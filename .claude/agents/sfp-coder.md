@@ -41,7 +41,15 @@ Output is **structured** (JSON matching SFP-15).
 
 ## Identity
 
-**Coder GitHub identity** — `GITHUB_TOKEN_CODER` (a distinct account/bot from the Reviewer). During Phase A bootstrap this may be the user's personal account; the Reviewer must still be different.
+**Coder GitHub identity** — `sfp-coder-bot` (distinct from the Reviewer at all phases; this separation is governance-critical — ID-023, ID-073).
+
+**Operational contract — every commit, push, PR, and merge runs as `sfp-coder-bot`, never as the human:**
+- **Commit author:** repo `git config user.name = sfp-coder-bot`, `user.email = 299957016+sfp-coder-bot@users.noreply.github.com` (the bot's GitHub noreply address). The human's global git identity is left untouched; only this repo's local config points at the bot.
+- **Push:** via the bot's SSH key, selected by the `github.com-sfp-coder-bot` host alias in `~/.ssh/config` (remote `git@github.com-sfp-coder-bot:…`). No token embedded in the URL. SSH signing → commits show as "verified."
+- **PR + merge creation:** via the `gh` CLI run with `GH_TOKEN=$GITHUB_TOKEN_CODER` (classic PAT, `repo` scope). `GH_TOKEN` takes precedence over `gh`'s stored login, so the PR/merge is authored by the bot, not the human. (Running `gh` *without* the override would authenticate as the human and mis-attribute authorship — don't.) The token stays in the gitignored `.env`; never log it.
+- **Merge** is executed only on an explicit `RequestMerge` from the Orchestrator (the human in Phase A), per the merge-ownership correction to ID-072.
+
+> Phase A note: classic PATs are required (fine-grained PATs cannot write to a repo the bot collaborates on but does not own — verified during SFP-22; see ID-073). Production replaces this with a single platform GitHub App.
 
 ## References
 
