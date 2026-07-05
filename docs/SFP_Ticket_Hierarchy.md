@@ -1118,7 +1118,7 @@ PRs are the implementation review unit (ID-025).
 ---
 
 ### SFP-43 [AGENT] 🤖 — Git Provider Adapter: review submission
-**Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-41
+**Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-41, SFP-171 *(ID-073: Reviewer identity must exist)*
 
 **Context:**
 The Reviewer submits its verdict to GitHub (ID-023).
@@ -1438,7 +1438,7 @@ The Coder implements one PR-spec and submits it for review (ID-022).
 ---
 
 ### SFP-56 [AGENT] 🤖 — Reviewer agent + prompt (judgment-only)
-**Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-36, SFP-16, SFP-35, SFP-42
+**Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-36, SFP-16, SFP-35, SFP-42, SFP-171 *(ID-073: Reviewer identity must exist)*
 
 **Context:**
 The Reviewer returns holistic judgments; comments live on GitHub (ID-023, ID-066).
@@ -4004,6 +4004,45 @@ MAS §12.7 end-to-end scenario.
 
 **Acceptance criteria:**
 - [ ] A ticket flows through to `COMPLETED` end-to-end
+
+---
+
+## Additional Manual Prerequisites (added post-initial-backlog)
+
+> Added after the initial 170-ticket load, so numbered SFP-171+ (out of numeric order) to preserve the existing SFP-1…170 numbering and the doc→Jira +17 key mapping in `.jira_creation_state.json`. Dependencies are wired into the relevant tickets below.
+
+### SFP-171 [PREREQ] 👤 — Create the `sfp-reviewer-bot` GitHub account + token
+**Labels:** manual-core, manual, prereq | **Deps:** SFP-1 | **Context out:** `github_token_reviewer_secret_ref`
+
+**Context:**
+ID-073 makes Git Provider credentials **role-scoped**: the Reviewer (SFP-56) must authenticate with an identity **distinct** from the Coder's (SFP-55). A shared identity would make every PR display as the same user authoring commits and approving them, undermining the Reviewer's independence (ID-023) and the audit trail (MAS §8). This account must exist before SFP-43 (review submission) or SFP-56 (Reviewer agent) can run.
+
+**Human action required:**
+GitHub account creation requires a human; it cannot be executed by an agent.
+
+**What the human must do:**
+1. Create a dedicated GitHub account `sfp-reviewer-bot` (or an organization bot account acceptable for review submission).
+2. Accept the collaborator invitation on `josep-lagunas/software-factory-platform` (Write permission, for review submission).
+3. Create a **classic** PAT (not fine-grained — see ID-073: fine-grained PATs cannot write to a repo the bot collaborates on but does not own) with the `public_repo` scope (sufficient while the repo is public; use `repo` if it goes private). Classic PATs inherit the account's collaborator permissions.
+4. Store the token as a secret reference `github_token_reviewer_secret_ref` (Phase A: local env/file via `sfp-config`, SFP-12; production: AWS Secrets Manager, ID-016).
+5. Confirm the account is a collaborator on the SFP repo with permission to submit reviews.
+
+**Least-privilege note:** the Reviewer's *functional* constraint (never push code — ID-023) is enforced by the agent definition and the role-scoped token boundary (ID-073), not by the PAT scope. Classic PATs are necessarily broader than fine-grained; per-repo least-privilege is restored in production via the GitHub App (ID-073).
+
+**Verification:**
+- [ ] `sfp-reviewer-bot` account exists, accepted the collaborator invite, and is distinct from the Coder identity
+- [ ] Token is a **classic** PAT (starts `ghp_`)
+- [ ] Token resolvable via `github_token_reviewer_secret_ref` from `sfp-config`
+- [ ] A test review submission (or write probe) via the API returns 200/201, not 403
+
+**References:** ID-016, ID-023, ID-066, ID-073. MAS §8, §9.6. SFP-12, SFP-43, SFP-56.
+
+---
+
+**Dependency updates (existing tickets):**
+- **SFP-43** [AGENT] Git Provider Adapter: review submission — **add dep: SFP-171** (was: SFP-41).
+- **SFP-56** [AGENT] Reviewer agent + prompt (judgment-only) — **add dep: SFP-171** (was: SFP-36, SFP-16, SFP-35, SFP-42).
+- SFP-55 (Coder) gains **no** new dep; it uses `GITHUB_TOKEN_CODER` (Phase A: the user's existing account is acceptable per ID-073).
 
 ---
 

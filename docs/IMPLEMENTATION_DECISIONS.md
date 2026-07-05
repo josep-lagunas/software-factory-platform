@@ -2596,6 +2596,51 @@ All (architecture-level decision).
 
 ---
 
+## ID-073
+
+### Title
+Git Provider credentials are role-scoped: the Coder and Reviewer use separate GitHub identities (separate tokens), never a shared one.
+
+### Status
+Accepted
+
+### Context
+SFP-41 previously specified a single `github_token_secret_ref` for all outbound GitHub operations through the Git Provider Adapter. In practice the Coder (SFP-55) pushes commits/branches and opens PRs (SFP-41/42), while the Reviewer (SFP-56) submits PR reviews (SFP-43). ID-023 makes the Reviewer **judgment-only and independent** from the Coder, and ID-066 makes review comments live on GitHub (the source of truth). If both roles authenticate as the same GitHub identity, a PR displays as the same user authoring commits *and* approving them — the automated quality gate is cosmetically undermined and the audit trail becomes ambiguous. Governance (MAS §8: the user owns accountability for any behavior-affecting change) requires a clean, distinguishable provenance for "who authored" vs "who approved."
+
+### Decision
+The Git Provider Adapter consumes **two role-scoped credentials**, injected via config (never hardcoded), parallel to the per-role model routing in ID-020/ID-063:
+- `GITHUB_TOKEN_CODER` (`github_token_coder_secret_ref`) — used by the Coder for branch/push/PR operations (SFP-41, SFP-42). During the Phase A manual bootstrap this MAY be the user's personal GitHub account; in production it is a service account or the platform GitHub App acting in the coder role.
+- `GITHUB_TOKEN_REVIEWER` (`github_token_reviewer_secret_ref`) — used by the Reviewer for review submission (SFP-43). This identity MUST be **distinct** from the Coder's at all phases (Phase A minimum: a dedicated `sfp-reviewer-bot` account; production: a GitHub App or separate service account).
+
+Rules:
+- The Coder NEVER authenticates with the Reviewer token, and vice versa. This is enforced at the composition root (ID-052): each role's runtime receives only its own credential.
+- The Planner, Test Designer, and Readiness evaluator perform **no GitHub writes** and hold no GitHub credential.
+- Credential selection is role-driven and configuration-only; no code path chooses a token based on ad-hoc logic.
+- Production targets a single **GitHub App** for the platform identity, with role separation expressed as the App acting in distinct capacities (or as the App plus a distinct reviewer service account). The Phase A two-account scheme is the minimal configuration that preserves role independence and migrates cleanly to the App model.
+- **Phase A token type: classic PATs, not fine-grained.** Verified during SFP-22: GitHub fine-grained PATs issued by a collaborator account **cannot write** to a repository the account does not own (the token UI exposes only "Public Repositories (read-only)" and "All repositories you own"). Because `sfp-coder-bot` / `sfp-reviewer-bot` *collaborate* on `josep-lagunas/software-factory-platform` but do not own it, fine-grained tokens return `403 Resource not accessible by personal access token` on every write, while reads succeed (the repo is public). Classic PATs use scope-based access and inherit the account's collaborator permissions, so they work in this topology. Phase A scopes: Coder → classic PAT `repo`; Reviewer → classic PAT `public_repo` (sufficient while the repo is public; `repo` if it goes private). This is broader than fine-grained least-privilege; per-repo least-privilege is restored in production via the GitHub App.
+- This extends SFP-41 (and the credentials surface of SFP-43, SFP-55, SFP-56) from one token to two role-scoped tokens.
+
+### Rationale
+Separate identities make authorship and approval distinguishable on every PR, preserving the Reviewer's independence (ID-023) and the integrity of the automated quality gate. It keeps provenance auditable (MAS §8 accountability), prevents the appearance of self-review, and adds no architectural complexity — credential injection is already configuration-driven (ID-016, ID-020). The two-account Phase A minimum is the smallest change that unblocks correct governance and maps directly onto the production GitHub-App target.
+
+### Alternatives Considered
+- Single shared token (original SFP-41 design): rejected; collapses author and reviewer into one identity, undermining ID-023 independence and audit clarity.
+- GitHub App from day one (Phase A): rejected for sequencing; the App is the production target but is heavier to set up than a second free account during the manual bootstrap. The two-account scheme migrates cleanly to the App.
+- Fine-grained PATs for the Phase A bots: rejected (attempted and verified infeasible during SFP-22). Fine-grained PATs cannot grant write access to a repo the issuing account collaborates on but does not own; classic PATs are required until the GitHub App exists.
+- Coder and Reviewer as the same bot but distinguished only in commit/review metadata: rejected; GitHub's UI and audit log key on identity, not metadata, so the self-review appearance persists.
+
+### Consequences
+Positive: clean per-role provenance on every PR; Reviewer independence enforced at the credential layer, not just by prompt; straightforward migration to a GitHub App in production.
+Negative: requires a second GitHub account/token to exist and be provisioned (a new manual prerequisite — SFP-171); SFP-41/SFP-43 credential wiring is slightly broader than a single token; secret management must hold two GitHub secrets rather than one.
+
+### References
+ID-016 (secrets), ID-020 (config-driven provider selection), ID-023 (judgment-only reviewer), ID-035 (Git Provider Adapter), ID-052 (composition root), ID-063 (per-role model routing), ID-066 (review comments live on GitHub). Master Architecture Specification §8 (governance/accountability), §9.6 (Git Provider Adapter, agents). SFP-41, SFP-42, SFP-43, SFP-55, SFP-56, SFP-171.
+
+### Affected Components
+Workspace Worker (Git Provider Adapter), Agent Runtime, sfp-config, Orchestrator (no change to merge centralization, ID-072).
+
+---
+
 # Resolved Known Gaps (provenance)
 
 All originally-listed known gaps have been resolved as Implementation Decisions:
