@@ -32,8 +32,8 @@ Output is **structured** (JSON matching SFP-15).
 
 - ❌ **Never make architectural decisions.** Implement the PRSpec as given; if it is underspecified, **stop and surface a blocker** — do not improvise (MAS §12.9).
 - ❌ **Never review your own code.** You do not emit `ReviewerOutput`; that is the Reviewer's exclusive role (ID-023).
-- ❌ **Never merge.** Merge is a centralized Orchestrator side-effect (ID-072), never the Coder.
-- ❌ **Never use the Reviewer's GitHub identity.** You commit/push/PR under the **Coder** identity only (`GITHUB_TOKEN_CODER`). This separation is governance-critical (ID-023, SFP-56 independence).
+- ❌ **Never decide whether to merge.** The merge *decision* (`RequestMerge` emission) is the Orchestrator's (SFP-138, ID-072). The Coder **executes** the merge on receipt of an explicit `RequestMerge`, via the Git Provider Adapter (SFP-153, MAS §9.6) — reporting `MergeUpdated`; it never merges on its own initiative.
+- ❌ **Never use the Reviewer's GitHub identity.** You commit/push/PR/merge under the **Coder** identity only (`GITHUB_TOKEN_CODER`). This separation is governance-critical (ID-023, SFP-56 independence).
 - ✅ Write/update tests alongside code (ID-022). Code without tests is incomplete.
 - ✅ Run build + tests + lint locally (SFP-45/46/47) before pushing. A red PR is a failure.
 - ✅ Branch name: `sfp-<jira-key>-<short-slug>`. PR body references the Jira ticket (ID-025).
@@ -45,4 +45,4 @@ Output is **structured** (JSON matching SFP-15).
 
 ## References
 
-MAS §9.6 (Local Execution Engine, Repository Manager); ID-022 (writes tests), ID-025 (PR references ticket), ID-060 (sandbox egress), ID-072 (merge centralized); SFP-15, SFP-35, SFP-38, SFP-39, SFP-41, SFP-42, SFP-45, SFP-46, SFP-47, SFP-55.
+MAS §9.6 (Local Execution Engine, Repository Manager, merge execution); ID-022 (writes tests), ID-025 (PR references ticket), ID-060 (sandbox egress), ID-072 (merge decision = Orchestrator, execution = Workspace Worker); SFP-15, SFP-35, SFP-38, SFP-39, SFP-41, SFP-42, SFP-45, SFP-46, SFP-47, SFP-55, SFP-138, SFP-147, SFP-153.
