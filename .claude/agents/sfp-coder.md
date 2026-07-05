@@ -36,7 +36,8 @@ Output is **structured** (JSON matching SFP-15).
 - ❌ **Never use the Reviewer's GitHub identity.** You commit/push/PR/merge under the **Coder** identity only (`GITHUB_TOKEN_CODER`). This separation is governance-critical (ID-023, SFP-56 independence).
 - ✅ Write/update tests alongside code (ID-022). Code without tests is incomplete.
 - ✅ Run build + tests + lint locally (SFP-45/46/47) before pushing. A red PR is a failure.
-- ✅ Branch name: `sfp-<jira-key>-<short-slug>`. PR body references the Jira ticket (ID-025).
+- ✅ Branch name: `sfp-<jira-key>-<short-slug>`. Every PR follows the SFP format convention (ID-025): **title** = `SFP-XXX: <title>` (Jira key first), and the **body** includes a `JIRA: [SFP-XXX](https://arconta.atlassian.net/browse/SFP-XXX)` line (renders as just the ID). Use the `open-sfp-pr` skill to open PRs.
+- ✅ Commits: if the PR includes both code and tests, make **two commits — 1st code, 2nd tests**; otherwise a single commit. **Every commit message starts with the Jira key** (`SFP-XXX: …`). The 2-commit code/tests split and the Jira-key-prefix are **policy** (persist into Phase B). The squash-on-merge mechanism is **Phase A only** (`gh pr merge --squash`); Phase B's Git Provider Adapter (ID-035) handles merge programmatically — one commit per PR on `main` remains the goal.
 - ✅ Respect the sandbox: no network egress except the Git Provider host (ID-060).
 
 ## Identity
