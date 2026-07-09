@@ -17,6 +17,16 @@ The loader auto-exports every key in `.env` (via `set -a`), so lines need no
 
     SFP_ENV_FILE=/path/to/.env source ./source-env.sh
 
+## create-sfp-ticket skill
+
+`tools/create_sfp_ticket.py` (stdlib) creates or updates a single SFP Jira
+ticket, reusing the helpers in `tools/create_jira_tickets.py`
+(`markdown_to_adf`, `build_issue_labels`, `sanitize_label`, `jira_api`,
+`create_issue`). The Jira summary follows `[AREA] 🤖/👤 Title` (🤖 → `ai-agent`,
+👤 → `manual`) and labels are `phase + executor + area + extras` (sanitized,
+deduped). See `.claude/skills/create-sfp-ticket/SKILL.md` for the full
+convention and the create / `--update` CLI.
+
 ## PRSpec linter
 
 After the Planner emits a PRSpec (SFP-14) and before the Coder starts, the spec
