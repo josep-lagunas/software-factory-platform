@@ -1,0 +1,26 @@
+{
+  "ticket": "SFP-998",
+  "branch_name": "sfp-998-broken-fixture",
+  "validation_profile_acknowledged": "default",
+  "files": [
+    {
+      "path": "src/a.py",
+      "action": "modify"
+    },
+    {
+      "path": "src/b.py",
+      "action": "modify",
+      "anchor": {
+        "before": "literal text",
+        "line_range": [1, 2]
+      }
+    }
+  ],
+  "implementation_steps": [],
+  "dependencies": null,
+  "risks": [],
+  "pr_title": "",
+  "pr_body_must_include": "JIRA: [SFP-998](https://arconta.atlassian.net/browse/SFP-998)",
+  "acceptance_criteria_mapping": ["AC-1 not a dict"],
+  "read_allowlist": []
+}

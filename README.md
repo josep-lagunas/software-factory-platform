@@ -16,3 +16,15 @@ The loader auto-exports every key in `.env` (via `set -a`), so lines need no
 `export` prefix. To point at a different file, set `SFP_ENV_FILE`:
 
     SFP_ENV_FILE=/path/to/.env source ./source-env.sh
+
+## PRSpec linter
+
+After the Planner emits a PRSpec (SFP-14) and before the Coder starts, the spec
+is structurally validated:
+
+    python3 tools/check_prspec.py --file <spec.json>
+
+The linter (stdlib only) checks that every required top-level key is present,
+that each `modify` entry carries exactly one anchor (`before` literal text or
+`line_range`), and the other field shapes documented in the Planner output
+contract (`.claude/agents/sfp-planner.md`). It exits 0 iff the spec is clean.

@@ -1,0 +1,64 @@
+{
+  "pr_spec_id": "PRSPEC-SFP-999",
+  "ticket": "SFP-999",
+  "title": "Fictitious demo feature (linter fixture, not a real ticket)",
+  "branch_name": "sfp-999-demo-feature",
+  "validation_profile_acknowledged": "default",
+  "files": [
+    {
+      "path": "src/demo/feature.py",
+      "action": "create"
+    },
+    {
+      "path": "src/demo/legacy.py",
+      "action": "delete"
+    },
+    {
+      "path": "src/demo/modify_before.py",
+      "action": "modify",
+      "anchor": {
+        "before": "def old_function():\n    return None\n"
+      }
+    },
+    {
+      "path": "src/demo/modify_range.py",
+      "action": "modify",
+      "anchor": {
+        "line_range": [10, 20]
+      }
+    }
+  ],
+  "implementation_steps": [
+    "Create src/demo/feature.py with the new function.",
+    "Delete the obsolete src/demo/legacy.py.",
+    "Modify modify_before.py by replacing the located literal block.",
+    "Modify modify_range.py lines 10-20 with the new logic."
+  ],
+  "dependencies": {
+    "on_tickets": [],
+    "on_decisions": ["ID-021"],
+    "on_code": []
+  },
+  "risks": [
+    "None — this is a fictitious fixture for the PRSpec linter."
+  ],
+  "commit_plan": {
+    "strategy": "single commit",
+    "commit_message": "SFP-999: demo feature"
+  },
+  "pr_title": "SFP-999: demo feature",
+  "pr_body_must_include": "JIRA: [SFP-999](https://arconta.atlassian.net/browse/SFP-999)",
+  "acceptance_criteria_mapping": {
+    "AC-1": "covered by src/demo/feature.py",
+    "AC-2": "covered by tests/test_demo.py"
+  },
+  "verification": {
+    "type": "script",
+    "body": "python3 -m pytest tests/test_demo.py -q"
+  },
+  "read_allowlist": [
+    "src/demo/",
+    "tests/test_demo.py"
+  ],
+  "rig_reference": "Phase A local execution (MAS §9.6); Coder identity = sfp-coder-bot."
+}
