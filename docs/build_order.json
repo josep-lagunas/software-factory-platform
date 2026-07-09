@@ -1,0 +1,2112 @@
+{
+  "flat_order": [
+    "SFP-1",
+    "SFP-2",
+    "SFP-3",
+    "SFP-4",
+    "SFP-64",
+    "SFP-5",
+    "SFP-65",
+    "SFP-67",
+    "SFP-68",
+    "SFP-69",
+    "SFP-171",
+    "SFP-6",
+    "SFP-8",
+    "SFP-9",
+    "SFP-10",
+    "SFP-66",
+    "SFP-78",
+    "SFP-7",
+    "SFP-11",
+    "SFP-13",
+    "SFP-19",
+    "SFP-21",
+    "SFP-22",
+    "SFP-23",
+    "SFP-24",
+    "SFP-38",
+    "SFP-45",
+    "SFP-59",
+    "SFP-70",
+    "SFP-94",
+    "SFP-95",
+    "SFP-96",
+    "SFP-97",
+    "SFP-98",
+    "SFP-155",
+    "SFP-156",
+    "SFP-157",
+    "SFP-161",
+    "SFP-12",
+    "SFP-14",
+    "SFP-15",
+    "SFP-16",
+    "SFP-17",
+    "SFP-18",
+    "SFP-20",
+    "SFP-25",
+    "SFP-30",
+    "SFP-34",
+    "SFP-39",
+    "SFP-40",
+    "SFP-41",
+    "SFP-46",
+    "SFP-47",
+    "SFP-48",
+    "SFP-50",
+    "SFP-57",
+    "SFP-58",
+    "SFP-60",
+    "SFP-61",
+    "SFP-71",
+    "SFP-72",
+    "SFP-73",
+    "SFP-74",
+    "SFP-77",
+    "SFP-79",
+    "SFP-81",
+    "SFP-82",
+    "SFP-99",
+    "SFP-100",
+    "SFP-162",
+    "SFP-165",
+    "SFP-26",
+    "SFP-27",
+    "SFP-28",
+    "SFP-29",
+    "SFP-31",
+    "SFP-35",
+    "SFP-36",
+    "SFP-42",
+    "SFP-43",
+    "SFP-44",
+    "SFP-49",
+    "SFP-62",
+    "SFP-75",
+    "SFP-76",
+    "SFP-80",
+    "SFP-83",
+    "SFP-84",
+    "SFP-85",
+    "SFP-86",
+    "SFP-87",
+    "SFP-88",
+    "SFP-89",
+    "SFP-90",
+    "SFP-91",
+    "SFP-92",
+    "SFP-93",
+    "SFP-158",
+    "SFP-32",
+    "SFP-33",
+    "SFP-37",
+    "SFP-51",
+    "SFP-53",
+    "SFP-54",
+    "SFP-55",
+    "SFP-56",
+    "SFP-101",
+    "SFP-150",
+    "SFP-159",
+    "SFP-164",
+    "SFP-52",
+    "SFP-63",
+    "SFP-102",
+    "SFP-103",
+    "SFP-108",
+    "SFP-112",
+    "SFP-120",
+    "SFP-143",
+    "SFP-160",
+    "SFP-163",
+    "SFP-104",
+    "SFP-107",
+    "SFP-109",
+    "SFP-113",
+    "SFP-114",
+    "SFP-116",
+    "SFP-117",
+    "SFP-121",
+    "SFP-122",
+    "SFP-123",
+    "SFP-124",
+    "SFP-125",
+    "SFP-130",
+    "SFP-132",
+    "SFP-133",
+    "SFP-134",
+    "SFP-135",
+    "SFP-136",
+    "SFP-137",
+    "SFP-138",
+    "SFP-139",
+    "SFP-140",
+    "SFP-141",
+    "SFP-142",
+    "SFP-144",
+    "SFP-145",
+    "SFP-146",
+    "SFP-147",
+    "SFP-148",
+    "SFP-151",
+    "SFP-152",
+    "SFP-154",
+    "SFP-168",
+    "SFP-105",
+    "SFP-110",
+    "SFP-115",
+    "SFP-118",
+    "SFP-119",
+    "SFP-126",
+    "SFP-127",
+    "SFP-128",
+    "SFP-131",
+    "SFP-149",
+    "SFP-153",
+    "SFP-170",
+    "SFP-106",
+    "SFP-111",
+    "SFP-129",
+    "SFP-166",
+    "SFP-167",
+    "SFP-169"
+  ],
+  "tickets": [
+    {
+      "ticket": "SFP-1",
+      "wave": 0,
+      "deps": [],
+      "area": "PREREQ",
+      "executor": "manual",
+      "phase": "Manual Core",
+      "title": "Create SFP GitHub monorepo"
+    },
+    {
+      "ticket": "SFP-2",
+      "wave": 0,
+      "deps": [],
+      "area": "PREREQ",
+      "executor": "manual",
+      "phase": "Manual Core",
+      "title": "Obtain LLM provider API key (Anthropic-compatible)"
+    },
+    {
+      "ticket": "SFP-3",
+      "wave": 0,
+      "deps": [],
+      "area": "PREREQ",
+      "executor": "manual",
+      "phase": "Manual Core",
+      "title": "Create SFP Jira project + API token"
+    },
+    {
+      "ticket": "SFP-4",
+      "wave": 0,
+      "deps": [],
+      "area": "PREREQ",
+      "executor": "manual",
+      "phase": "Manual Core",
+      "title": "Configure local development environment"
+    },
+    {
+      "ticket": "SFP-64",
+      "wave": 0,
+      "deps": [],
+      "area": "PREREQ",
+      "executor": "manual",
+      "phase": "Platform",
+      "title": "AWS account + billing (eu-west-1)"
+    },
+    {
+      "ticket": "SFP-5",
+      "wave": 1,
+      "deps": [
+        "SFP-1",
+        "SFP-4"
+      ],
+      "area": "WORKSPACE",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "uv workspace + root pyproject + single uv.lock"
+    },
+    {
+      "ticket": "SFP-65",
+      "wave": 1,
+      "deps": [
+        "SFP-64"
+      ],
+      "area": "PREREQ",
+      "executor": "manual",
+      "phase": "Platform",
+      "title": "IAM user for Pulumi"
+    },
+    {
+      "ticket": "SFP-67",
+      "wave": 1,
+      "deps": [
+        "SFP-64"
+      ],
+      "area": "PREREQ",
+      "executor": "manual",
+      "phase": "Platform",
+      "title": "Integration secrets in Secrets Manager"
+    },
+    {
+      "ticket": "SFP-68",
+      "wave": 1,
+      "deps": [
+        "SFP-64"
+      ],
+      "area": "PREREQ",
+      "executor": "manual",
+      "phase": "Platform",
+      "title": "Domain/DNS"
+    },
+    {
+      "ticket": "SFP-69",
+      "wave": 1,
+      "deps": [
+        "SFP-64"
+      ],
+      "area": "PREREQ",
+      "executor": "manual",
+      "phase": "Platform",
+      "title": "Slack workspace + app credentials"
+    },
+    {
+      "ticket": "SFP-171",
+      "wave": 1,
+      "deps": [
+        "SFP-1"
+      ],
+      "area": "PREREQ",
+      "executor": "manual",
+      "phase": "Platform",
+      "title": "Create the `sfp-reviewer-bot` GitHub account + token"
+    },
+    {
+      "ticket": "SFP-6",
+      "wave": 2,
+      "deps": [
+        "SFP-5"
+      ],
+      "area": "WORKSPACE",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Monorepo skeleton: services/*, packages/*"
+    },
+    {
+      "ticket": "SFP-8",
+      "wave": 2,
+      "deps": [
+        "SFP-5"
+      ],
+      "area": "WORKSPACE",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "ruff configuration (lint + format)"
+    },
+    {
+      "ticket": "SFP-9",
+      "wave": 2,
+      "deps": [
+        "SFP-5"
+      ],
+      "area": "WORKSPACE",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "mypy configuration"
+    },
+    {
+      "ticket": "SFP-10",
+      "wave": 2,
+      "deps": [
+        "SFP-5"
+      ],
+      "area": "WORKSPACE",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "pytest + pytest-asyncio + coverage (90% gate)"
+    },
+    {
+      "ticket": "SFP-66",
+      "wave": 2,
+      "deps": [
+        "SFP-65"
+      ],
+      "area": "PREREQ",
+      "executor": "manual",
+      "phase": "Platform",
+      "title": "Pulumi bootstrap (state backend + stack config)"
+    },
+    {
+      "ticket": "SFP-78",
+      "wave": 2,
+      "deps": [
+        "SFP-67"
+      ],
+      "area": "PLAT-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Secrets Manager + config injection wiring"
+    },
+    {
+      "ticket": "SFP-7",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "WORKSPACE",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Uniform per-service layout template"
+    },
+    {
+      "ticket": "SFP-11",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "WORKSPACE",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-config: typed config + env loading"
+    },
+    {
+      "ticket": "SFP-13",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "CONTRACTS",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Common agent output envelope schema"
+    },
+    {
+      "ticket": "SFP-19",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "CONTRACTS",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Context-types catalogue (shared, versioned)"
+    },
+    {
+      "ticket": "SFP-21",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "CONTRACTS",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Command contracts catalogue"
+    },
+    {
+      "ticket": "SFP-22",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "CONTRACTS",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Event contracts catalogue"
+    },
+    {
+      "ticket": "SFP-23",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "CONTRACTS",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "ExternalEventReceived contract"
+    },
+    {
+      "ticket": "SFP-24",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "CONTRACTS",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Validation-profile enum + gate-mapping"
+    },
+    {
+      "ticket": "SFP-38",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Repository Manager: clone"
+    },
+    {
+      "ticket": "SFP-45",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Local Execution Engine: build"
+    },
+    {
+      "ticket": "SFP-59",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "LOCAL",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "docker compose: Postgres (multi-DB)"
+    },
+    {
+      "ticket": "SFP-70",
+      "wave": 3,
+      "deps": [
+        "SFP-66"
+      ],
+      "area": "PLAT-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "VPC + subnets"
+    },
+    {
+      "ticket": "SFP-94",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Identity DB: Base + `User` + `UserExternalIdentity`"
+    },
+    {
+      "ticket": "SFP-95",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Communication DB: `UserInteraction`"
+    },
+    {
+      "ticket": "SFP-96",
+      "wave": 3,
+      "deps": [
+        "SFP-6"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "External Events DB: endpoint config"
+    },
+    {
+      "ticket": "SFP-97",
+      "wave": 3,
+      "deps": [
+        "SFP-66"
+      ],
+      "area": "MSG-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Pulumi: SNS topics"
+    },
+    {
+      "ticket": "SFP-98",
+      "wave": 3,
+      "deps": [
+        "SFP-66"
+      ],
+      "area": "MSG-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Pulumi: SQS queues"
+    },
+    {
+      "ticket": "SFP-155",
+      "wave": 3,
+      "deps": [
+        "SFP-8"
+      ],
+      "area": "CICD",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "ci workflow: lint (ruff)"
+    },
+    {
+      "ticket": "SFP-156",
+      "wave": 3,
+      "deps": [
+        "SFP-9"
+      ],
+      "area": "CICD",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "ci workflow: typecheck (mypy)"
+    },
+    {
+      "ticket": "SFP-157",
+      "wave": 3,
+      "deps": [
+        "SFP-10"
+      ],
+      "area": "CICD",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "ci workflow: test + coverage gate"
+    },
+    {
+      "ticket": "SFP-161",
+      "wave": 3,
+      "deps": [
+        "SFP-66"
+      ],
+      "area": "CICD",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "infrastructure workflow: pulumi preview/up"
+    },
+    {
+      "ticket": "SFP-12",
+      "wave": 4,
+      "deps": [
+        "SFP-11"
+      ],
+      "area": "WORKSPACE",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-config: local secret provider (env/file)"
+    },
+    {
+      "ticket": "SFP-14",
+      "wave": 4,
+      "deps": [
+        "SFP-13"
+      ],
+      "area": "CONTRACTS",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Planner output schema (`pr_specs`)"
+    },
+    {
+      "ticket": "SFP-15",
+      "wave": 4,
+      "deps": [
+        "SFP-13"
+      ],
+      "area": "CONTRACTS",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Coder output schema"
+    },
+    {
+      "ticket": "SFP-16",
+      "wave": 4,
+      "deps": [
+        "SFP-13"
+      ],
+      "area": "CONTRACTS",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Reviewer output schema (judgment-only)"
+    },
+    {
+      "ticket": "SFP-17",
+      "wave": 4,
+      "deps": [
+        "SFP-13"
+      ],
+      "area": "CONTRACTS",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Test Designer output schema"
+    },
+    {
+      "ticket": "SFP-18",
+      "wave": 4,
+      "deps": [
+        "SFP-13"
+      ],
+      "area": "CONTRACTS",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Readiness evaluator output schema"
+    },
+    {
+      "ticket": "SFP-20",
+      "wave": 4,
+      "deps": [
+        "SFP-19"
+      ],
+      "area": "CONTRACTS",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Ticket context I/O schemas (outputs/inputs)"
+    },
+    {
+      "ticket": "SFP-25",
+      "wave": 4,
+      "deps": [
+        "SFP-21",
+        "SFP-22",
+        "SFP-23",
+        "SFP-11"
+      ],
+      "area": "SHARED-FW",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-messaging: Message Bus interface"
+    },
+    {
+      "ticket": "SFP-30",
+      "wave": 4,
+      "deps": [
+        "SFP-11"
+      ],
+      "area": "SHARED-FW",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-observability: structlog setup + JSON"
+    },
+    {
+      "ticket": "SFP-34",
+      "wave": 4,
+      "deps": [
+        "SFP-11"
+      ],
+      "area": "SHARED-FW",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-agent-runtime: abstraction interfaces"
+    },
+    {
+      "ticket": "SFP-39",
+      "wave": 4,
+      "deps": [
+        "SFP-38"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Repository Manager: worktree lifecycle"
+    },
+    {
+      "ticket": "SFP-40",
+      "wave": 4,
+      "deps": [
+        "SFP-38"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Repository Manager: branch lifecycle + cleanup"
+    },
+    {
+      "ticket": "SFP-41",
+      "wave": 4,
+      "deps": [
+        "SFP-11"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Git Provider Adapter: branch + push"
+    },
+    {
+      "ticket": "SFP-46",
+      "wave": 4,
+      "deps": [
+        "SFP-45"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Local Execution Engine: test runner"
+    },
+    {
+      "ticket": "SFP-47",
+      "wave": 4,
+      "deps": [
+        "SFP-45"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Local Execution Engine: linters/static analysis"
+    },
+    {
+      "ticket": "SFP-48",
+      "wave": 4,
+      "deps": [
+        "SFP-45"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Sandbox: local container isolation"
+    },
+    {
+      "ticket": "SFP-50",
+      "wave": 4,
+      "deps": [
+        "SFP-24"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Readiness gate: rubric (rule-checks)"
+    },
+    {
+      "ticket": "SFP-57",
+      "wave": 4,
+      "deps": [
+        "SFP-24"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Validation profile logic: assignment + gate enforcement"
+    },
+    {
+      "ticket": "SFP-58",
+      "wave": 4,
+      "deps": [
+        "SFP-13"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Failure classification logic"
+    },
+    {
+      "ticket": "SFP-60",
+      "wave": 4,
+      "deps": [
+        "SFP-59"
+      ],
+      "area": "LOCAL",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "docker compose: LocalStack (SNS/SQS/DLQ)"
+    },
+    {
+      "ticket": "SFP-61",
+      "wave": 4,
+      "deps": [
+        "SFP-59"
+      ],
+      "area": "LOCAL",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "docker compose: OTel collector (dev sink)"
+    },
+    {
+      "ticket": "SFP-71",
+      "wave": 4,
+      "deps": [
+        "SFP-70"
+      ],
+      "area": "PLAT-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "NAT gateway + routing"
+    },
+    {
+      "ticket": "SFP-72",
+      "wave": 4,
+      "deps": [
+        "SFP-70"
+      ],
+      "area": "PLAT-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Security groups"
+    },
+    {
+      "ticket": "SFP-73",
+      "wave": 4,
+      "deps": [
+        "SFP-70",
+        "SFP-67"
+      ],
+      "area": "PLAT-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Aurora Serverless PostgreSQL (multi-DB)"
+    },
+    {
+      "ticket": "SFP-74",
+      "wave": 4,
+      "deps": [
+        "SFP-70"
+      ],
+      "area": "PLAT-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "ECS cluster (Fargate)"
+    },
+    {
+      "ticket": "SFP-77",
+      "wave": 4,
+      "deps": [
+        "SFP-70"
+      ],
+      "area": "PLAT-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "IAM roles + policies (per service)"
+    },
+    {
+      "ticket": "SFP-79",
+      "wave": 4,
+      "deps": [
+        "SFP-70"
+      ],
+      "area": "PLAT-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "CloudWatch Logs groups + shipping"
+    },
+    {
+      "ticket": "SFP-81",
+      "wave": 4,
+      "deps": [
+        "SFP-68",
+        "SFP-70"
+      ],
+      "area": "PLAT-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "DNS + TLS (Route53 + ACM)"
+    },
+    {
+      "ticket": "SFP-82",
+      "wave": 4,
+      "deps": [
+        "SFP-6",
+        "SFP-13"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Orchestrator DB: Alembic + Base + business/operational schemas"
+    },
+    {
+      "ticket": "SFP-99",
+      "wave": 4,
+      "deps": [
+        "SFP-98"
+      ],
+      "area": "MSG-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Pulumi: DLQs + redrive policies"
+    },
+    {
+      "ticket": "SFP-100",
+      "wave": 4,
+      "deps": [
+        "SFP-97",
+        "SFP-98"
+      ],
+      "area": "MSG-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Pulumi: SNS→SQS subscriptions"
+    },
+    {
+      "ticket": "SFP-162",
+      "wave": 4,
+      "deps": [
+        "SFP-155"
+      ],
+      "area": "CICD",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Reusable workflow templates (workflow_call)"
+    },
+    {
+      "ticket": "SFP-165",
+      "wave": 4,
+      "deps": [
+        "SFP-98"
+      ],
+      "area": "VAL",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Back-pressure → queue absorbs"
+    },
+    {
+      "ticket": "SFP-26",
+      "wave": 5,
+      "deps": [
+        "SFP-25"
+      ],
+      "area": "SHARED-FW",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-messaging: Handler + decorators"
+    },
+    {
+      "ticket": "SFP-27",
+      "wave": 5,
+      "deps": [
+        "SFP-25"
+      ],
+      "area": "SHARED-FW",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-messaging: MessageContext"
+    },
+    {
+      "ticket": "SFP-28",
+      "wave": 5,
+      "deps": [
+        "SFP-13",
+        "SFP-25"
+      ],
+      "area": "SHARED-FW",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-messaging: envelope serde (JSON)"
+    },
+    {
+      "ticket": "SFP-29",
+      "wave": 5,
+      "deps": [
+        "SFP-25"
+      ],
+      "area": "SHARED-FW",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-messaging: in-memory transport"
+    },
+    {
+      "ticket": "SFP-31",
+      "wave": 5,
+      "deps": [
+        "SFP-30"
+      ],
+      "area": "SHARED-FW",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-observability: correlation/causation binding"
+    },
+    {
+      "ticket": "SFP-35",
+      "wave": 5,
+      "deps": [
+        "SFP-34"
+      ],
+      "area": "SHARED-FW",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-agent-runtime: PromptBuilder"
+    },
+    {
+      "ticket": "SFP-36",
+      "wave": 5,
+      "deps": [
+        "SFP-34",
+        "SFP-11"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Agent Runtime impl (Claude Agent SDK wrapper)"
+    },
+    {
+      "ticket": "SFP-42",
+      "wave": 5,
+      "deps": [
+        "SFP-41"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Git Provider Adapter: PR create/update"
+    },
+    {
+      "ticket": "SFP-43",
+      "wave": 5,
+      "deps": [
+        "SFP-41",
+        "SFP-171"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Git Provider Adapter: review submission"
+    },
+    {
+      "ticket": "SFP-44",
+      "wave": 5,
+      "deps": [
+        "SFP-41"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Git Provider Adapter: branch synchronization"
+    },
+    {
+      "ticket": "SFP-49",
+      "wave": 5,
+      "deps": [
+        "SFP-20",
+        "SFP-19"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Ticket context resolver: input resolution + injection"
+    },
+    {
+      "ticket": "SFP-62",
+      "wave": 5,
+      "deps": [
+        "SFP-60"
+      ],
+      "area": "LOCAL",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Compose init: local provisioning + Alembic baseline"
+    },
+    {
+      "ticket": "SFP-75",
+      "wave": 5,
+      "deps": [
+        "SFP-74"
+      ],
+      "area": "PLAT-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "ECR registries (per service)"
+    },
+    {
+      "ticket": "SFP-76",
+      "wave": 5,
+      "deps": [
+        "SFP-74"
+      ],
+      "area": "PLAT-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "AWS Batch compute env + job queue + max-vCpus"
+    },
+    {
+      "ticket": "SFP-80",
+      "wave": 5,
+      "deps": [
+        "SFP-79"
+      ],
+      "area": "PLAT-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Alarms + dashboards"
+    },
+    {
+      "ticket": "SFP-83",
+      "wave": 5,
+      "deps": [
+        "SFP-82"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "`Project` + `ProjectUser` models"
+    },
+    {
+      "ticket": "SFP-84",
+      "wave": 5,
+      "deps": [
+        "SFP-82"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "`Ticket` model"
+    },
+    {
+      "ticket": "SFP-85",
+      "wave": 5,
+      "deps": [
+        "SFP-82"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "`PRSpecification` model"
+    },
+    {
+      "ticket": "SFP-86",
+      "wave": 5,
+      "deps": [
+        "SFP-82"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "`CodingJob` model"
+    },
+    {
+      "ticket": "SFP-87",
+      "wave": 5,
+      "deps": [
+        "SFP-82"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "`Review` model"
+    },
+    {
+      "ticket": "SFP-88",
+      "wave": 5,
+      "deps": [
+        "SFP-82"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "`Merge` model"
+    },
+    {
+      "ticket": "SFP-89",
+      "wave": 5,
+      "deps": [
+        "SFP-82"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "`Deployment` model"
+    },
+    {
+      "ticket": "SFP-90",
+      "wave": 5,
+      "deps": [
+        "SFP-82"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "`UserDecision` model"
+    },
+    {
+      "ticket": "SFP-91",
+      "wave": 5,
+      "deps": [
+        "SFP-82"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "`WorkflowDecision` model"
+    },
+    {
+      "ticket": "SFP-92",
+      "wave": 5,
+      "deps": [
+        "SFP-82"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Transactional outbox table + relay publisher"
+    },
+    {
+      "ticket": "SFP-93",
+      "wave": 5,
+      "deps": [
+        "SFP-82"
+      ],
+      "area": "PERSIST",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Idempotency / message ledger"
+    },
+    {
+      "ticket": "SFP-158",
+      "wave": 5,
+      "deps": [
+        "SFP-60",
+        "SFP-157"
+      ],
+      "area": "CICD",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "ci workflow: integration tests (LocalStack)"
+    },
+    {
+      "ticket": "SFP-32",
+      "wave": 6,
+      "deps": [
+        "SFP-29"
+      ],
+      "area": "SHARED-FW",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-testing: in-memory bus fake"
+    },
+    {
+      "ticket": "SFP-33",
+      "wave": 6,
+      "deps": [
+        "SFP-27"
+      ],
+      "area": "SHARED-FW",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "sfp-testing: fake MessageContext + fixtures"
+    },
+    {
+      "ticket": "SFP-37",
+      "wave": 6,
+      "deps": [
+        "SFP-36",
+        "SFP-11"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Per-role model config routing"
+    },
+    {
+      "ticket": "SFP-51",
+      "wave": 6,
+      "deps": [
+        "SFP-18",
+        "SFP-49",
+        "SFP-50"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Readiness gate: evaluator + verdicts"
+    },
+    {
+      "ticket": "SFP-53",
+      "wave": 6,
+      "deps": [
+        "SFP-36",
+        "SFP-14",
+        "SFP-35",
+        "SFP-24"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Planner agent + prompt"
+    },
+    {
+      "ticket": "SFP-54",
+      "wave": 6,
+      "deps": [
+        "SFP-36",
+        "SFP-17",
+        "SFP-35"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Test Designer agent + prompt"
+    },
+    {
+      "ticket": "SFP-55",
+      "wave": 6,
+      "deps": [
+        "SFP-36",
+        "SFP-15",
+        "SFP-35",
+        "SFP-38",
+        "SFP-41",
+        "SFP-45"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Coder agent + prompt"
+    },
+    {
+      "ticket": "SFP-56",
+      "wave": 6,
+      "deps": [
+        "SFP-36",
+        "SFP-16",
+        "SFP-35",
+        "SFP-42",
+        "SFP-171"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Reviewer agent + prompt (judgment-only)"
+    },
+    {
+      "ticket": "SFP-101",
+      "wave": 6,
+      "deps": [
+        "SFP-29",
+        "SFP-97",
+        "SFP-98"
+      ],
+      "area": "MSG-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "sfp-messaging SNS/SQS transport"
+    },
+    {
+      "ticket": "SFP-150",
+      "wave": 6,
+      "deps": [
+        "SFP-76",
+        "SFP-48"
+      ],
+      "area": "WSW",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Batch task definition (container, sandbox, egress policy)"
+    },
+    {
+      "ticket": "SFP-159",
+      "wave": 6,
+      "deps": [
+        "SFP-75"
+      ],
+      "area": "CICD",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "release workflow: build + push (ECR)"
+    },
+    {
+      "ticket": "SFP-164",
+      "wave": 6,
+      "deps": [
+        "SFP-92"
+      ],
+      "area": "VAL",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Crash mid-outbox → no duplicate business effect"
+    },
+    {
+      "ticket": "SFP-52",
+      "wave": 7,
+      "deps": [
+        "SFP-51"
+      ],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Readiness gate: manual-required classification"
+    },
+    {
+      "ticket": "SFP-63",
+      "wave": 7,
+      "deps": [
+        "SFP-49",
+        "SFP-51",
+        "SFP-53",
+        "SFP-54",
+        "SFP-55",
+        "SFP-56",
+        "SFP-57"
+      ],
+      "area": "LOCAL",
+      "executor": "ai-agent",
+      "phase": "Manual Core",
+      "title": "Manual-run runbook"
+    },
+    {
+      "ticket": "SFP-102",
+      "wave": 7,
+      "deps": [
+        "SFP-28",
+        "SFP-101"
+      ],
+      "area": "MSG-INFRA",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Envelope propagation across SNS/SQS"
+    },
+    {
+      "ticket": "SFP-103",
+      "wave": 7,
+      "deps": [
+        "SFP-96",
+        "SFP-101"
+      ],
+      "area": "EXT-EVT",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Webhook endpoint `/webhooks/{endpoint_id}`"
+    },
+    {
+      "ticket": "SFP-108",
+      "wave": 7,
+      "deps": [
+        "SFP-94",
+        "SFP-101"
+      ],
+      "area": "IDENT",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "User aggregate + lifecycle"
+    },
+    {
+      "ticket": "SFP-112",
+      "wave": 7,
+      "deps": [
+        "SFP-95",
+        "SFP-101"
+      ],
+      "area": "COMM",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "UserInteraction lifecycle (create/expire/complete)"
+    },
+    {
+      "ticket": "SFP-120",
+      "wave": 7,
+      "deps": [
+        "SFP-82",
+        "SFP-101"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Workflow engine + state machine"
+    },
+    {
+      "ticket": "SFP-143",
+      "wave": 7,
+      "deps": [
+        "SFP-101",
+        "SFP-36",
+        "SFP-55",
+        "SFP-56"
+      ],
+      "area": "WSW",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Execution coordinator service skeleton"
+    },
+    {
+      "ticket": "SFP-160",
+      "wave": 7,
+      "deps": [
+        "SFP-159"
+      ],
+      "area": "CICD",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "release workflow: deploy (Pulumi + ECS)"
+    },
+    {
+      "ticket": "SFP-163",
+      "wave": 7,
+      "deps": [
+        "SFP-101",
+        "SFP-93"
+      ],
+      "area": "VAL",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Duplicate delivery → idempotency holds"
+    },
+    {
+      "ticket": "SFP-104",
+      "wave": 8,
+      "deps": [
+        "SFP-103"
+      ],
+      "area": "EXT-EVT",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Endpoint config resolver"
+    },
+    {
+      "ticket": "SFP-107",
+      "wave": 8,
+      "deps": [
+        "SFP-103",
+        "SFP-101"
+      ],
+      "area": "EXT-EVT",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "ExternalEventReceived publisher"
+    },
+    {
+      "ticket": "SFP-109",
+      "wave": 8,
+      "deps": [
+        "SFP-108"
+      ],
+      "area": "IDENT",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "UserExternalIdentity + mappings"
+    },
+    {
+      "ticket": "SFP-113",
+      "wave": 8,
+      "deps": [
+        "SFP-112"
+      ],
+      "area": "COMM",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "UserInteraction summary + expiration timer"
+    },
+    {
+      "ticket": "SFP-114",
+      "wave": 8,
+      "deps": [
+        "SFP-112"
+      ],
+      "area": "COMM",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Closed-interaction handling (no reopen; context ref)"
+    },
+    {
+      "ticket": "SFP-116",
+      "wave": 8,
+      "deps": [
+        "SFP-112"
+      ],
+      "area": "COMM",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Slack provider: outbound messages"
+    },
+    {
+      "ticket": "SFP-117",
+      "wave": 8,
+      "deps": [
+        "SFP-112",
+        "SFP-36"
+      ],
+      "area": "COMM",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Communication Agent (summarization, context)"
+    },
+    {
+      "ticket": "SFP-121",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Transitions: ticket→PR-spec stage"
+    },
+    {
+      "ticket": "SFP-122",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Transitions: coding/review stages"
+    },
+    {
+      "ticket": "SFP-123",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Transitions: merge/deploy stages"
+    },
+    {
+      "ticket": "SFP-124",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Transitions: WAITING_FOR_USER + failure/terminal"
+    },
+    {
+      "ticket": "SFP-125",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Policy engine (deterministic evaluation)"
+    },
+    {
+      "ticket": "SFP-130",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Aggregate manager (consistency)"
+    },
+    {
+      "ticket": "SFP-132",
+      "wave": 8,
+      "deps": [
+        "SFP-51",
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Hosting: Readiness Gate wiring"
+    },
+    {
+      "ticket": "SFP-133",
+      "wave": 8,
+      "deps": [
+        "SFP-53",
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Hosting: Planner wiring"
+    },
+    {
+      "ticket": "SFP-134",
+      "wave": 8,
+      "deps": [
+        "SFP-49",
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Hosting: context resolver wiring"
+    },
+    {
+      "ticket": "SFP-135",
+      "wave": 8,
+      "deps": [
+        "SFP-120",
+        "SFP-101"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Command emission: ExecuteCodingJob"
+    },
+    {
+      "ticket": "SFP-136",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Command emission: ReviewPullRequest"
+    },
+    {
+      "ticket": "SFP-137",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Command emission: SynchronizePullRequest"
+    },
+    {
+      "ticket": "SFP-138",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Command emission: RequestMerge"
+    },
+    {
+      "ticket": "SFP-139",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Command emission: RequestUserInput + NotifyUser"
+    },
+    {
+      "ticket": "SFP-140",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Command emission: CancelCodingJob + CancelReviewJob"
+    },
+    {
+      "ticket": "SFP-141",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Query API: RetrieveWorkflowContext"
+    },
+    {
+      "ticket": "SFP-142",
+      "wave": 8,
+      "deps": [
+        "SFP-120"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Query API: RetrieveTicketSummary + RetrieveProject"
+    },
+    {
+      "ticket": "SFP-144",
+      "wave": 8,
+      "deps": [
+        "SFP-143",
+        "SFP-101",
+        "SFP-76"
+      ],
+      "area": "WSW",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Consumer: ExecuteCodingJob"
+    },
+    {
+      "ticket": "SFP-145",
+      "wave": 8,
+      "deps": [
+        "SFP-143"
+      ],
+      "area": "WSW",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Consumer: ReviewPullRequest"
+    },
+    {
+      "ticket": "SFP-146",
+      "wave": 8,
+      "deps": [
+        "SFP-143"
+      ],
+      "area": "WSW",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Consumer: SynchronizePullRequest"
+    },
+    {
+      "ticket": "SFP-147",
+      "wave": 8,
+      "deps": [
+        "SFP-143"
+      ],
+      "area": "WSW",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Consumer: RequestMerge"
+    },
+    {
+      "ticket": "SFP-148",
+      "wave": 8,
+      "deps": [
+        "SFP-143"
+      ],
+      "area": "WSW",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Consumer: CancelCodingJob + CancelReviewJob"
+    },
+    {
+      "ticket": "SFP-151",
+      "wave": 8,
+      "deps": [
+        "SFP-143"
+      ],
+      "area": "WSW",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Execution reporting: CodingJobUpdated"
+    },
+    {
+      "ticket": "SFP-152",
+      "wave": 8,
+      "deps": [
+        "SFP-143"
+      ],
+      "area": "WSW",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Execution reporting: ReviewUpdated + MergeUpdated"
+    },
+    {
+      "ticket": "SFP-154",
+      "wave": 8,
+      "deps": [
+        "SFP-143"
+      ],
+      "area": "WSW",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Workspace Worker observability hooks"
+    },
+    {
+      "ticket": "SFP-168",
+      "wave": 8,
+      "deps": [
+        "SFP-112"
+      ],
+      "area": "VAL",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Closed UserInteraction not reopened"
+    },
+    {
+      "ticket": "SFP-105",
+      "wave": 9,
+      "deps": [
+        "SFP-104"
+      ],
+      "area": "EXT-EVT",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Authentication strategy factory"
+    },
+    {
+      "ticket": "SFP-110",
+      "wave": 9,
+      "deps": [
+        "SFP-108",
+        "SFP-109"
+      ],
+      "area": "IDENT",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Identity resolution (external↔platform)"
+    },
+    {
+      "ticket": "SFP-115",
+      "wave": 9,
+      "deps": [
+        "SFP-107",
+        "SFP-112"
+      ],
+      "area": "COMM",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Slack provider: inbound event handling"
+    },
+    {
+      "ticket": "SFP-118",
+      "wave": 9,
+      "deps": [
+        "SFP-112",
+        "SFP-117"
+      ],
+      "area": "COMM",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "CONFIRM flow (summary→CONFIRM→UserDecision)"
+    },
+    {
+      "ticket": "SFP-119",
+      "wave": 9,
+      "deps": [
+        "SFP-116"
+      ],
+      "area": "COMM",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Notifications + input requests (NotifyUser/RequestUserInput)"
+    },
+    {
+      "ticket": "SFP-126",
+      "wave": 9,
+      "deps": [
+        "SFP-125"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Policies: coding-start / review-success / merge-ready"
+    },
+    {
+      "ticket": "SFP-127",
+      "wave": 9,
+      "deps": [
+        "SFP-125"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Policies: user-approval / deploy-begin / fail"
+    },
+    {
+      "ticket": "SFP-128",
+      "wave": 9,
+      "deps": [
+        "SFP-125",
+        "SFP-76"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Scheduler: admission + concurrency"
+    },
+    {
+      "ticket": "SFP-131",
+      "wave": 9,
+      "deps": [
+        "SFP-130"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Decision recorder (WorkflowDecision persistence)"
+    },
+    {
+      "ticket": "SFP-149",
+      "wave": 9,
+      "deps": [
+        "SFP-144",
+        "SFP-76"
+      ],
+      "area": "WSW",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "SQS→Batch bridge + task-per-job dispatch"
+    },
+    {
+      "ticket": "SFP-153",
+      "wave": 9,
+      "deps": [
+        "SFP-147",
+        "SFP-44"
+      ],
+      "area": "WSW",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Merge execution via Git Provider Adapter"
+    },
+    {
+      "ticket": "SFP-170",
+      "wave": 9,
+      "deps": [
+        "SFP-132",
+        "SFP-143"
+      ],
+      "area": "VAL",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "E2E happy path: ticket→plan→code→review→merge→deploy"
+    },
+    {
+      "ticket": "SFP-106",
+      "wave": 10,
+      "deps": [
+        "SFP-105"
+      ],
+      "area": "EXT-EVT",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Authentication strategies (HMAC, signatures)"
+    },
+    {
+      "ticket": "SFP-111",
+      "wave": 10,
+      "deps": [
+        "SFP-110"
+      ],
+      "area": "IDENT",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Identity read-only query API"
+    },
+    {
+      "ticket": "SFP-129",
+      "wave": 10,
+      "deps": [
+        "SFP-128"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Scheduler: max-vCpus ceiling + dispatch"
+    },
+    {
+      "ticket": "SFP-166",
+      "wave": 10,
+      "deps": [
+        "SFP-143",
+        "SFP-131"
+      ],
+      "area": "VAL",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Worker crash/restart → recover from durable state"
+    },
+    {
+      "ticket": "SFP-167",
+      "wave": 10,
+      "deps": [
+        "SFP-128"
+      ],
+      "area": "VAL",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Scheduler capacity/admission enforced"
+    },
+    {
+      "ticket": "SFP-169",
+      "wave": 10,
+      "deps": [
+        "SFP-153"
+      ],
+      "area": "VAL",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Merge conflict handling"
+    }
+  ]
+}
