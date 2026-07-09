@@ -59,14 +59,14 @@ VALID_VERIFICATION_TYPES = ("script", "command")
 # VALIDATION — collects ALL violations (no short-circuit)
 # ============================================================
 
+
 def validate(spec) -> list:
     """Validate a PRSpec dict. Returns a list of human-readable violation
     strings (empty == valid). Collects every violation; never short-circuits."""
     violations = []
 
     if not isinstance(spec, dict):
-        return ["spec must be a JSON object (dict); got "
-                f"{type(spec).__name__}"]
+        return [f"spec must be a JSON object (dict); got {type(spec).__name__}"]
 
     # ---- required top-level keys ----------------------------------------
     for key in REQUIRED_TOP_LEVEL_KEYS:
@@ -81,14 +81,13 @@ def validate(spec) -> list:
     if "verification" in spec:
         v = spec["verification"]
         if not isinstance(v, dict):
-            violations.append("'verification' must be a dict "
-                              f"(got {type(v).__name__})")
+            violations.append(f"'verification' must be a dict (got {type(v).__name__})")
         else:
             vtype = v.get("type")
             if vtype not in VALID_VERIFICATION_TYPES:
                 violations.append(
-                    "'verification.type' must be one of "
-                    f"{VALID_VERIFICATION_TYPES} (got {vtype!r})")
+                    f"'verification.type' must be one of {VALID_VERIFICATION_TYPES} (got {vtype!r})"
+                )
             body = v.get("body")
             if not isinstance(body, str) or not body.strip():
                 violations.append("'verification.body' must be a non-empty string")
@@ -113,12 +112,10 @@ def validate(spec) -> list:
         else:
             strategy = cp.get("strategy")
             if not isinstance(strategy, str) or not strategy.strip():
-                violations.append(
-                    "'commit_plan.strategy' must be a non-empty string")
+                violations.append("'commit_plan.strategy' must be a non-empty string")
             cm = cp.get("commit_message")
             if not isinstance(cm, str) or not cm.strip():
-                violations.append(
-                    "'commit_plan.commit_message' must be a non-empty string")
+                violations.append("'commit_plan.commit_message' must be a non-empty string")
 
     # ---- risks ----------------------------------------------------------
     if "risks" in spec:
@@ -136,9 +133,7 @@ def validate(spec) -> list:
     if "dependencies" in spec:
         d = spec["dependencies"]
         if not isinstance(d, (dict, list)):
-            violations.append(
-                "'dependencies' must be a dict or list "
-                f"(got {type(d).__name__})")
+            violations.append(f"'dependencies' must be a dict or list (got {type(d).__name__})")
 
     # ---- acceptance_criteria_mapping (must be dict) --------------------
     if "acceptance_criteria_mapping" in spec:
@@ -146,7 +141,8 @@ def validate(spec) -> list:
         if not isinstance(acm, dict):
             violations.append(
                 "'acceptance_criteria_mapping' must be a dict "
-                f"(got {type(acm).__name__}; list/scalar rejected)")
+                f"(got {type(acm).__name__}; list/scalar rejected)"
+            )
 
     # NOTE: unknown/extra top-level keys are NOT rejected (presence+shape
     # only). Duplicate file paths are NOT rejected either. See PRSpec SFP-193.
@@ -163,17 +159,14 @@ def _check_files(files) -> list:
         return out
     for i, entry in enumerate(files):
         if not isinstance(entry, dict):
-            out.append(f"files[{i}] must be a dict/object "
-                       f"(got {type(entry).__name__})")
+            out.append(f"files[{i}] must be a dict/object (got {type(entry).__name__})")
             continue
         path = entry.get("path")
         if not isinstance(path, str) or not path.strip():
-            out.append(f"files[{i}] missing or empty 'path' "
-                       "(non-empty string required)")
+            out.append(f"files[{i}] missing or empty 'path' (non-empty string required)")
         action = entry.get("action")
         if action not in VALID_ACTIONS:
-            out.append(f"files[{i}] invalid 'action' {action!r} "
-                       f"(must be one of {VALID_ACTIONS})")
+            out.append(f"files[{i}] invalid 'action' {action!r} (must be one of {VALID_ACTIONS})")
         # create/delete with an anchor present is OK (ignored, not rejected).
         if action == "modify":
             out.extend(_check_anchor(entry.get("anchor"), i))
@@ -188,18 +181,17 @@ def _check_anchor(anchor, i: int) -> list:
         out.append(f"files[{i}] action=modify REQUIRES an 'anchor' (missing)")
         return out
     if not isinstance(anchor, dict):
-        out.append(f"files[{i}] 'anchor' must be a dict "
-                   f"(got {type(anchor).__name__})")
+        out.append(f"files[{i}] 'anchor' must be a dict (got {type(anchor).__name__})")
         return out
     has_before = "before" in anchor
     has_range = "line_range" in anchor
     if has_before and has_range:
-        out.append(f"files[{i}] 'anchor' must have EXACTLY ONE of "
-                   "before/line_range (both present)")
+        out.append(f"files[{i}] 'anchor' must have EXACTLY ONE of before/line_range (both present)")
         return out
     if not has_before and not has_range:
-        out.append(f"files[{i}] 'anchor' must have EXACTLY ONE of "
-                   "before/line_range (neither present)")
+        out.append(
+            f"files[{i}] 'anchor' must have EXACTLY ONE of before/line_range (neither present)"
+        )
         return out
     if has_before:
         b = anchor["before"]
@@ -209,23 +201,23 @@ def _check_anchor(anchor, i: int) -> list:
     # line_range path
     lr = anchor["line_range"]
     if not isinstance(lr, list) or len(lr) != 2:
-        out.append(f"files[{i}] anchor.line_range must be a 2-element list "
-                   "[start, end]")
+        out.append(f"files[{i}] anchor.line_range must be a 2-element list [start, end]")
         return out
     start, end = lr[0], lr[1]
     # Reject bools explicitly: isinstance(True, int) is True in Python, so the
     # int check alone would let True/False through.
-    if (isinstance(start, bool) or isinstance(end, bool)
-            or not isinstance(start, int) or not isinstance(end, int)):
-        out.append(f"files[{i}] anchor.line_range elements must be ints "
-                   "(bools rejected)")
+    if (
+        isinstance(start, bool)
+        or isinstance(end, bool)
+        or not isinstance(start, int)
+        or not isinstance(end, int)
+    ):
+        out.append(f"files[{i}] anchor.line_range elements must be ints (bools rejected)")
         return out
     if start < 1:
-        out.append(f"files[{i}] anchor.line_range start must be >= 1 "
-                   f"(got {start})")
+        out.append(f"files[{i}] anchor.line_range start must be >= 1 (got {start})")
     if end < start:
-        out.append(f"files[{i}] anchor.line_range end ({end}) must be "
-                   f">= start ({start})")
+        out.append(f"files[{i}] anchor.line_range end ({end}) must be >= start ({start})")
     return out
 
 
@@ -233,15 +225,16 @@ def _check_anchor(anchor, i: int) -> list:
 # CLI
 # ============================================================
 
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="check_prspec.py",
         description="Structurally validate an SFP PRSpec JSON (SFP-14 / ID-021).",
     )
-    p.add_argument("--file",
-                   help="path to a PRSpec JSON file; if omitted, read stdin")
-    p.add_argument("--sample", action="store_true",
-                   help="self-test against bundled fixtures (exit 0 if ok)")
+    p.add_argument("--file", help="path to a PRSpec JSON file; if omitted, read stdin")
+    p.add_argument(
+        "--sample", action="store_true", help="self-test against bundled fixtures (exit 0 if ok)"
+    )
     return p.parse_args(argv)
 
 
@@ -255,8 +248,10 @@ def _run_sample() -> int:
         return 1
     ex_v = validate(example)
     inv_v = validate(invalid)
-    print("sample: example -> {} violation(s) (expect 0); "
-          "invalid -> {} violation(s) (expect >0)".format(len(ex_v), len(inv_v)))
+    print(
+        f"sample: example -> {len(ex_v)} violation(s) (expect 0); "
+        f"invalid -> {len(inv_v)} violation(s) (expect >0)"
+    )
     return 0 if (ex_v == [] and len(inv_v) > 0) else 1
 
 
@@ -286,8 +281,7 @@ def main(argv=None) -> int:
 
     violations = validate(spec)
     if violations:
-        print(f"error: {len(violations)} violation(s) in {source}:",
-              file=sys.stderr)
+        print(f"error: {len(violations)} violation(s) in {source}:", file=sys.stderr)
         for v in violations:
             print(f"  - {v}", file=sys.stderr)
         return 1

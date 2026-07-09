@@ -44,6 +44,7 @@ DEFAULT_OUT_JSON = "docs/build_order.json"
 # INDEX + VALIDATION
 # ============================================================
 
+
 def build_index(tickets):
     """Build a {num: ticket} index from the parsed ticket list."""
     return {t["num"]: t for t in tickets}
@@ -64,7 +65,7 @@ def compute_waves(tickets, by_num):
     """Compute {num: wave} via memoized longest-path with DFS recursion-stack
     cycle detection. Exits non-zero naming cycle members if a cycle is found."""
     memo = {}
-    stack = []        # current recursion path (nums)
+    stack = []  # current recursion path (nums)
     on_stack = set()  # O(1) membership for the current path
 
     def wave_of(num):
@@ -94,6 +95,7 @@ def compute_waves(tickets, by_num):
 # READY SET (--done mode)
 # ============================================================
 
+
 def compute_ready(tickets, done_set):
     """Tickets NOT in done whose deps ⊆ done, lowest-num-first.
     `done_set` is a set of ticket-id strings (e.g. {"SFP-5", "SFP-6"})."""
@@ -110,6 +112,7 @@ def compute_ready(tickets, done_set):
 # ============================================================
 # EMIT
 # ============================================================
+
 
 def _group_by_wave(tickets, waves):
     """Return {wave: [tickets]} with each group sorted ascending by num."""
@@ -130,12 +133,16 @@ def emit_md(tickets, waves, doc_path, out_path):
         "",
         f"Source: `{doc_path}`",
         "",
-        ("Waves computed via longest-path (Kahn): `wave(t)=0` if no deps, "
-         "else `1+max(wave(dep))`. Within each wave, tickets are sorted "
-         "ascending by number."),
+        (
+            "Waves computed via longest-path (Kahn): `wave(t)=0` if no deps, "
+            "else `1+max(wave(dep))`. Within each wave, tickets are sorted "
+            "ascending by number."
+        ),
         "",
-        ("`*(B→A)*` markers are informational (platform → manual-core) and "
-         "are stripped for dependency resolution."),
+        (
+            "`*(B→A)*` markers are informational (platform → manual-core) and "
+            "are stripped for dependency resolution."
+        ),
         "",
     ]
     for w in range(max_wave + 1):
@@ -184,19 +191,24 @@ def emit_json(tickets, waves, out_path):
 # CLI
 # ============================================================
 
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="build_order.py",
         description="Deterministic build-order generator (SFP-195).",
     )
-    p.add_argument("--doc", default=DEFAULT_DOC,
-                   help=f"hierarchy markdown (default: {DEFAULT_DOC})")
-    p.add_argument("--out-md", default=DEFAULT_OUT_MD,
-                   help=f"output markdown path (default: {DEFAULT_OUT_MD})")
-    p.add_argument("--out-json", default=DEFAULT_OUT_JSON,
-                   help=f"output json path (default: {DEFAULT_OUT_JSON})")
-    p.add_argument("--done", default=None,
-                   help="comma-separated done ticket ids; prints ready set")
+    p.add_argument(
+        "--doc", default=DEFAULT_DOC, help=f"hierarchy markdown (default: {DEFAULT_DOC})"
+    )
+    p.add_argument(
+        "--out-md", default=DEFAULT_OUT_MD, help=f"output markdown path (default: {DEFAULT_OUT_MD})"
+    )
+    p.add_argument(
+        "--out-json",
+        default=DEFAULT_OUT_JSON,
+        help=f"output json path (default: {DEFAULT_OUT_JSON})",
+    )
+    p.add_argument("--done", default=None, help="comma-separated done ticket ids; prints ready set")
     return p.parse_args(argv)
 
 
@@ -213,8 +225,7 @@ def main(argv=None):
     dangling = check_dangling(tickets, by_num)
     if dangling:
         offender, missing = dangling
-        sys.exit(f"error: {offender} depends on {missing} "
-                 f"which is not in the hierarchy")
+        sys.exit(f"error: {offender} depends on {missing} which is not in the hierarchy")
 
     # 2) Cycle detection + waves.
     waves = compute_waves(tickets, by_num)

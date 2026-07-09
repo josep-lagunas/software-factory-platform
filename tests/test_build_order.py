@@ -4,6 +4,7 @@ Covers TC-001..016. The REAL cjt.parse_hierarchy is used as the oracle (never
 reimplemented). All file I/O is redirected to tmp_path; the real docs/ tree is
 never mutated. Synthetic fixtures are deterministic (no network, no env).
 """
+
 import json
 import sys
 from pathlib import Path
@@ -15,11 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
 sys.path.insert(0, str(TOOLS))
 
-import create_jira_tickets as cjt  # noqa: E402
 import build_order  # noqa: E402
+import create_jira_tickets as cjt  # noqa: E402
 
 REAL_DOC = ROOT / "docs" / "SFP_Ticket_Hierarchy.md"
-BOT = "\U0001F916"  # 🤖
+BOT = "\U0001f916"  # 🤖
 
 # ============================================================
 # FIXTURES (deterministic synthetic markdown)
@@ -80,6 +81,7 @@ SINGLE = f"""# MANUAL CORE
 # HELPERS
 # ============================================================
 
+
 def write_fixture(tmp_path, content, name="hierarchy.md"):
     """Write markdown content to a tmp file; return its path."""
     p = tmp_path / name
@@ -106,8 +108,7 @@ def run_main(tmp_path, doc_path, extra=None):
     """Invoke build_order.main with outputs redirected to tmp_path."""
     out_md = tmp_path / "BUILD_ORDER.md"
     out_json = tmp_path / "build_order.json"
-    argv = ["--doc", str(doc_path), "--out-md", str(out_md),
-            "--out-json", str(out_json)]
+    argv = ["--doc", str(doc_path), "--out-md", str(out_md), "--out-json", str(out_json)]
     if extra:
         argv.extend(extra)
     rc = build_order.main(argv)
@@ -117,6 +118,7 @@ def run_main(tmp_path, doc_path, extra=None):
 # ============================================================
 # TC-001 — parse: id-set == cjt.parse_hierarchy oracle, count == 8
 # ============================================================
+
 
 def test_tc001_parse_matches_oracle(tmp_path):
     doc = write_fixture(tmp_path, PRIMARY)
@@ -132,6 +134,7 @@ def test_tc001_parse_matches_oracle(tmp_path):
 # TC-002 — integration smoke on the real hierarchy doc
 # ============================================================
 
+
 def test_tc002_integration_smoke_real_doc(tmp_path):
     rc, _, out_json = run_main(tmp_path, REAL_DOC)
     assert rc == 0
@@ -145,6 +148,7 @@ def test_tc002_integration_smoke_real_doc(tmp_path):
 # ============================================================
 # TC-003 — wave == longest-path (universal invariant; SFP-6 == 3)
 # ============================================================
+
 
 def test_tc003_wave_is_longest_path(tmp_path):
     doc = write_fixture(tmp_path, PRIMARY)
@@ -165,6 +169,7 @@ def test_tc003_wave_is_longest_path(tmp_path):
 # TC-004 — within-wave ascending (wave-1 == [3,4,7,8])
 # ============================================================
 
+
 def test_tc004_within_wave_ascending(tmp_path):
     doc = write_fixture(tmp_path, PRIMARY)
     _, tickets = cjt.parse_hierarchy(str(doc))
@@ -181,6 +186,7 @@ def test_tc004_within_wave_ascending(tmp_path):
 # TC-005 — cycle detection names the cycle members
 # ============================================================
 
+
 def test_tc005_cycle_names_members(tmp_path):
     doc = write_fixture(tmp_path, CYCLE)
     with pytest.raises(SystemExit) as exc:
@@ -194,18 +200,20 @@ def test_tc005_cycle_names_members(tmp_path):
 # TC-006 — dangling dep names the offender + missing dep
 # ============================================================
 
+
 def test_tc006_dangling_names_offender(tmp_path):
     doc = write_fixture(tmp_path, DANGLING)
     with pytest.raises(SystemExit) as exc:
         run_main(tmp_path, doc)
     msg = str(exc.value)
-    assert "SFP-9999" in msg          # the missing dep
-    assert "SFP-2" in msg             # the offender ticket
+    assert "SFP-9999" in msg  # the missing dep
+    assert "SFP-2" in msg  # the offender ticket
 
 
 # ============================================================
 # TC-007 — --done SFP-1 → ready [2,3] (both directions)
 # ============================================================
+
 
 def test_tc007_done_ready_set_single(tmp_path):
     doc = write_fixture(tmp_path, PRIMARY)
@@ -223,6 +231,7 @@ def test_tc007_done_ready_set_single(tmp_path):
 # ============================================================
 # TC-008 — --done SFP-1,SFP-2 → ready [3,4,7,8] (both directions)
 # ============================================================
+
 
 def test_tc008_done_ready_set_multi(tmp_path):
     doc = write_fixture(tmp_path, PRIMARY)
@@ -242,6 +251,7 @@ def test_tc008_done_ready_set_multi(tmp_path):
 # TC-009 — emit md+json; flat_order ordered; 3-deep index > transitive deps
 # ============================================================
 
+
 def test_tc009_emit_and_ordering(tmp_path):
     doc = write_fixture(tmp_path, PRIMARY)
     rc, out_md, out_json = run_main(tmp_path, doc)
@@ -249,8 +259,7 @@ def test_tc009_emit_and_ordering(tmp_path):
     assert out_md.exists() and out_json.exists()
     data = json.loads(out_json.read_text())
     # flat_order ordered by (wave asc, num asc)
-    expected_flat = ["SFP-1", "SFP-2", "SFP-3", "SFP-4",
-                     "SFP-7", "SFP-8", "SFP-5", "SFP-6"]
+    expected_flat = ["SFP-1", "SFP-2", "SFP-3", "SFP-4", "SFP-7", "SFP-8", "SFP-5", "SFP-6"]
     assert data["flat_order"] == expected_flat
     # 3-deep ticket (SFP-6) index > index of all its transitive deps
     _, tickets = cjt.parse_hierarchy(str(doc))
@@ -265,24 +274,24 @@ def test_tc009_emit_and_ordering(tmp_path):
 # TC-010 — json schema completeness + md/json count parity
 # ============================================================
 
+
 def test_tc010_json_schema_and_parity(tmp_path):
     doc = write_fixture(tmp_path, PRIMARY)
     rc, out_md, out_json = run_main(tmp_path, doc)
     assert rc == 0
     data = json.loads(out_json.read_text())
-    expected_keys = {"ticket", "wave", "deps", "area",
-                     "executor", "phase", "title"}
+    expected_keys = {"ticket", "wave", "deps", "area", "executor", "phase", "title"}
     for t in data["tickets"]:
         assert set(t.keys()) == expected_keys
     # md/json count parity: one table row per ticket
-    md_rows = [row for row in out_md.read_text().splitlines()
-               if row.startswith("| SFP-")]
+    md_rows = [row for row in out_md.read_text().splitlines() if row.startswith("| SFP-")]
     assert len(md_rows) == len(data["tickets"]) == 8
 
 
 # ============================================================
 # TC-011 — determinism (byte-identical re-emit, no timestamps)
 # ============================================================
+
 
 def test_tc011_determinism(tmp_path):
     doc = write_fixture(tmp_path, PRIMARY)
@@ -305,6 +314,7 @@ def test_tc011_determinism(tmp_path):
 # TC-012 — empty hierarchy → flat_order []
 # ============================================================
 
+
 def test_tc012_empty(tmp_path):
     doc = write_fixture(tmp_path, EMPTY)
     rc, out_md, out_json = run_main(tmp_path, doc)
@@ -320,6 +330,7 @@ def test_tc012_empty(tmp_path):
 # TC-013 — single root ticket
 # ============================================================
 
+
 def test_tc013_single(tmp_path):
     doc = write_fixture(tmp_path, SINGLE)
     rc, _, out_json = run_main(tmp_path, doc)
@@ -334,6 +345,7 @@ def test_tc013_single(tmp_path):
 # TC-014 — self-cycle (SFP-1 → SFP-1)
 # ============================================================
 
+
 def test_tc014_self_cycle(tmp_path):
     doc = write_fixture(tmp_path, SELF_CYCLE)
     with pytest.raises(SystemExit) as exc:
@@ -344,6 +356,7 @@ def test_tc014_self_cycle(tmp_path):
 # ============================================================
 # TC-015 — --done CLI stdout (ready set printed, no docs emitted)
 # ============================================================
+
 
 def test_tc015_done_cli_stdout(tmp_path, capsys):
     doc = write_fixture(tmp_path, PRIMARY)
@@ -359,6 +372,7 @@ def test_tc015_done_cli_stdout(tmp_path, capsys):
 # TC-016 — coverage gate (missing-doc branch + API surface)
 # ============================================================
 
+
 def test_tc016_missing_doc_exits(tmp_path):
     """Covers the file-not-found branch. The >=90% coverage gate itself is
     enforced by `coverage report --fail-under=90` in the verification command."""
@@ -369,6 +383,13 @@ def test_tc016_missing_doc_exits(tmp_path):
 
 def test_tc016_public_api_surface():
     """Structural smoke — all documented functions are present and callable."""
-    for name in ("build_index", "check_dangling", "compute_waves",
-                 "compute_ready", "emit_md", "emit_json", "main"):
+    for name in (
+        "build_index",
+        "check_dangling",
+        "compute_waves",
+        "compute_ready",
+        "emit_md",
+        "emit_json",
+        "main",
+    ):
         assert callable(getattr(build_order, name)), name

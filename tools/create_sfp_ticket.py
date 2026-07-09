@@ -40,7 +40,7 @@ import create_jira_tickets as cjt  # noqa: E402
 # ============================================================
 
 # executor (as used on the CLI) -> heading/summary emoji
-EMOJI = {"bot": "\U0001F916", "human": "\U0001F464"}  # 🤖 / 👤
+EMOJI = {"bot": "\U0001f916", "human": "\U0001f464"}  # 🤖 / 👤
 # executor -> Jira label
 EXECUTOR_LABEL = {"bot": "ai-agent", "human": "manual"}
 
@@ -48,6 +48,7 @@ EXECUTOR_LABEL = {"bot": "ai-agent", "human": "manual"}
 # ============================================================
 # SMALL HELPERS
 # ============================================================
+
 
 def _parse_csv(value):
     """Split a 'a,b,c' arg into a clean list (drop empty/whitespace entries)."""
@@ -69,11 +70,15 @@ def _require_env():
     Reuses the cjt module globals (which themselves read os.environ at import);
     tests monkeypatch these attributes directly on cjt.
     """
-    missing = [name for name, val in (
-        ("JIRA_SITE", cjt.JIRA_SITE),
-        ("JIRA_EMAIL", cjt.JIRA_EMAIL),
-        ("JIRA_API_TOKEN", cjt.JIRA_API_TOKEN),
-    ) if not val]
+    missing = [
+        name
+        for name, val in (
+            ("JIRA_SITE", cjt.JIRA_SITE),
+            ("JIRA_EMAIL", cjt.JIRA_EMAIL),
+            ("JIRA_API_TOKEN", cjt.JIRA_API_TOKEN),
+        )
+        if not val
+    ]
     if missing:
         print("❌ Missing env vars: " + ", ".join(missing))
         sys.exit(1)
@@ -82,6 +87,7 @@ def _require_env():
 # ============================================================
 # CREATE
 # ============================================================
+
 
 def run_create(args):
     # Validate required create flags first (fail fast on user input).
@@ -103,7 +109,7 @@ def run_create(args):
 
     emoji = EMOJI[args.executor]
     executor_label = EXECUTOR_LABEL[args.executor]
-    summary = "[{}] {} {}".format(args.area, emoji, args.title)
+    summary = f"[{args.area}] {emoji} {args.title}"
 
     extras = _parse_csv(args.labels)
     raw_labels = []
@@ -134,6 +140,7 @@ def run_create(args):
 # ============================================================
 # UPDATE
 # ============================================================
+
 
 def _resolve_update_description(existing, args):
     """Resolve the description for an update PUT.
@@ -192,7 +199,7 @@ def run_update(args):
         sys.exit(1)
     _require_env()
 
-    existing = cjt.jira_api("GET", "/issue/{}".format(args.key))
+    existing = cjt.jira_api("GET", f"/issue/{args.key}")
     if not existing:
         print("❌ could not fetch " + args.key)
         sys.exit(1)
@@ -205,7 +212,7 @@ def run_update(args):
         "description": description,
         "labels": labels,
     }
-    cjt.jira_api("PUT", "/issue/{}".format(args.key), {"fields": fields})
+    cjt.jira_api("PUT", f"/issue/{args.key}", {"fields": fields})
     print(args.key)
 
 
@@ -213,39 +220,48 @@ def run_update(args):
 # CLI
 # ============================================================
 
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="create_sfp_ticket.py",
         description="Create or update a single SFP Jira ticket (SFP-194). "
-                    "Reuses tools/create_jira_tickets.py helpers.",
+        "Reuses tools/create_jira_tickets.py helpers.",
     )
-    p.add_argument("--update", action="store_true",
-                   help="update an existing ticket instead of creating one")
+    p.add_argument(
+        "--update", action="store_true", help="update an existing ticket instead of creating one"
+    )
     # ---- create-only ----
     p.add_argument("--title", help="ticket title (create)")
     p.add_argument("--area", help="area tag, e.g. SPEC (create)")
-    p.add_argument("--executor", choices=list(EMOJI),
-                   help="who executes: bot or human (create)")
-    p.add_argument("--phase", choices=["manual-core", "platform"],
-                   help="phase label (create, optional)")
-    p.add_argument("--deps",
-                   help="comma-separated dependency ids (create, accepted; "
-                        "linking is out of scope for single-ticket create)")
-    p.add_argument("--labels",
-                   help="comma-separated extra labels (create + update)")
-    p.add_argument("--description",
-                   help="path to a markdown body file, or '-' for stdin (create)")
+    p.add_argument("--executor", choices=list(EMOJI), help="who executes: bot or human (create)")
+    p.add_argument(
+        "--phase", choices=["manual-core", "platform"], help="phase label (create, optional)"
+    )
+    p.add_argument(
+        "--deps",
+        help="comma-separated dependency ids (create, accepted; "
+        "linking is out of scope for single-ticket create)",
+    )
+    p.add_argument("--labels", help="comma-separated extra labels (create + update)")
+    p.add_argument("--description", help="path to a markdown body file, or '-' for stdin (create)")
     # ---- update-only ----
     p.add_argument("--key", help="existing issue key, e.g. SFP-194 (update)")
     p.add_argument("--summary", help="new summary (update)")
-    p.add_argument("--description-source", choices=["existing", "file"],
-                   help="where the update description comes from (update)")
-    p.add_argument("--description-file",
-                   help="markdown body file (update; required with "
-                        "--description-source file)")
-    p.add_argument("--labels-mode", choices=["merge", "replace"], default="merge",
-                   help="merge = existing ∪ parsed (default); "
-                        "replace = drop existing (update)")
+    p.add_argument(
+        "--description-source",
+        choices=["existing", "file"],
+        help="where the update description comes from (update)",
+    )
+    p.add_argument(
+        "--description-file",
+        help="markdown body file (update; required with --description-source file)",
+    )
+    p.add_argument(
+        "--labels-mode",
+        choices=["merge", "replace"],
+        default="merge",
+        help="merge = existing ∪ parsed (default); replace = drop existing (update)",
+    )
     return p
 
 

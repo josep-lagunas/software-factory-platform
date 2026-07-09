@@ -30,14 +30,14 @@ Configuration (env vars — set before running, do NOT hardcode the token):
     JIRA_PROJECT   - Project key (default SFP)
 """
 
+import base64
 import json
 import os
 import re
 import sys
 import time
-import base64
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 
 # ============================================================
@@ -53,8 +53,8 @@ JIRA_PROJECT = os.environ.get("JIRA_PROJECT", "SFP")
 # id (commonly customfield_10014) and the script will use that field instead.
 EPIC_LINK_FIELD = os.environ.get("EPIC_LINK_FIELD", "")
 
-HERE = Path(__file__).resolve().parent          # tools/
-ROOT = HERE.parent                               # repo root
+HERE = Path(__file__).resolve().parent  # tools/
+ROOT = HERE.parent  # repo root
 HIERARCHY_FILE = ROOT / "docs" / "SFP_Ticket_Hierarchy.md"
 STATE_FILE = ROOT / ".jira_creation_state.json"
 
@@ -64,6 +64,7 @@ API_DELAY_MS = 300
 # ============================================================
 # JIRA API HELPERS
 # ============================================================
+
 
 def get_auth_header():
     """Build Basic auth header from email:api_token."""
@@ -134,10 +135,10 @@ def get_project_issue_types():
 # MARKDOWN PARSER (SFP format)
 # ============================================================
 
-SECTION_RE = re.compile(r'^# (MANUAL CORE|PLATFORM)')
-EPIC_RE = re.compile(r'^## (.+?)\s+Epic\b')
-TICKET_RE = re.compile(r'^### (SFP-\d+) \[([^\]]+)\] (🤖|👤) — (.+)$')
-LABELS_RE = re.compile(r'^\*\*Labels:\*\*\s*(.+)$')
+SECTION_RE = re.compile(r"^# (MANUAL CORE|PLATFORM)")
+EPIC_RE = re.compile(r"^## (.+?)\s+Epic\b")
+TICKET_RE = re.compile(r"^### (SFP-\d+) \[([^\]]+)\] (🤖|👤) — (.+)$")
+LABELS_RE = re.compile(r"^\*\*Labels:\*\*\s*(.+)$")
 
 
 def parse_hierarchy(filepath):
@@ -151,8 +152,8 @@ def parse_hierarchy(filepath):
     """
     text = Path(filepath).read_text()
 
-    epics = []          # [{epic_id, name, phase}]
-    tickets = []        # parsed tickets
+    epics = []  # [{epic_id, name, phase}]
+    tickets = []  # parsed tickets
     cur_epic = None
     cur_phase = None
     epic_counter = 0
@@ -182,8 +183,7 @@ def parse_hierarchy(filepath):
             flush()
             epic_counter += 1
             name = em.group(1).strip()
-            cur_epic = {"epic_id": f"EPIC-{epic_counter}",
-                        "name": name, "phase": cur_phase}
+            cur_epic = {"epic_id": f"EPIC-{epic_counter}", "name": name, "phase": cur_phase}
             epics.append(cur_epic)
             continue
 
@@ -213,7 +213,7 @@ def parse_hierarchy(filepath):
             if ml and not cur["labels"]:
                 parts = line.split("|")
                 labels_part = parts[0].replace("**Labels:**", "").strip()
-                cur["labels"] = [l.strip() for l in labels_part.split(",") if l.strip()]
+                cur["labels"] = [label.strip() for label in labels_part.split(",") if label.strip()]
                 for p in parts:
                     if "**Deps:**" in p:
                         d = p.split("**Deps:**", 1)[1]
@@ -234,10 +234,11 @@ def parse_hierarchy(filepath):
 # DESCRIPTION / LABEL HELPERS
 # ============================================================
 
+
 def inline_nodes(s):
     """Split a line into ADF text nodes, handling `code` and **bold**."""
     nodes = []
-    for tok in re.split(r'(`[^`]+`|\*\*[^*]+\*\*)', s):
+    for tok in re.split(r"(`[^`]+`|\*\*[^*]+\*\*)", s):
         if not tok:
             continue
         if tok.startswith("`") and tok.endswith("`"):
@@ -262,9 +263,14 @@ def markdown_to_adf(text):
             return
         items = []
         for raw in bullet_buf:
-            item = re.sub(r'^- ', '', raw.strip())  # keep "[ ]" checkboxes literal (ARCONTA-consistent)
-            items.append({"type": "listItem",
-                          "content": [{"type": "paragraph", "content": inline_nodes(item)}]})
+            # keep "[ ]" checkboxes literal (ARCONTA-consistent)
+            item = re.sub(r"^- ", "", raw.strip())
+            items.append(
+                {
+                    "type": "listItem",
+                    "content": [{"type": "paragraph", "content": inline_nodes(item)}],
+                }
+            )
         content.append({"type": "bulletList", "content": items})
         bullet_buf.clear()
 
@@ -273,11 +279,16 @@ def markdown_to_adf(text):
         if not s:
             flush_bullets()
             continue
-        m = re.match(r'\*\*([A-Z][^*]*):\*\*(.*)$', s)  # **Section:** [trailing content]
+        m = re.match(r"\*\*([A-Z][^*]*):\*\*(.*)$", s)  # **Section:** [trailing content]
         if m:
             flush_bullets()
-            content.append({"type": "heading", "attrs": {"level": 3},
-                            "content": [{"type": "text", "text": m.group(1).strip()}]})
+            content.append(
+                {
+                    "type": "heading",
+                    "attrs": {"level": 3},
+                    "content": [{"type": "text", "text": m.group(1).strip()}],
+                }
+            )
             trailing = m.group(2).strip()
             if trailing:  # inline content -> separate paragraph (with code/bold marks)
                 content.append({"type": "paragraph", "content": inline_nodes(trailing)})
@@ -313,7 +324,7 @@ def build_issue_labels(ticket):
     The phase label is already present in the ticket's labels (manual-core/platform),
     so we only sanitize and dedupe here.
     """
-    labels = [sanitize_label(l) for l in ticket["labels"]]
+    labels = [sanitize_label(label) for label in ticket["labels"]]
     return list(dict.fromkeys(labels))  # dedupe, preserve order
 
 
@@ -321,9 +332,10 @@ def build_issue_labels(ticket):
 # STATE MANAGEMENT (resume support)
 # ============================================================
 
+
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
+        with open(STATE_FILE) as f:
             return json.load(f)
     return {"created": {}, "epics_created": {}, "links_created": False}
 
@@ -336,6 +348,7 @@ def save_state(state):
 # ============================================================
 # MAIN
 # ============================================================
+
 
 def update_descriptions(tickets):
     """Re-push the (now complete) description to each existing Jira issue,
@@ -359,7 +372,7 @@ def update_descriptions(tickets):
             failed += 1
             print(f"  [{i}/{total}] ❌ {t['id']} → {key}")
         time.sleep(API_DELAY_MS / 1000)
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"✅ Updated: {updated} | Failed: {failed} | Skipped: {skipped}")
     if failed:
         print("   Re-run with --update-descriptions to retry failures.")
@@ -367,13 +380,11 @@ def update_descriptions(tickets):
 
 def main():
     dry_run = "--dry-run" in sys.argv
-    resume = "--resume" in sys.argv
     update_desc = "--update-descriptions" in sys.argv
 
     # Validate config (unless dry-run)
     if not dry_run:
-        missing = [k for k in ("JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN")
-                   if not globals()[k]]
+        missing = [k for k in ("JIRA_SITE", "JIRA_EMAIL", "JIRA_API_TOKEN") if not globals()[k]]
         if missing:
             print(f"❌ Missing env vars: {', '.join(missing)}")
             print("   Export JIRA_SITE, JIRA_EMAIL, JIRA_API_TOKEN (and optionally JIRA_PROJECT).")
@@ -385,10 +396,14 @@ def main():
 
     epics, tickets = parse_hierarchy(HIERARCHY_FILE)
     print(f"📋 Parsed {len(tickets)} tickets across {len(epics)} epics from {HIERARCHY_FILE.name}")
-    print(f"   Manual Core: {sum(1 for t in tickets if t['phase']=='Manual Core')} | "
-          f"Platform: {sum(1 for t in tickets if t['phase']=='Platform')}")
-    print(f"   Manual (👤): {sum(1 for t in tickets if t['executor']=='manual')} | "
-          f"AI (🤖): {sum(1 for t in tickets if t['executor']=='ai-agent')}")
+    print(
+        f"   Manual Core: {sum(1 for t in tickets if t['phase'] == 'Manual Core')} | "
+        f"Platform: {sum(1 for t in tickets if t['phase'] == 'Platform')}"
+    )
+    print(
+        f"   Manual (👤): {sum(1 for t in tickets if t['executor'] == 'manual')} | "
+        f"AI (🤖): {sum(1 for t in tickets if t['executor'] == 'ai-agent')}"
+    )
 
     if update_desc:
         print(f"\n🔄 Updating descriptions for {len(tickets)} existing issues...")
@@ -440,10 +455,19 @@ def main():
             "project": {"key": JIRA_PROJECT},
             "summary": name,
             "description": {
-                "type": "doc", "version": 1,
-                "content": [{"type": "paragraph",
-                             "content": [{"type": "text",
-                                          "text": f"Epic: {e['name']} — phase: {e.get('phase','')}"}]}],
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (f"Epic: {e['name']} — phase: {e.get('phase', '')}"),
+                            }
+                        ],
+                    }
+                ],
             },
             "issuetype": {"id": type_mapping.get("Epic", type_mapping.get("Task"))},
             "labels": [sanitize_label(e.get("phase") or "platform"), "epic"],
@@ -491,8 +515,10 @@ def main():
         print(f"  {t['emoji']} Creating {t['id']}: {summary[:80]}")
         key = create_issue(fields)
         if not key:
-            print(f"     ⚠️ No parent link type set? "
-                  f"{'using ' + EPIC_LINK_FIELD if EPIC_LINK_FIELD else 'using parent field'}")
+            print(
+                f"     ⚠️ No parent link type set? "
+                f"{'using ' + EPIC_LINK_FIELD if EPIC_LINK_FIELD else 'using parent field'}"
+            )
         if key:
             created[t["id"]] = key
             state["created"] = created
@@ -503,7 +529,7 @@ def main():
         time.sleep(API_DELAY_MS / 1000)
 
     # ---- STEP 3: Dependency links (Blocks) ----
-    print(f"\n🔗 Step 3: Creating dependency links...")
+    print("\n🔗 Step 3: Creating dependency links...")
     links_created = links_failed = 0
     for t in tickets:
         if t["id"] not in created or not t["deps"]:
@@ -526,13 +552,15 @@ def main():
     save_state(state)
 
     # ---- SUMMARY ----
-    print(f"\n{'='*60}")
-    print(f"✅ CREATION COMPLETE")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print("✅ CREATION COMPLETE")
+    print(f"{'=' * 60}")
     print(f"  Epics created: {len(epics_created)}/{len(epics)}")
     print(f"  Issues created: {len(created)}/{len(tickets)}")
-    print(f"  Dependency links created: {links_created}"
-          + (f"  (failed: {links_failed})" if links_failed else ""))
+    print(
+        f"  Dependency links created: {links_created}"
+        + (f"  (failed: {links_failed})" if links_failed else "")
+    )
     if len(created) < len(tickets):
         missing = [t["id"] for t in tickets if t["id"] not in created]
         print(f"\n⚠️ Missing: {', '.join(missing)}")
