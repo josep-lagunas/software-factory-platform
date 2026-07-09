@@ -117,6 +117,20 @@ def create_issue_link(link_type, inward_key, outward_key):
     return jira_api("POST", "/issueLink", data) is not None
 
 
+def blocks_link_keys(blocking_key, blocked_key):
+    """Return ``(inward_key, outward_key)`` for a Blocks link meaning
+    *blocking_key blocks blocked_key* (i.e. blocked_key depends on blocking_key).
+
+    Empirically verified against the Jira UI (2026-07-10, SFP-196): for a Blocks
+    link the **inwardIssue is the BLOCKER** and the **outwardIssue is the
+    BLOCKED** issue — the opposite of what the link type's label names
+    ("outward = blocks", "inward = is blocked by") suggest. Swapping these two
+    arguments reverses every dependency arrow in the backlog, so do not invert
+    without re-verifying against the UI.
+    """
+    return blocking_key, blocked_key
+
+
 def get_issue_link_types():
     result = jira_api("GET", "/issueLinkType")
     if result:
@@ -540,8 +554,8 @@ def main():
                 print(f"  ⚠️ {t['id']} depends on {dep_id} (not created) — skipping link")
                 continue
             blocking_key = created[dep_id]
-            # Blocks: outward = blocks, inward = is blocked
-            if create_issue_link("Blocks", inward_key=blocked_key, outward_key=blocking_key):
+            inward, outward = blocks_link_keys(blocking_key, blocked_key)
+            if create_issue_link("Blocks", inward_key=inward, outward_key=outward):
                 links_created += 1
                 print(f"  🔗 {dep_id} ({blocking_key}) blocks {t['id']} ({blocked_key})")
             else:
