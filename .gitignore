@@ -5,6 +5,9 @@
 *.pem
 *.key
 secrets.*
+# sfp_config's SecretRef is a value-free reference type (ID-016, MAS §10.8);
+# un-ignore that module while keeping real secret material out of git.
+!packages/sfp-config/src/sfp_config/secrets.py
 
 # ── Jira upload run state ───────────────────────────
 .jira_creation_state.json
