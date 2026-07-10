@@ -41,3 +41,32 @@ exclude = [
 # service genuinely needs a strict-rule loosened. Do not relax globally.
 # packages/sfp-contracts is the canonical strict surface (ID-062) and
 # inherits strict = true from above.
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests", "packages", "services"]
+
+[tool.coverage.run]
+source = [
+    "packages/sfp-contracts/src",
+    "packages/sfp-observability/src",
+    "packages/sfp-testing/src",
+    "packages/sfp-messaging/src",
+    "packages/sfp-agent-runtime/src",
+    "packages/sfp-config/src",
+    "services/identity/src",
+    "services/communication/src",
+    "services/workspace-worker/src",
+    "services/orchestrator/src",
+    "services/external-events/src",
+]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
