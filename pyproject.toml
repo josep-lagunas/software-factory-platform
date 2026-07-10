@@ -29,3 +29,15 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+exclude = [
+    "/tests/",
+]
+
+# Per-service relaxations: add a [[tool.mypy.overrides]] block here when a
+# service genuinely needs a strict-rule loosened. Do not relax globally.
+# packages/sfp-contracts is the canonical strict surface (ID-062) and
+# inherits strict = true from above.
