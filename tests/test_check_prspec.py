@@ -532,7 +532,14 @@ def test_tc_016_readme_mentions_linter():
 def test_tc_017_coverage_threshold(tmp_path):
     # Isolated COVERAGE_FILE so we don't clobber the outer run's data.
     cov_file = tmp_path / ".coverage"
-    env_cov = {"COVERAGE_FILE": str(cov_file), "SFP_COVERAGE_CHILD": "1"}
+    env_cov = {
+        "COVERAGE_FILE": str(cov_file),
+        "SFP_COVERAGE_CHILD": "1",
+        # Ignore the workspace [tool.coverage] config: its `source` list
+        # excludes tools/ (see SFP-27), which would yield "No data to report".
+        # This test specifies everything via CLI (--include, --fail-under).
+        "COVERAGE_RCFILE": "/dev/null",
+    }
     # Run the suite under coverage, scoped to the linter.
     r = subprocess.run(
         [
