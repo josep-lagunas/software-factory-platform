@@ -1,0 +1,55 @@
+# Local-development Docker Compose for SFP infrastructure dependencies.
+#
+# Scope of this file (SFP-76 / doc SFP-59): the Postgres cluster ONLY.
+# LocalStack (SNS/SQS/DLQ) and the OpenTelemetry Collector are added by later
+# tickets per ID-055; this file is intentionally limited to the persistence
+# dependency.
+#
+# Per ID-055, Compose brings up *dependencies only*; application services run on
+# the host via `uv run` (one process per service) for fast reload/debugging.
+# Per MAS §10.14, one Postgres cluster hosts multiple logical databases — shared
+# infrastructure is permitted, shared *ownership* is not.
+#
+# Usage:
+#   docker compose -f infrastructure/local/compose.yaml up -d
+#   docker compose -f infrastructure/local/compose.yaml ps
+#   docker compose -f infrastructure/local/compose.yaml down      # keep data
+#   docker compose -f infrastructure/local/compose.yaml down -v   # wipe data
+#
+# Connect from the host (e.g. for psql / Alembic) as the local-dev superuser:
+#   psql "host=localhost port=5432 user=sfp password=sfp_local_dev dbname=identity"
+#
+# All values below are overridable from a local .env file or the shell; the
+# defaults keep `docker compose up` zero-config for local development.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sfp-postgres
+    restart: unless-stopped
+    environment:
+      # Cluster superuser + default maintenance DB. The four service logical
+      # databases (identity, orchestrator, communication, external_events) are
+      # created at first startup by postgres/init.sh, mounted below.
+      POSTGRES_USER: ${POSTGRES_USER:-sfp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sfp_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Logical-DB provisioning; the entrypoint runs /docker-entrypoint-initdb.d
+      # scripts once, against an empty data volume, as the superuser.
+      - ./postgres/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+      # Named volume so data survives `down`; use `down -v` to wipe and reprovision.
+      - sfp-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # `$$` is escaped so Compose does not interpolate it; the container shell
+      # expands $POSTGRES_USER / $POSTGRES_DB from the env above.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  sfp-postgres-data:
