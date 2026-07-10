@@ -118,6 +118,16 @@ wheels = [
 name = "external-events"
 version = "0.1.0"
 source = { editable = "services/external-events" }
+dependencies = [
+    { name = "alembic" },
+    { name = "sqlalchemy" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "alembic", specifier = ">=1.13.0" },
+    { name = "sqlalchemy", specifier = ">=2.0.0" },
+]
 
 [[package]]
 name = "greenlet"
