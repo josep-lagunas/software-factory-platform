@@ -237,7 +237,6 @@ wheels = [
 ]
 
 [[package]]
-<<<<<<< HEAD
 name = "pydantic-settings"
 version = "2.14.2"
 source = { registry = "https://pypi.org/simple" }
@@ -252,8 +251,6 @@ wheels = [
 ]
 
 [[package]]
-=======
->>>>>>> 9a1fa45 (SFP-30: add pydantic v2 dependency to sfp-contracts + regenerate uv.lock)
 name = "pygments"
 version = "2.20.0"
 source = { registry = "https://pypi.org/simple" }
