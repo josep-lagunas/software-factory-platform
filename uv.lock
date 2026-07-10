@@ -355,6 +355,12 @@ requires-dist = [{ name = "pydantic-settings", specifier = ">=2.5.0" }]
 name = "sfp-contracts"
 version = "0.1.0"
 source = { editable = "packages/sfp-contracts" }
+dependencies = [
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pydantic", specifier = ">=2.0,<3.0" }]
 
 [[package]]
 name = "sfp-messaging"
