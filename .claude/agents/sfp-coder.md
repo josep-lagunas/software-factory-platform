@@ -54,6 +54,26 @@ Output is **structured** (JSON matching SFP-15).
 
 > Phase A note: classic PATs are required (fine-grained PATs cannot write to a repo the bot collaborates on but does not own — verified during SFP-22; see ID-073). Production replaces this with a single platform GitHub App.
 
+## Staged execution (Phase A)
+
+A Coder **invocation does ONE stage and stops at a commit** — it does not implement + verify + PR + merge in a single run. The Orchestrator chunks a ticket's work into short, commit-boundary stages (the Phase A shadow of ID-074). Short runs are less likely to stall, and a stall only ever costs one stage's in-progress edit.
+
+The stages map onto the existing **≤2-commit cap** (ID-022) — the allowed commits *are* the implementation checkpoints, so the branch never exceeds 2 commits and the squash-merge still yields one commit on `main`:
+
+| Stage | This invocation does | Checkpoint |
+|---|---|---|
+| **S1a — code** | write the implementation | → **commit-1 (code)**, stop |
+| **S1b — tests** | write the tests | → **commit-2 (tests)**, stop |
+| **S2 — verify+PR** | run gates, push, open PR, → In Review | (no new code commit) |
+| **S3 — review** | *(Reviewer agent — not the Coder)* | review event |
+| **S4 — merge+Done** | execute `RequestMerge` + transition Done (MAS §9.6) | squash → 1 on main |
+
+Rules:
+- **Each stage ends at a commit** (S1a/S1b) or a durable event (S2/S4). A stall is recovered by resuming the agent (`SendMessage`) or spawning a fresh Coder pointed at the committed state — bounded to the one stage in progress.
+- **Size-gated:** small / config-only tickets collapse S1a + S1b into a single run (one commit if code-only, two if code+tests). Only **heavy multi-file** tickets (plausibly > ~5–10 min of agent work) get the split — that is where stalls have actually occurred.
+- The Coder never exceeds the ≤2-commit cap: S1a and S1b produce the two allowed commits; S2 produces no code commit. The PR opens with ≤2 commits on the branch, always.
+- The Coder does **not** decide staging — the Orchestrator tells it which stage to run ("S1a: implement, commit code, stop"). The Coder performs the named stage and reports.
+
 ## Jira status ownership
 
 The Coder drives its ticket's status through the lifecycle (MAS §9.6, ID-072) — the Orchestrator only *decides* (emits `RequestMerge`) and does **not** transition status itself. Load creds first (`. ./source-env.sh`), then use the helper:
