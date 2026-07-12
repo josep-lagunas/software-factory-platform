@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # SFP env loader.
 #
-# Usage (from the repo root):
+# Usage (from anywhere in the repo, incl. a git worktree):
 #     source ./source-env.sh      # zsh / bash
 #     . ./source-env.sh           # POSIX sh
 #
@@ -13,12 +13,33 @@
 # regardless of whether the line in .env carries an `export` prefix.
 # (.env is mixed: Jira keys use `export`, the Anthropic + GitHub keys do not.)
 #
-# Point at a different file with:  SFP_ENV_FILE=/path/.env source ./source-env.sh
+# .env resolution (worktree-safe): an explicit SFP_ENV_FILE wins; otherwise the
+# MAIN repo root's .env is used — resolved via `git rev-parse --git-common-root`
+# so that a git worktree (which has no .env of its own, since .env is gitignored
+# and lives only in the main checkout) still loads the real credentials. Without
+# this, sourcing from a worktree silently leaves GITHUB_TOKEN_*/JIRA_* empty and
+# `gh` falls back to the human's stored auth (mis-attributing PRs).
+# Override with:  SFP_ENV_FILE=/path/.env source ./source-env.sh
 
-ENV_FILE="${SFP_ENV_FILE:-./.env}"
+if [ -n "${SFP_ENV_FILE:-}" ]; then
+  ENV_FILE="$SFP_ENV_FILE"
+else
+  # --git-common-dir is the shared .git dir (absolute from a linked worktree,
+  # ".git" from the main checkout). Its parent is the main repo root, where the
+  # gitignored .env actually lives.
+  _GIT_COMMON="$(git rev-parse --git-common-dir 2>/dev/null)"
+  _REPO_ROOT=""
+  [ -n "$_GIT_COMMON" ] && _REPO_ROOT="$(cd "$_GIT_COMMON/.." && pwd 2>/dev/null)"
+  if [ -n "$_REPO_ROOT" ] && [ -f "$_REPO_ROOT/.env" ]; then
+    ENV_FILE="$_REPO_ROOT/.env"
+  else
+    ENV_FILE="./.env"
+  fi
+  unset _GIT_COMMON _REPO_ROOT
+fi
 
 if [ ! -f "$ENV_FILE" ]; then
-  echo "source-env.sh: .env not found at $ENV_FILE (run from repo root, or set SFP_ENV_FILE)" >&2
+  echo "source-env.sh: .env not found at $ENV_FILE (run from a repo/worktree, or set SFP_ENV_FILE)" >&2
   return 1 2>/dev/null || exit 1
 fi
 
