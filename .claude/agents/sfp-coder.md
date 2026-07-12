@@ -70,7 +70,17 @@ The stages map onto the existing **≤2-commit cap** (ID-022) — the allowed co
 
 Rules:
 - **Each stage ends at a commit** (S1a/S1b) or a durable event (S2/S4). A stall is recovered by resuming the agent (`SendMessage`) or spawning a fresh Coder pointed at the committed state — bounded to the one stage in progress.
-- **Size-gated:** small / config-only tickets collapse S1a + S1b into a single run (one commit if code-only, two if code+tests). Only **heavy multi-file** tickets (plausibly > ~5–10 min of agent work) get the split — that is where stalls have actually occurred.
+- **Size-gated by a heaviness rubric.** The Orchestrator applies this at **planning time** (the PRSpec is visible — `files[]`, dep additions, referenced IDs) and **reports the call** (e.g. "staging: 2-of-6 — file surface + new dep"). Split into separate S1a/S1b runs only if the ticket meets **≥2** of:
+  - **File surface** — PRSpec lists **>5 files** to create/modify, or spans **>2 directories**.
+  - **New dependency** — adds **≥1 runtime dep** (→ `uv lock` churn + merge-time rebase).
+  - **Distinct components** — introduces **≥3 concerns** (e.g. model + migration + tests; provider + interface + wiring).
+  - **New scaffolding** — creates a **new package/sub-tree** with multiple files (e.g. `alembic/`, a new sub-package).
+  - **Design depth** — non-trivial **schema / protocol / security / stateful-logic** design.
+  - **Test mass** — expects **>~12 test cases** / heavy fixtures / parametrization.
+
+  If **≤1** of these hold, collapse S1a + S1b into a **single run**. (The single best predictor is "estimated agent run > ~10 min"; the six signals are how that is read off the ticket upfront.)
+- **Always commit-bounded (universal).** Even a single-run ticket still does **code-commit → tests-commit** (the ≤2-commit rule). So a stall in *any* ticket — staged or not — recovers from the last commit. The commit-boundary discipline is free and durable; only the multi-run *split* is gated by the rubric.
+- **Reactive fallback.** The rubric is a prediction, not a guarantee. If a single-run ticket *does* stall, resume it as stages from the last commit (the commit-boundaries make this always possible).
 - The Coder never exceeds the ≤2-commit cap: S1a and S1b produce the two allowed commits; S2 produces no code commit. The PR opens with ≤2 commits on the branch, always.
 - The Coder does **not** decide staging — the Orchestrator tells it which stage to run ("S1a: implement, commit code, stop"). The Coder performs the named stage and reports.
 
