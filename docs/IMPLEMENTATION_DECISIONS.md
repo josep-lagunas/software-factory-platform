@@ -5,7 +5,7 @@ Version: 1.0
 Date: 2026-07-03
 Author: Josep Lagunas
 
-This document is the canonical catalogue of SFP implementation decisions (ID-001 … ID-072). It is derived from the Master Architecture Specification and must not contradict it; where a decision and the MAS conflict, the MAS prevails. Each entry records context, decision, rationale, alternatives considered, consequences, references, and affected components. The final section lists Open Validation Items to close during implementation.
+This document is the canonical catalogue of SFP implementation decisions (ID-001 … ID-074). It is derived from the Master Architecture Specification and must not contradict it; where a decision and the MAS conflict, the MAS prevails. Each entry records context, decision, rationale, alternatives considered, consequences, references, and affected components. The final section lists Open Validation Items to close during implementation.
 
 ---
 
@@ -2638,6 +2638,48 @@ ID-016 (secrets), ID-020 (config-driven provider selection), ID-023 (judgment-on
 
 ### Affected Components
 Workspace Worker (Git Provider Adapter), Agent Runtime, sfp-config, Orchestrator (no change to merge centralization, ID-072).
+
+---
+
+## ID-074
+
+### Title
+CodingJob execution is staged and resumable from durable state.
+
+### Status
+Accepted
+
+### Context
+A CodingJob performs substantial, multi-step work (checkout → implement → local validation → commit/push/PR → review → merge) in a sandboxed workspace. MAS §6.9 defines a CodingJob as "one implementation execution" that is non-interactive and fails on ambiguity; §9.6 defines the Workspace Worker's repository/validation/reporting responsibilities, and §4.10 gives the platform idempotency and durability primitives. The MAS does not specify what happens when an execution stalls or is restarted mid-job. During the Phase A bootstrap, agent runs repeatedly stalled mid-execution (API stream watchdogs); recovery required reconstructing partial state, and the cost/determinism risk of re-running a whole job from scratch after a late-stage stall motivated making stage-level resumability explicit.
+
+### Decision
+A CodingJob executes as an ordered sequence of **stages**, each ending at a **durable checkpoint**. A worker that stalls, fails, or is restarted **resumes the CodingJob from its last completed stage**, never from scratch. Concretely:
+
+- **Code-producing stages** checkpoint via **git commits** on the job branch (the artifact state). A commit is the correct, sufficient save point for file state — no parallel store duplicates it.
+- **The workflow pointer** ("which stage is this job on; what is next") and **non-code stages** (run gates, open PR, submit review, execute merge, observe deployment) checkpoint via **CodingJob stage-state in platform persistence** — a durable business fact owned by the Workspace Worker, consistent with MAS §4 ("durable business facts owned by services").
+- Stage transitions are **idempotent**, reusing §4.10 `idempotency_key` semantics: a redelivered or re-executed stage produces no duplicate effects.
+
+This is an execution-recovery property. It does **not** loosen MAS §6.9: a genuine business failure (e.g. an insufficient PRSpecification, or a blocking ambiguity) still fails the CodingJob with a structured reason. Resumability governs *infrastructure* stalls/restarts, not *business* failures.
+
+### Rationale
+Bounds the blast radius of an execution stall to one stage's in-progress work; keeps completed work durable across restarts; aligns job execution with the platform's existing durability/idempotency model; preserves determinism (a resumed job reaches the same outcome as a non-stalled one). Uses git for what git is good at (artifact state) and platform persistence for what it is good at (workflow position + non-code outcomes).
+
+### Alternatives Considered
+- **Atomic CodingJob (fail → re-run from scratch):** simpler state model but wastes completed work on any late stall and amplifies cost/latency under flaky execution. Rejected for v0's determinism and cost goals.
+- **Whole-workspace resume with no stage state:** retains files but cannot tell which logical stage completed → ambiguous recovery (the Phase A failure mode this ID addresses). Rejected.
+- **Workflow state stored *in* git (e.g. a committed `.sfp-job-state` file):** couples the workflow ledger to the code repo and breaks down for non-branch stages (merge/review/deploy). Rejected; the workflow ledger is the platform's own durable fact (MAS §4).
+
+### Consequences
+- The CodingJob aggregate gains an explicit, persisted **stage-state** field.
+- The Repository Manager / worktree lifecycle must retain workspace state across stalls (already implied by "worktree lifecycle" in §9.6, now load-bearing for resumability).
+- Each stage must be idempotent and end at a checkpoint (git commit for code stages; job-state row for non-code stages and the workflow pointer).
+- Phase A operational shadow: the manual runbook (SFP-63) uses commit-boundary stages with ephemeral agents; this ID is the durable Phase B statement of that pattern.
+
+### References
+MAS §4 (durable business facts), §4.10 (idempotency), §6.9 (CodingJob), §9.6 (Workspace Worker: Repository Execution, Execution Reporting, Execution Coordinator). Phase A lesson: agent stalls + commit-boundary recovery (batch 2, 2026-07). Related: ID-034 (workspace checkout), ID-035 (Git Provider Adapter).
+
+### Affected Components
+Workspace Worker (Execution Coordinator, Repository Execution, Agent Runtime), CodingJob aggregate, Workspace Worker persistence (job stage-state).
 
 ---
 
