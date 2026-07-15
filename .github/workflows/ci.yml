@@ -41,3 +41,69 @@ jobs:
         run: uv sync --all-packages --frozen
       - name: Mypy typecheck
         run: uv run mypy packages services
+
+  discover-members:
+    runs-on: ubuntu-latest
+    outputs:
+      members: ${{ steps.discover.outputs.members }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Discover members with tests
+        id: discover
+        run: |
+          # Recursive find: every workspace member (packages/ or services/)
+          # that has >=1 test_*.py anywhere under its tests/ tree. The
+          # `-path '*/tests/*'` filter is load-bearing — it excludes stray
+          # test files outside a tests/ subtree.
+          members=$(find packages services -type f -name 'test_*.py' -path '*/tests/*' \
+            | awk -F/ '{print $1"/"$2}' | sort -u)
+
+          # On pull_request, keep only members touched by the PR diff so
+          # untouched services skip the matrix; on push to main keep every
+          # member-with-tests.
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            changed=$(git diff --name-only "$base_sha" HEAD \
+              | awk -F/ '{print $1"/"$2}' | sort -u)
+            members=$(comm -12 \
+              <(printf '%s\n' "$members") \
+              <(printf '%s\n' "$changed"))
+          fi
+
+          # Compact JSON array; empty discovery yields the bare token [].
+          json=$(printf '%s' "$members" \
+            | jq -R -sc 'split("\n") | map(select(length > 0))')
+          echo "members=$json" >> "$GITHUB_OUTPUT"
+          echo "Discovered members-with-tests: $json"
+
+  test:
+    needs: discover-members
+    if: needs.discover-members.outputs.members != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        member: ${{ fromJson(needs.discover-members.outputs.members) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+      - name: Sync dependencies (frozen lockfile, all workspace packages)
+        run: uv sync --all-packages --frozen
+      - name: Pytest with coverage
+        # Per-member coverage gate: working-directory scopes --cov to this
+        # member's SFP-213 [tool.coverage] (sources + fail_under=90).
+        working-directory: ${{ matrix.member }}
+        run: uv run pytest --cov --cov-report=term-missing
