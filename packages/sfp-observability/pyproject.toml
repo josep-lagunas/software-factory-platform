@@ -7,3 +7,9 @@ dependencies = ["structlog>=24.4.0"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.coverage.run]
+source = ["src/sfp_observability"]
+
+[tool.coverage.report]
+fail_under = 90
