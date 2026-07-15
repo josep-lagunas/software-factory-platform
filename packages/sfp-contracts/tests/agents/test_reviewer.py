@@ -13,7 +13,6 @@ Covers the acceptance criteria:
 """
 
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
@@ -22,7 +21,6 @@ from sfp_contracts.agents.reviewer import (
     ReviewerOutput,
     ReviewStatus,
 )
-
 
 VALID_KWARGS: dict[str, Any] = {
     "pr_spec_id": "sfp-10-verify-prspec-linter",
