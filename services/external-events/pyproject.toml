@@ -10,3 +10,9 @@ dependencies = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.coverage.run]
+source = ["src/external_events"]
+
+[tool.coverage.report]
+fail_under = 90
