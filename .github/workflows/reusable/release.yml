@@ -1,0 +1,85 @@
+# Reusable release template (SFP-179 / ID-062).
+#
+# Encodes one uniform build + publish shape so every future service/package
+# releases identically. This is forward-looking: no service publishes today,
+# but the template is in place so a new service only has to `uses:` it rather
+# than reinvent release mechanics.
+#
+# A service workflow calls it on a tag/version event like:
+#
+#   jobs:
+#     release:
+#       needs: ci
+#       uses: josep-lagunas/software-factory-platform/.github/workflows/reusable/release.yml@main
+#       with:
+#         package-path: services/identity
+#       secrets:
+#         publish-token: ${{ secrets.PUBLISH_TOKEN }}
+#
+# When `publish-token` is omitted the run builds only (no publish) — useful for
+# dry-run / verification workflows.
+name: reusable-release
+
+on:
+  workflow_call:
+    inputs:
+      package-path:
+        description: Path to the package/service to release (e.g. services/identity, packages/sfp-contracts).
+        type: string
+        required: true
+      python-version:
+        description: Python version to build with.
+        type: string
+        default: "3.13"
+    secrets:
+      publish-token:
+        description: Token used to publish the built artifact. Omit for build-only runs.
+        required: false
+  workflow_dispatch:
+    inputs:
+      package-path:
+        description: Path to the package/service to release.
+        type: string
+        required: true
+      python-version:
+        description: Python version to build with.
+        type: string
+        default: "3.13"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Release (${{ inputs.package-path }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Sync dependencies (frozen lockfile, all workspace packages)
+        run: uv sync --all-packages --frozen
+
+      - name: Build (${{ inputs.package-path }})
+        # uv builds the workspace member found in the given path.
+        working-directory: ${{ inputs.package-path }}
+        run: uv build
+
+      - name: Publish
+        env:
+          # The secrets context may not be used in `if:` expressions, so the
+          # gate is applied inside the step via the env var.
+          PUBLISH_TOKEN: ${{ secrets.publish-token }}
+        run: |
+          if [ -n "$PUBLISH_TOKEN" ]; then
+            uv publish
+          else
+            echo "No publish-token secret supplied; skipping publish (build-only)."
+          fi
