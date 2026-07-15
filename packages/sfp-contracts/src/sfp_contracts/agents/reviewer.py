@@ -14,7 +14,7 @@ Design choices:
 """
 
 from enum import StrEnum
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict
 
