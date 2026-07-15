@@ -7,9 +7,15 @@ persisted, mirroring ``workspace_worker.repo.manager``.
 """
 
 from workspace_worker.repo.git.adapter import (
+    GitDeleteResult,
     GitProviderAdapter,
     GitProviderAdapterError,
     GitPushResult,
 )
 
-__all__ = ["GitProviderAdapter", "GitProviderAdapterError", "GitPushResult"]
+__all__ = [
+    "GitDeleteResult",
+    "GitProviderAdapter",
+    "GitProviderAdapterError",
+    "GitPushResult",
+]

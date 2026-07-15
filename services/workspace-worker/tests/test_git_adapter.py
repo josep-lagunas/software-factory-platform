@@ -14,6 +14,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 from workspace_worker.repo.git.adapter import (
+    GitDeleteResult,
     GitProviderAdapter,
     GitProviderAdapterError,
     GitPushResult,
@@ -314,6 +315,174 @@ def test_empty_ref_raises_value_error_before_any_http() -> None:
     adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
     with pytest.raises(ValueError, match="ref"):
         adapter.push_branch(OWNER, REPO, "", SHA)
+
+    assert called == []  # no HTTP call made — validated locally
+
+
+# ---------------------------------------------------------------------------
+# delete_ref — DELETE a remote ref (SFP-57)
+# ---------------------------------------------------------------------------
+
+
+def test_git_delete_result_reexported() -> None:
+    # AC10: GitDeleteResult is re-exported from the git subpackage.
+    from workspace_worker.repo.git import GitDeleteResult as Reexported
+
+    assert Reexported is GitDeleteResult
+
+
+def test_delete_ref_issues_delete_with_bearer_header() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.method == "DELETE"
+        assert request.url.path == _ref_path()
+        assert request.headers.get("authorization") == f"Bearer {TOKEN}"
+        # No JSON body for DELETE.
+        assert request.content in (b"", b"null")
+        return httpx.Response(204)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.delete_ref(OWNER, REPO, REF)
+
+    assert result == GitDeleteResult(owner=OWNER, repo=REPO, ref=REF)
+    assert len(seen) == 1
+
+
+def test_delete_ref_success_on_200() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.delete_ref(OWNER, REPO, REF)
+
+    assert result == GitDeleteResult(owner=OWNER, repo=REPO, ref=REF)
+
+
+def test_delete_ref_retry_then_succeed_on_500() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries < 3:
+            return httpx.Response(500, json={"message": "server error"})
+        return httpx.Response(204)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    adapter.delete_ref(OWNER, REPO, REF)
+
+    assert tries == 3  # retried twice, succeeded on the 3rd attempt
+
+
+def test_delete_ref_retry_then_succeed_on_429() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries < 3:
+            return httpx.Response(429, json={"message": "rate limited"})
+        return httpx.Response(204)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    adapter.delete_ref(OWNER, REPO, REF)
+
+    assert tries == 3
+
+
+def test_delete_ref_retry_then_succeed_on_connect_error() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries < 3:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(204)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    adapter.delete_ref(OWNER, REPO, REF)
+
+    assert tries == 3
+
+
+def test_delete_ref_retry_exhaust_on_503_raises_adapter_error() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(503, json={"message": "unavailable"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        adapter.delete_ref(OWNER, REPO, REF)
+
+    msg = str(exc_info.value)
+    assert "503" in msg
+    assert "3 attempts" in msg
+    assert TOKEN not in msg
+    assert tries == 3  # exactly the budget
+
+
+def test_delete_ref_no_retry_on_422() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(422, json={"message": "Validation Failed"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="422"):
+        adapter.delete_ref(OWNER, REPO, REF)
+
+    assert tries == 1  # NOT retried
+
+
+def test_delete_ref_no_retry_on_404() -> None:
+    # AC9 / R4: a 404 (ref already gone) is NOT retried and NOT swallowed — it
+    # surfaces as a redacted GitProviderAdapterError. End-to-end remote-delete
+    # idempotency on an already-gone ref is an explicit out-of-scope refinement.
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="404"):
+        adapter.delete_ref(OWNER, REPO, REF)
+
+    assert tries == 1  # NOT retried
+
+
+def test_delete_ref_token_redacted_from_error_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text=f"forbidden: invalid token {TOKEN}")
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        adapter.delete_ref(OWNER, REPO, REF)
+
+    msg = str(exc_info.value)
+    assert TOKEN not in msg
+    assert "***" in msg
+
+
+def test_delete_ref_empty_ref_raises_value_error_before_any_http() -> None:
+    called: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request)
+        return httpx.Response(204)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(ValueError, match="ref"):
+        adapter.delete_ref(OWNER, REPO, "")
 
     assert called == []  # no HTTP call made — validated locally
 

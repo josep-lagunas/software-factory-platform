@@ -40,7 +40,12 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-__all__ = ["GitProviderAdapter", "GitProviderAdapterError", "GitPushResult"]
+__all__ = [
+    "GitDeleteResult",
+    "GitProviderAdapter",
+    "GitProviderAdapterError",
+    "GitPushResult",
+]
 
 #: Placeholder substituted for the token anywhere it would appear in errors.
 _REDACTED = "***"
@@ -83,6 +88,21 @@ class GitPushResult:
     ref: str
     sha: str
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class GitDeleteResult:
+    """Outcome of :meth:`GitProviderAdapter.delete_ref`.
+
+    Attributes:
+        owner: Repository owner (account or organization).
+        repo: Repository name.
+        ref: The partial ref path deleted (e.g. ``heads/sfp-57-x``).
+    """
+
+    owner: str
+    repo: str
+    ref: str
 
 
 class _TransientHTTPError(Exception):
@@ -269,3 +289,41 @@ class GitProviderAdapter:
         update = self._request("PATCH", probe_url, json={"sha": sha})
         self._raise_for_status("update ref", update, probe_url)
         return GitPushResult(owner=owner, repo=repo, ref=ref, sha=sha, created=False)
+
+    def delete_ref(self, owner: str, repo: str, ref: str) -> GitDeleteResult:
+        """Delete the remote ref ``ref`` (a branch, expressed as its partial ref path).
+
+        Issues ``DELETE {base_url}/repos/{owner}/{repo}/git/refs/{ref}`` with no
+        request body, reusing :meth:`_request` (bearer auth + tenacity retry on
+        ``{429,500,502,503,504}`` and the network errors, no retry on other
+        ``4xx``) and :meth:`_raise_for_status` (a redacted
+        :class:`GitProviderAdapterError` on any non-success).
+
+        The caller maps a branch name to the partial-ref form before delegating
+        (``<branch>`` -> ``heads/<branch>``). A ``404`` (ref already gone) is
+        surfaced as a redacted :class:`GitProviderAdapterError` and is **not**
+        swallowed — end-to-end remote-delete idempotency on an already-gone ref
+        is an explicit out-of-scope refinement for a future ticket.
+
+        Args:
+            owner: Repository owner (account or organization).
+            repo: Repository name.
+            ref: Partial ref path to delete (e.g. ``heads/sfp-57-x``). Must be
+                non-empty; an empty ref raises :class:`ValueError` before any
+                HTTP call.
+
+        Returns:
+            The :class:`GitDeleteResult` describing the outcome.
+
+        Raises:
+            ValueError: if ``ref`` is empty (before any network call).
+            GitProviderAdapterError: if the request ultimately fails after
+                retries, or a non-retryable error (incl. ``404``) is returned.
+                The token is redacted from the message.
+        """
+        if not ref:
+            raise ValueError("ref must not be empty")
+        url = f"{self._base}/repos/{owner}/{repo}/git/refs/{ref}"
+        response = self._request("DELETE", url)
+        self._raise_for_status("delete ref", response, url)
+        return GitDeleteResult(owner=owner, repo=repo, ref=ref)
