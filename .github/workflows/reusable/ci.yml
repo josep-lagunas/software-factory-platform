@@ -68,8 +68,10 @@ jobs:
         run: uv run mypy .
 
       - name: Pytest with coverage
-        # The coverage gate (>=90%) comes from pyproject.toml
-        # [tool.coverage.report] fail_under. --cov activates coverage using the
-        # sources configured in [tool.coverage.run]; the report fails the step
-        # when total coverage drops below the threshold.
+        # Per-project coverage gate: because this step runs from
+        # inputs.package-path, --cov reads the calling member's own SFP-213
+        # [tool.coverage] (sources scoped to that member, fail_under=90) rather
+        # than the bare repo-root workspace-wide config. --cov-report fails the
+        # step when that member's coverage drops below the threshold.
+        working-directory: ${{ inputs.package-path }}
         run: uv run pytest --cov --cov-report=term-missing
