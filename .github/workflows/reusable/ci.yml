@@ -1,0 +1,75 @@
+# Reusable CI template (SFP-179 / ID-062).
+#
+# Every service/package calls this template and gets an IDENTICAL CI step
+# chain, so the whole factory runs one uniform quality pipeline:
+#
+#   checkout -> setup-python -> setup-uv -> uv sync --all-packages --frozen
+#   -> ruff check -> ruff format check -> mypy -> pytest (with coverage gate)
+#
+# The setup steps (checkout / setup-python / setup-uv / uv sync / ruff) mirror
+# the `lint` job in `.github/workflows/ci.yml` and factor it into a reusable
+# form, extended with the mypy + pytest-with-coverage stages.
+#
+# A service or package workflow calls it like:
+#
+#   jobs:
+#     ci:
+#       uses: josep-lagunas/software-factory-platform/.github/workflows/reusable/ci.yml@main
+#       with:
+#         package-path: services/identity      # the caller's primary artifact
+#         python-version: "3.13"
+#
+# `package-path` scopes which workspace member is the caller's primary artifact
+# (surfaced in the job name); sync, lint, type-check, and coverage still run
+# workspace-wide so cross-package contracts stay validated. The coverage gate
+# (>=90%) is encoded in pyproject.toml as [tool.coverage.report] fail_under.
+name: reusable-ci
+
+on:
+  workflow_call:
+    inputs:
+      package-path:
+        description: Path to the calling package/service (e.g. services/identity, packages/sfp-contracts).
+        type: string
+        default: "."
+      python-version:
+        description: Python version to build with.
+        type: string
+        default: "3.13"
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: CI (${{ inputs.package-path }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Sync dependencies (frozen lockfile, all workspace packages)
+        run: uv sync --all-packages --frozen
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Mypy type check
+        run: uv run mypy .
+
+      - name: Pytest with coverage
+        # The coverage gate (>=90%) comes from pyproject.toml
+        # [tool.coverage.report] fail_under. --cov activates coverage using the
+        # sources configured in [tool.coverage.run]; the report fails the step
+        # when total coverage drops below the threshold.
+        run: uv run pytest --cov --cov-report=term-missing
