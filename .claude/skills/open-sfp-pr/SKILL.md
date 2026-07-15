@@ -73,8 +73,10 @@ Fully bot-authored: committed, pushed, and PR-opened by `sfp-coder-bot`.
 
 ## Command
 
+> `source-env.sh` resolves the gitignored `.env` from the **repo root** (via `git rev-parse`), so the skill works inside a git worktree where `.env` does not exist — loading the `.env` directly would silently leave the GitHub token empty and `gh` would fall back to the human's login.
+
 ```bash
-source .env   # loads GITHUB_TOKEN_CODER (gitignored .env)
+. ./source-env.sh   # loads GITHUB_TOKEN_CODER — resolves .env from the repo root (worktree-safe)
 GH_TOKEN="$GITHUB_TOKEN_CODER" gh pr create \
   --title "SFP-XXX: <TITLE>" \
   --base main \
@@ -102,7 +104,7 @@ EOF
 ## Verify after opening
 
 ```bash
-source .env
+. ./source-env.sh
 GH_TOKEN="$GITHUB_TOKEN_CODER" gh pr view --json number,author,url \
   --jq '"PR #\(.number) | author: \(.author.login) | \(.url)"'
 ```
