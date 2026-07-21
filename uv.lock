@@ -632,11 +632,13 @@ version = "0.1.0"
 source = { editable = "services/workspace-worker" }
 dependencies = [
     { name = "httpx" },
+    { name = "sfp-contracts" },
     { name = "tenacity" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "httpx" },
+    { name = "sfp-contracts", editable = "packages/sfp-contracts" },
     { name = "tenacity" },
 ]

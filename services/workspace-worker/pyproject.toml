@@ -5,11 +5,17 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "httpx",
     "tenacity",
+    "sfp-contracts",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# sfp-contracts is a workspace member (packages/sfp-contracts); resolve it from
+# the local workspace rather than a registry (SFP-75 — first intra-workspace dep).
+[tool.uv.sources]
+sfp-contracts = { workspace = true }
 
 [tool.coverage.run]
 source = ["src/workspace_worker"]
