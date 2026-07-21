@@ -45,6 +45,7 @@ __all__ = [
     "GitProviderAdapter",
     "GitProviderAdapterError",
     "GitPushResult",
+    "PullRequestResult",
 ]
 
 #: Placeholder substituted for the token anywhere it would appear in errors.
@@ -103,6 +104,26 @@ class GitDeleteResult:
     owner: str
     repo: str
     ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class PullRequestResult:
+    """Outcome of :meth:`GitProviderAdapter.create_pr` / :meth:`update_pr`.
+
+    Attributes:
+        owner: Repository owner (account or organization).
+        repo: Repository name.
+        number: The pull request number (GitHub integer id).
+        url: The pull request's human-readable URL, sourced from the GitHub
+            response ``html_url`` field.
+        state: The pull request state string (e.g. ``open`` / ``closed``).
+    """
+
+    owner: str
+    repo: str
+    number: int
+    url: str
+    state: str
 
 
 class _TransientHTTPError(Exception):
@@ -327,3 +348,141 @@ class GitProviderAdapter:
         response = self._request("DELETE", url)
         self._raise_for_status("delete ref", response, url)
         return GitDeleteResult(owner=owner, repo=repo, ref=ref)
+
+    def create_pr(
+        self,
+        owner: str,
+        repo: str,
+        *,
+        title: str,
+        head: str,
+        base: str,
+        body: str,
+    ) -> PullRequestResult:
+        """Create a pull request via ``POST /repos/{owner}/{repo}/pulls``.
+
+        Issues the GitHub pull-request create endpoint with a JSON payload of
+        ``{title, head, base, body}`` via :meth:`_request` (bearer auth +
+        tenacity retry on ``{429,500,502,503,504}`` and the network errors, no
+        retry on other ``4xx``) and :meth:`_raise_for_status` (a redacted
+        :class:`GitProviderAdapterError` on any non-success).
+
+        This adapter is **format-agnostic** — it carries no title/body
+        formatting knowledge and passes ``title`` / ``body`` through verbatim;
+        the caller formats them.
+
+        Args:
+            owner: Repository owner (account or organization).
+            repo: Repository name.
+            title: Pull request title (caller-formatted). Must be non-empty.
+            head: The head branch name the PR's changes come from.
+            base: The base branch name the PR targets.
+            body: Pull request body (caller-formatted).
+
+        Returns:
+            The :class:`PullRequestResult` parsed from the response JSON
+            (``number`` / ``html_url`` / ``state``).
+
+        Raises:
+            ValueError: if ``owner`` / ``repo`` / ``title`` / ``head`` / ``base``
+                is empty (before any network call).
+            GitProviderAdapterError: if the request ultimately fails after
+                retries, or a non-retryable error is returned. The token is
+                redacted from the message.
+        """
+        if not owner:
+            raise ValueError("owner must not be empty")
+        if not repo:
+            raise ValueError("repo must not be empty")
+        if not title:
+            raise ValueError("title must not be empty")
+        if not head:
+            raise ValueError("head must not be empty")
+        if not base:
+            raise ValueError("base must not be empty")
+        url = f"{self._base}/repos/{owner}/{repo}/pulls"
+        payload = {"title": title, "head": head, "base": base, "body": body}
+        response = self._request("POST", url, json=payload)
+        self._raise_for_status("create pull request", response, url)
+        data = response.json()
+        return PullRequestResult(
+            owner=owner,
+            repo=repo,
+            number=data["number"],
+            url=data["html_url"],
+            state=data["state"],
+        )
+
+    def update_pr(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+        state: str | None = None,
+    ) -> PullRequestResult:
+        """Update a pull request via ``PATCH /repos/{owner}/{repo}/pulls/{number}``.
+
+        Issues the GitHub pull-request update endpoint with a JSON body
+        containing **only** the non-``None`` fields among ``{title, body,
+        state}`` (``None`` fields are omitted, not serialized as ``null``) via
+        :meth:`_request` (bearer auth + tenacity retry on
+        ``{429,500,502,503,504}`` and the network errors, no retry on other
+        ``4xx``) and :meth:`_raise_for_status` (a redacted
+        :class:`GitProviderAdapterError` on any non-success).
+
+        This adapter is **format-agnostic** — it carries no title/body
+        formatting knowledge and passes ``title`` / ``body`` through verbatim;
+        ``state`` accepts the GitHub values (``open`` / ``closed``) and is
+        passed through without validation (invalid values surface as a redacted
+        ``422`` error).
+
+        Args:
+            owner: Repository owner (account or organization).
+            repo: Repository name.
+            number: The pull request number. Must be ``>= 1``.
+            title: New title (caller-formatted); ``None`` to leave unchanged.
+            body: New body (caller-formatted); ``None`` to leave unchanged.
+            state: New state (e.g. ``open`` / ``closed``); ``None`` to leave
+                unchanged.
+
+        Returns:
+            The :class:`PullRequestResult` parsed from the response JSON
+            (``number`` / ``html_url`` / ``state``).
+
+        Raises:
+            ValueError: if ``owner`` / ``repo`` is empty, if ``number < 1``, or
+                if all of ``title`` / ``body`` / ``state`` are ``None`` (empty
+                payload) — all raised before any network call.
+            GitProviderAdapterError: if the request ultimately fails after
+                retries, or a non-retryable error is returned. The token is
+                redacted from the message.
+        """
+        if not owner:
+            raise ValueError("owner must not be empty")
+        if not repo:
+            raise ValueError("repo must not be empty")
+        if number < 1:
+            raise ValueError("number must be >= 1")
+        payload: dict[str, str] = {}
+        if title is not None:
+            payload["title"] = title
+        if body is not None:
+            payload["body"] = body
+        if state is not None:
+            payload["state"] = state
+        if not payload:
+            raise ValueError("update_pr requires at least one of title/body/state")
+        url = f"{self._base}/repos/{owner}/{repo}/pulls/{number}"
+        response = self._request("PATCH", url, json=payload)
+        self._raise_for_status("update pull request", response, url)
+        data = response.json()
+        return PullRequestResult(
+            owner=owner,
+            repo=repo,
+            number=data["number"],
+            url=data["html_url"],
+            state=data["state"],
+        )
