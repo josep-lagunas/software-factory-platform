@@ -47,6 +47,7 @@ __all__ = [
     "GitPushResult",
     "GitSyncResult",
     "PullRequestResult",
+    "ReviewResult",
 ]
 
 #: Placeholder substituted for the token anywhere it would appear in errors.
@@ -144,6 +145,27 @@ class GitSyncResult:
     repo: str
     pull_number: int
     sha: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewResult:
+    """Outcome of :meth:`GitProviderAdapter.submit_review`.
+
+    Attributes:
+        owner: Repository owner (account or organization).
+        repo: Repository name.
+        number: The pull request number the review was submitted on.
+        review_id: The review id, parsed from the GitHub response ``id`` field.
+        state: The review state string (e.g. ``APPROVED`` /
+            ``CHANGES_REQUESTED`` / ``COMMENTED`` / ``PENDING``), parsed from the
+            response ``state`` field.
+    """
+
+    owner: str
+    repo: str
+    number: int
+    review_id: int
+    state: str
 
 
 class _TransientHTTPError(Exception):
@@ -520,6 +542,67 @@ class GitProviderAdapter:
             repo=repo,
             number=data["number"],
             url=data["html_url"],
+            state=data["state"],
+        )
+
+    def submit_review(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        event: str,
+        body: str,
+    ) -> ReviewResult:
+        """Submit a pull request review via ``POST /repos/{...}/pulls/{number}/reviews``.
+
+        Issues the GitHub submit-review endpoint with a JSON payload of
+        ``{event, body}`` via :meth:`_request` (bearer auth + tenacity retry on
+        ``{429,500,502,503,504}`` and the network errors, no retry on other
+        ``4xx``) and :meth:`_raise_for_status` (a redacted
+        :class:`GitProviderAdapterError` on any non-success).
+
+        This adapter is **format-agnostic / pass-through** on ``event``
+        (ID-066): the ``event`` string is carried to GitHub verbatim with **no
+        local validation** and this module imports no review-status enum. Mapping
+        a review-status value to the GitHub ``event`` string (``APPROVE`` /
+        ``REQUEST_CHANGES`` / ``COMMENT``) is the **caller's** job; an invalid
+        ``event`` surfaces as a redacted GitHub ``422``.
+
+        Args:
+            owner: Repository owner (account or organization).
+            repo: Repository name.
+            number: The pull request number. Must be ``>= 1``.
+            event: The review event string (caller-mapped from a review-status
+                value, e.g. ``APPROVE``). Carried through verbatim — not validated.
+            body: The review body (caller-formatted). May be empty.
+
+        Returns:
+            The :class:`ReviewResult` parsed from the response JSON (``id`` ->
+            ``review_id``, ``state`` -> ``state``).
+
+        Raises:
+            ValueError: if ``owner`` / ``repo`` is empty or ``number < 1``
+                (before any network call).
+            GitProviderAdapterError: if the request ultimately fails after
+                retries, or a non-retryable error (e.g. ``422`` for an invalid
+                ``event``) is returned. The token is redacted from the message.
+        """
+        if not owner:
+            raise ValueError("owner must not be empty")
+        if not repo:
+            raise ValueError("repo must not be empty")
+        if number < 1:
+            raise ValueError("number must be >= 1")
+        url = f"{self._base}/repos/{owner}/{repo}/pulls/{number}/reviews"
+        response = self._request("POST", url, json={"event": event, "body": body})
+        self._raise_for_status("submit review", response, url)
+        data = response.json()
+        return ReviewResult(
+            owner=owner,
+            repo=repo,
+            number=number,
+            review_id=data["id"],
             state=data["state"],
         )
 
