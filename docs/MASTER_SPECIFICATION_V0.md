@@ -2814,6 +2814,27 @@ One user may have multiple external identities.
 
 Each external identity belongs to exactly one user.
 
+#### Field Sets
+
+The persistence projection of the Identity aggregates uses these field sets.
+Table names are plural snake_case (ID-058); both tables live in the `business`
+schema.
+
+`User` → `business.users`:
+- `user_id` — UUID, primary key, immutable.
+- `created_at` / `updated_at` — audit timestamps (ID-058 `_at` suffix).
+
+`UserExternalIdentity` → `business.user_external_identities`:
+- `external_identity_id` — UUID, surrogate primary key.
+- `provider` — external provider (Slack, GitHub, future). Open-ended string;
+  the valid provider set is owned elsewhere, not by this model.
+- `provider_user_id` — the provider's identifier for the user.
+- `user_id` — UUID, foreign key to `business.users(user_id)` (intra-service;
+  ID-058 permits intra-service FKs, forbids cross-service FKs).
+- `created_at` / `updated_at` — audit timestamps.
+- `UNIQUE(provider, provider_user_id)` — enforces the "duplicated external
+  identity" failure mode as a constraint (MAS §9.3 Failure Behaviour).
+
 ### Internal Components
 
 The Identity Service consists of:
