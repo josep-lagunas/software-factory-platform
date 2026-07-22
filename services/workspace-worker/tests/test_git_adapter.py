@@ -20,6 +20,7 @@ from workspace_worker.repo.git.adapter import (
     GitProviderAdapter,
     GitProviderAdapterError,
     GitPushResult,
+    GitSyncResult,
     PullRequestResult,
     _redact,
 )
@@ -36,6 +37,12 @@ BASE = "main"
 TITLE = "SFP-59: PR create/update"
 BODY = "JIRA: https://arconta.atlassian.net/browse/SFP-59"
 PR_URL = f"https://github.com/{OWNER}/{REPO}/pull/{PR_NUMBER}"
+
+# update-branch 202 response carries a `url` whose last path segment is the
+# resulting sha; SYNC_SHA deliberately differs from the push SHA constant so
+# parse-not-echo is observable.
+SYNC_SHA = "fedcba9876543210fedcba9876543210fedcba98"
+SYNC_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/commits/{SYNC_SHA}"
 
 
 def _client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.Client:
@@ -967,3 +974,315 @@ def test_adapter_methods_have_no_title_body_formatting_logic() -> None:
         # title/body are only referenced as plain identifiers (passed through).
         assert "SFP-" not in src
         assert "JIRA" not in src
+
+
+# ---------------------------------------------------------------------------
+# sync_branch — update-branch (SFP-44)
+# ---------------------------------------------------------------------------
+
+
+def test_git_sync_result_reexported() -> None:
+    # GitSyncResult is re-exported from the git subpackage.
+    from workspace_worker.repo import git
+    from workspace_worker.repo.git.adapter import GitSyncResult as Direct
+
+    assert git.GitSyncResult is Direct
+    assert "GitSyncResult" in git.__all__
+
+
+def test_git_sync_result_frozen_slots() -> None:
+    result = GitSyncResult(owner=OWNER, repo=REPO, pull_number=PR_NUMBER, sha=SYNC_SHA)
+    fields = {f.name for f in dataclasses.fields(result)}
+    assert fields == {"owner", "repo", "pull_number", "sha"}
+    # frozen — assignment raises FrozenInstanceError
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.sha = "other"  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.pull_number = 99  # type: ignore[misc]
+    # slots — no per-instance __dict__
+    assert not hasattr(result, "__dict__")
+
+
+def test_sync_branch_issues_put_with_bearer_header() -> None:
+    # PUT /repos/{owner}/{repo}/pulls/{pull_number}/update-branch, bearer header,
+    # empty body; returns 202 with url.
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.method == "PUT"
+        assert request.url.path == f"/repos/{OWNER}/{REPO}/pulls/{PR_NUMBER}/update-branch"
+        assert request.headers.get("authorization") == f"Bearer {TOKEN}"
+        # update-branch takes no JSON payload — body is empty.
+        assert request.content in (b"", b"null")
+        return httpx.Response(202, json={"url": SYNC_URL})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    assert result == GitSyncResult(owner=OWNER, repo=REPO, pull_number=PR_NUMBER, sha=SYNC_SHA)
+    assert len(seen) == 1
+
+
+def test_sync_branch_extracts_sha_from_url_field() -> None:
+    # The sha is parsed from the LAST path segment of the response url —
+    # sync_branch takes no sha argument, so this proves parse-not-echo. The last
+    # segment deliberately differs from the push-test SHA constant.
+    resp_url = f"https://api.github.com/repos/{OWNER}/{REPO}/commits/{SYNC_SHA}"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(202, json={"url": resp_url})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    assert result.sha == SYNC_SHA
+    assert result.sha != SHA  # parsed from response, not the push-test constant
+
+
+def test_sync_branch_empty_sha_when_url_absent() -> None:
+    # No `url` key in the 202 response -> sha degrades to "" (graceful, no raise).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(202, json={"message": "Updating pull request branch."})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    assert result.sha == ""
+
+
+def test_sync_branch_empty_sha_when_url_unparseable() -> None:
+    # Validator correction #2: a `url` that cannot be parsed (here a non-string)
+    # degrades to "" via the defensive guard — graceful, never raises.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(202, json={"url": 12345})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    assert result.sha == ""
+
+
+def test_sync_branch_success_on_202() -> None:
+    # 202 Accepted is a success (is_success covers all 2xx) — no poll, no raise.
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(202, json={"url": SYNC_URL})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    assert tries == 1  # success on the first try — no polling loop
+    assert result.pull_number == PR_NUMBER
+
+
+# ---------------------------------------------------------------------------
+# sync_branch — retry-then-succeed on transient failures
+# ---------------------------------------------------------------------------
+
+
+def test_sync_branch_retry_then_succeed_on_500() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries < 3:
+            return httpx.Response(500, json={"message": "server error"})
+        return httpx.Response(202, json={"url": SYNC_URL})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    assert tries == 3  # retried twice, succeeded on the 3rd attempt
+
+
+def test_sync_branch_retry_then_succeed_on_429() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries < 3:
+            return httpx.Response(429, json={"message": "rate limited"})
+        return httpx.Response(202, json={"url": SYNC_URL})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    assert tries == 3
+
+
+def test_sync_branch_retry_then_succeed_on_connect_error() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries < 3:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(202, json={"url": SYNC_URL})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    assert tries == 3
+
+
+# ---------------------------------------------------------------------------
+# sync_branch — retry-exhaust surfaces a redacted error
+# ---------------------------------------------------------------------------
+
+
+def test_sync_branch_retry_exhaust_on_503_raises_adapter_error() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(503, json={"message": "unavailable"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    msg = str(exc_info.value)
+    assert "503" in msg
+    assert "3 attempts" in msg
+    assert TOKEN not in msg
+    assert tries == 3  # exactly the budget
+
+
+# ---------------------------------------------------------------------------
+# sync_branch — 409 conflict is a NORMAL FAILURE, not blocked (ID-068)
+# ---------------------------------------------------------------------------
+
+
+def test_sync_branch_409_conflict_is_normal_failure_not_blocked() -> None:
+    # ID-068: a 409 Conflict (merge conflict) is a NORMAL FAILURE, not a blocked
+    # state. It is NOT retried (409 is not in _RETRY_STATUSES) and surfaces as a
+    # plain redacted GitProviderAdapterError — there is NO separate "blocked"
+    # exception type.
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(
+            409, json={"message": "merge conflict: head branch is not behind base"}
+        )
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="409") as exc_info:
+        adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    assert tries == 1  # NOT retried — 409 is not a transient status
+    # Exact type — no subclass, no separate "blocked" exception type.
+    assert type(exc_info.value) is GitProviderAdapterError
+    assert TOKEN not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# sync_branch — no retry on non-transient 4xx
+# ---------------------------------------------------------------------------
+
+
+def test_sync_branch_no_retry_on_422() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(422, json={"message": "Validation Failed"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="422"):
+        adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    assert tries == 1  # NOT retried
+
+
+def test_sync_branch_no_retry_on_403() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(403, json={"message": "Forbidden"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="403"):
+        adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    assert tries == 1  # NOT retried
+
+
+def test_sync_branch_no_retry_on_404() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="404"):
+        adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    assert tries == 1  # NOT retried
+
+
+# ---------------------------------------------------------------------------
+# sync_branch — token redaction + local validation
+# ---------------------------------------------------------------------------
+
+
+def test_sync_branch_token_redacted_from_error_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text=f"forbidden: invalid token {TOKEN}")
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        adapter.sync_branch(OWNER, REPO, PR_NUMBER)
+
+    msg = str(exc_info.value)
+    assert TOKEN not in msg
+    assert "***" in msg
+
+
+@pytest.mark.parametrize("which", ["owner", "repo"])
+def test_sync_branch_empty_owner_or_repo_raises_value_error_before_any_http(
+    which: str,
+) -> None:
+    called: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request)
+        return httpx.Response(202, json={"url": SYNC_URL})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    if which == "owner":
+        with pytest.raises(ValueError, match="owner"):
+            adapter.sync_branch("", REPO, PR_NUMBER)
+    else:
+        with pytest.raises(ValueError, match="repo"):
+            adapter.sync_branch(OWNER, "", PR_NUMBER)
+
+    assert called == []  # no HTTP call made — validated locally
+
+
+def test_sync_branch_invalid_pull_number_raises_value_error_before_any_http() -> None:
+    called: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request)
+        return httpx.Response(202, json={"url": SYNC_URL})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(ValueError, match="pull_number"):
+        adapter.sync_branch(OWNER, REPO, 0)
+
+    assert called == []  # no HTTP call made — validated locally

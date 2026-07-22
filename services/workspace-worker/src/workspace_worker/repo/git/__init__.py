@@ -11,6 +11,7 @@ from workspace_worker.repo.git.adapter import (
     GitProviderAdapter,
     GitProviderAdapterError,
     GitPushResult,
+    GitSyncResult,
     PullRequestResult,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "GitProviderAdapter",
     "GitProviderAdapterError",
     "GitPushResult",
+    "GitSyncResult",
     "PullRequestResult",
 ]
