@@ -2010,6 +2010,14 @@ Adopt a uniform per-service schema organization:
 - Alembic owns all schema changes per service database (ID-008); migrations are per-service.
 - No cross-service foreign keys (AP-001, MAS §7.9); references to other services' entities are stored as plain identifier columns.
 
+**Timestamp convention:** audit columns use the `_at` suffix. `created_at` is
+set on INSERT via `server_default = now()`. `updated_at` is declared with
+`server_default = now()` (insert-side) as the current provisional pattern
+(matching `EndpointConfig`); a true auto-update-on-modify mechanism (DB-level
+`BEFORE UPDATE`, since PostgreSQL has no native `ON UPDATE CURRENT_TIMESTAMP`)
+is deferred to a platform-wide follow-up ticket covering all DB-bearing
+services. No Python-side `onupdate=` — auto-fill is a database concern.
+
 ### Rationale
 Named schemas cleanly separate authoritative business state from operational plumbing, are uniform across services, and keep the outbox and idempotency ledger distinct from business facts. Plural snake_case tables and the `infrastructure/persistence/` location match the uniform service layout and the contract/domain/persistence separation. No cross-service foreign keys preserve ownership boundaries.
 
