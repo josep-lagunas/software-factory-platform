@@ -22,6 +22,7 @@ from workspace_worker.repo.git.adapter import (
     GitPushResult,
     GitSyncResult,
     PullRequestResult,
+    ReviewResult,
     _redact,
 )
 
@@ -43,6 +44,14 @@ PR_URL = f"https://github.com/{OWNER}/{REPO}/pull/{PR_NUMBER}"
 # parse-not-echo is observable.
 SYNC_SHA = "fedcba9876543210fedcba9876543210fedcba98"
 SYNC_URL = f"https://api.github.com/repos/{OWNER}/{REPO}/commits/{SYNC_SHA}"
+
+# submit-review (SFP-60) — REVIEW_ID/REVIEW_STATE deliberately differ from any
+# input so parse-not-echo is observable; REVIEW_EVENT is the GitHub event string
+# a caller maps from a review-status enum (the adapter carries it verbatim).
+REVIEW_ID = 9999
+REVIEW_STATE = "APPROVED"
+REVIEW_EVENT = "APPROVE"
+REVIEW_BODY = "LGTM — looks good to merge."
 
 
 def _client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.Client:
@@ -1286,3 +1295,314 @@ def test_sync_branch_invalid_pull_number_raises_value_error_before_any_http() ->
         adapter.sync_branch(OWNER, REPO, 0)
 
     assert called == []  # no HTTP call made — validated locally
+
+
+# ---------------------------------------------------------------------------
+# ReviewResult — re-export + frozen-slots (SFP-60)
+# ---------------------------------------------------------------------------
+
+
+def test_review_result_reexported() -> None:
+    # ReviewResult is re-exported from the git subpackage.
+    from workspace_worker.repo import git
+    from workspace_worker.repo.git.adapter import ReviewResult as Direct
+
+    assert git.ReviewResult is Direct
+    assert "ReviewResult" in git.__all__
+
+
+def test_review_result_frozen_slots() -> None:
+    result = ReviewResult(
+        owner=OWNER, repo=REPO, number=PR_NUMBER, review_id=REVIEW_ID, state=REVIEW_STATE
+    )
+    fields = {f.name for f in dataclasses.fields(result)}
+    assert fields == {"owner", "repo", "number", "review_id", "state"}
+    # frozen — assignment raises FrozenInstanceError
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.review_id = 1  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.state = "x"  # type: ignore[misc]
+    # slots — no per-instance __dict__
+    assert not hasattr(result, "__dict__")
+
+
+# ---------------------------------------------------------------------------
+# submit_review — request shape (POST /pulls/{n}/reviews, bearer, JSON)
+# ---------------------------------------------------------------------------
+
+
+def _review_response(*, review_id: int = REVIEW_ID, state: str = REVIEW_STATE) -> dict[str, object]:
+    return {"id": review_id, "state": state}
+
+
+def test_submit_review_issues_post_with_bearer_header() -> None:
+    # POST /repos/{owner}/{repo}/pulls/{number}/reviews with {event, body} +
+    # bearer; result fields parsed from the response.
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.method == "POST"
+        assert request.url.path == f"/repos/{OWNER}/{REPO}/pulls/{PR_NUMBER}/reviews"
+        assert request.headers.get("authorization") == f"Bearer {TOKEN}"
+        assert json.loads(request.content) == {"event": REVIEW_EVENT, "body": REVIEW_BODY}
+        return httpx.Response(200, json=_review_response())
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.submit_review(OWNER, REPO, PR_NUMBER, event=REVIEW_EVENT, body=REVIEW_BODY)
+
+    assert result == ReviewResult(
+        owner=OWNER, repo=REPO, number=PR_NUMBER, review_id=REVIEW_ID, state=REVIEW_STATE
+    )
+    assert len(seen) == 1
+
+
+def test_submit_review_result_fields_come_from_response() -> None:
+    # Parse-not-echo: review_id/state come from the response JSON, not inferred
+    # from the inputs (the response fields deliberately differ).
+    resp = _review_response(review_id=12345, state="CHANGES_REQUESTED")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=resp)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.submit_review(OWNER, REPO, PR_NUMBER, event=REVIEW_EVENT, body=REVIEW_BODY)
+
+    assert result.review_id == 12345
+    assert result.state == "CHANGES_REQUESTED"
+
+
+# ---------------------------------------------------------------------------
+# submit_review — retry-then-succeed on transient failures
+# ---------------------------------------------------------------------------
+
+
+def test_submit_review_retry_then_succeed_on_500() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries < 3:
+            return httpx.Response(500, json={"message": "server error"})
+        return httpx.Response(200, json=_review_response())
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    adapter.submit_review(OWNER, REPO, PR_NUMBER, event=REVIEW_EVENT, body=REVIEW_BODY)
+
+    assert tries == 3  # retried twice, succeeded on the 3rd attempt
+
+
+def test_submit_review_retry_then_succeed_on_429() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries < 3:
+            return httpx.Response(429, json={"message": "rate limited"})
+        return httpx.Response(200, json=_review_response())
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    adapter.submit_review(OWNER, REPO, PR_NUMBER, event=REVIEW_EVENT, body=REVIEW_BODY)
+
+    assert tries == 3
+
+
+def test_submit_review_retry_then_succeed_on_connect_error() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries < 3:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, json=_review_response())
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    adapter.submit_review(OWNER, REPO, PR_NUMBER, event=REVIEW_EVENT, body=REVIEW_BODY)
+
+    assert tries == 3
+
+
+# ---------------------------------------------------------------------------
+# submit_review — retry-exhaust surfaces a redacted error
+# ---------------------------------------------------------------------------
+
+
+def test_submit_review_retry_exhaust_on_503_raises_adapter_error() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(503, json={"message": "unavailable"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        adapter.submit_review(OWNER, REPO, PR_NUMBER, event=REVIEW_EVENT, body=REVIEW_BODY)
+
+    msg = str(exc_info.value)
+    assert "503" in msg
+    assert "3 attempts" in msg
+    assert TOKEN not in msg
+    assert tries == 3  # exactly the budget — no more, no fewer
+
+
+# ---------------------------------------------------------------------------
+# submit_review — no retry on non-transient 4xx
+# ---------------------------------------------------------------------------
+
+
+def test_submit_review_no_retry_on_422() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(422, json={"message": "Validation Failed"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="422"):
+        adapter.submit_review(OWNER, REPO, PR_NUMBER, event=REVIEW_EVENT, body=REVIEW_BODY)
+
+    assert tries == 1  # NOT retried
+
+
+def test_submit_review_no_retry_on_403() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(403, json={"message": "Forbidden"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="403"):
+        adapter.submit_review(OWNER, REPO, PR_NUMBER, event=REVIEW_EVENT, body=REVIEW_BODY)
+
+    assert tries == 1  # NOT retried
+
+
+def test_submit_review_no_retry_on_404() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="404"):
+        adapter.submit_review(OWNER, REPO, PR_NUMBER, event=REVIEW_EVENT, body=REVIEW_BODY)
+
+    assert tries == 1  # NOT retried
+
+
+# ---------------------------------------------------------------------------
+# submit_review — token redaction
+# ---------------------------------------------------------------------------
+
+
+def test_submit_review_token_redacted_from_error_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        # 422 body that happens to echo the token — must be redacted.
+        return httpx.Response(422, text=f"validation error: bad token {TOKEN}")
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        adapter.submit_review(OWNER, REPO, PR_NUMBER, event=REVIEW_EVENT, body=REVIEW_BODY)
+
+    msg = str(exc_info.value)
+    assert TOKEN not in msg
+    assert "***" in msg
+
+
+# ---------------------------------------------------------------------------
+# submit_review — local validation (ValueError before any HTTP)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("which", ["owner", "repo"])
+def test_submit_review_empty_owner_or_repo_raises_value_error_before_any_http(
+    which: str,
+) -> None:
+    called: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request)
+        return httpx.Response(200, json=_review_response())
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    if which == "owner":
+        with pytest.raises(ValueError, match="owner"):
+            adapter.submit_review("", REPO, PR_NUMBER, event=REVIEW_EVENT, body=REVIEW_BODY)
+    else:
+        with pytest.raises(ValueError, match="repo"):
+            adapter.submit_review(OWNER, "", PR_NUMBER, event=REVIEW_EVENT, body=REVIEW_BODY)
+
+    assert called == []  # no HTTP call made — validated locally
+
+
+def test_submit_review_invalid_number_raises_value_error_before_any_http() -> None:
+    called: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request)
+        return httpx.Response(200, json=_review_response())
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(ValueError, match="number"):
+        adapter.submit_review(OWNER, REPO, 0, event=REVIEW_EVENT, body=REVIEW_BODY)
+
+    assert called == []  # no HTTP call made — validated locally
+
+
+# ---------------------------------------------------------------------------
+# submit_review — format-agnostic pass-through (ID-066)
+# ---------------------------------------------------------------------------
+
+
+def test_submit_review_carries_unusual_event_verbatim() -> None:
+    # ID-066: an unusual event string (e.g. "DISMISS") is carried to GitHub
+    # verbatim — no validation, no coercion. The adapter does not judge it.
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(200, json=_review_response())
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    adapter.submit_review(OWNER, REPO, PR_NUMBER, event="DISMISS", body=REVIEW_BODY)
+
+    assert captured["payload"] == {"event": "DISMISS", "body": REVIEW_BODY}
+
+
+def test_submit_review_has_no_event_validation_logic() -> None:
+    # ID-066 (structural): submit_review performs NO local validation of `event`
+    # — no review-status enum reference, no .upper() coercion, no `if event`
+    # branching. The string is passed straight into the payload dict.
+    import workspace_worker.repo.git.adapter as adapter_mod
+
+    src = inspect.getsource(adapter_mod.GitProviderAdapter.submit_review)
+    assert "ReviewStatus" not in src
+    assert ".upper()" not in src
+    assert "if event" not in src
+
+
+def test_submit_review_body_optionality_empty_body_succeeds() -> None:
+    # `body` is a plain str (not Optional); an empty body is valid and carried
+    # through verbatim (e.g. an APPROVE with no comment).
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(200, json=_review_response())
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.submit_review(OWNER, REPO, PR_NUMBER, event=REVIEW_EVENT, body="")
+
+    assert captured["payload"] == {"event": REVIEW_EVENT, "body": ""}
+    assert result == ReviewResult(
+        owner=OWNER, repo=REPO, number=PR_NUMBER, review_id=REVIEW_ID, state=REVIEW_STATE
+    )
