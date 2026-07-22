@@ -45,6 +45,7 @@ __all__ = [
     "GitProviderAdapter",
     "GitProviderAdapterError",
     "GitPushResult",
+    "GitSyncResult",
     "PullRequestResult",
 ]
 
@@ -126,6 +127,25 @@ class PullRequestResult:
     state: str
 
 
+@dataclass(frozen=True, slots=True)
+class GitSyncResult:
+    """Outcome of :meth:`GitProviderAdapter.sync_branch`.
+
+    Attributes:
+        owner: Repository owner (account or organization).
+        repo: Repository name.
+        pull_number: The pull request number whose head branch was synced.
+        sha: The commit SHA the head branch was moved to, parsed from the last
+            path segment of the GitHub response ``url`` field. Empty string
+            when the field is absent or unparseable (graceful degradation).
+    """
+
+    owner: str
+    repo: str
+    pull_number: int
+    sha: str
+
+
 class _TransientHTTPError(Exception):
     """Internal signal: a retryable HTTP status was observed.
 
@@ -146,6 +166,22 @@ def _redact(text: str, token: str) -> str:
     ``RepoManager._redact`` (ID-035).
     """
     return text.replace(token, _REDACTED) if token else text
+
+
+def _last_url_path_segment(url: str) -> str:
+    """Return the last non-empty path segment of ``url``.
+
+    GitHub's ``update-branch`` 202 response carries a ``url`` (a git-ref or
+    commit URL) whose last path segment is the resulting sha/branch we surface.
+    This is a deliberately simple, defensive heuristic — any parse failure
+    degrades to an empty string and never raises.
+    """
+    try:
+        path = httpx.URL(url).path
+    except Exception:
+        return ""
+    segments = [s for s in path.split("/") if s]
+    return segments[-1] if segments else ""
 
 
 class GitProviderAdapter:
@@ -486,3 +522,56 @@ class GitProviderAdapter:
             url=data["html_url"],
             state=data["state"],
         )
+
+    def sync_branch(self, owner: str, repo: str, pull_number: int) -> GitSyncResult:
+        """Sync (update) a pull request's head branch with its base via ``update-branch``.
+
+        Issues ``PUT {base}/repos/{owner}/{repo}/pulls/{pull_number}/update-branch``
+        with an empty body via :meth:`_request` (bearer auth + tenacity retry on
+        ``{429,500,502,503,504}`` and the network errors, no retry on other
+        ``4xx``) and :meth:`_raise_for_status` (a redacted
+        :class:`GitProviderAdapterError` on any non-success).
+
+        GitHub returns ``202 Accepted`` on success — the update is queued
+        asynchronously. Any ``2xx`` is treated as success and this method does
+        **not** poll for completion (poll-until-merged is out of scope). The
+        resulting head SHA is parsed from the response ``url`` field's last path
+        segment and degrades to an empty string when the field is absent or
+        unparseable.
+
+        A ``409 Conflict`` (merge conflict) is a **normal failure**, not a
+        blocked state (ID-068): it is not retried (``409`` is not in
+        :data:`_RETRY_STATUSES`) and surfaces as a plain redacted
+        :class:`GitProviderAdapterError`. There is no separate "blocked"
+        exception type — callers distinguishing a conflict downstream must
+        inspect the redacted message text.
+
+        Args:
+            owner: Repository owner (account or organization).
+            repo: Repository name.
+            pull_number: The pull request number whose head branch to sync.
+                Must be ``>= 1``.
+
+        Returns:
+            The :class:`GitSyncResult` describing the outcome.
+
+        Raises:
+            ValueError: if ``owner`` / ``repo`` is empty or ``pull_number < 1``
+                (before any network call).
+            GitProviderAdapterError: if the request ultimately fails after
+                retries, or a non-retryable error (incl. ``409`` conflict) is
+                returned. The token is redacted from the message.
+        """
+        if not owner:
+            raise ValueError("owner must not be empty")
+        if not repo:
+            raise ValueError("repo must not be empty")
+        if pull_number < 1:
+            raise ValueError("pull_number must be >= 1")
+        url = f"{self._base}/repos/{owner}/{repo}/pulls/{pull_number}/update-branch"
+        response = self._request("PUT", url)
+        self._raise_for_status("sync branch", response, url)
+        data = response.json()
+        response_url = data.get("url") if isinstance(data, dict) else None
+        sha = _last_url_path_segment(response_url) if response_url else ""
+        return GitSyncResult(owner=owner, repo=repo, pull_number=pull_number, sha=sha)
