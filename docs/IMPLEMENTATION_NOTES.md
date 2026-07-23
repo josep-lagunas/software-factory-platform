@@ -50,8 +50,10 @@ Handlers should be declared declaratively.
 Conceptually:
 
 ```python
-@command_handler(ExecuteCodingJob)
+@command_handler(ExecuteCodingJob)          # ExecuteCodingJob is the payload type
 async def handle(command: ExecuteCodingJob, context: MessageContext):
+    # `command` is the payload (the business data); `context` carries the
+    # envelope metadata (correlation_id, causation_id, message_id, …).
     ...
 ```
 
@@ -95,15 +97,16 @@ The messaging framework owns:
 
 Every handler receives a framework-provided `MessageContext`.
 
-It should expose information such as:
+It exposes:
 
 - correlation_id,
 - causation_id,
 - message_id,
 - received_at,
-- retry_count,
-- trace/span references,
-- framework services.
+- retry_count.
+
+(Trace/span references and framework services are deferred to a future revision
+and are not part of v0.)
 
 Handlers should never reconstruct this information themselves.
 

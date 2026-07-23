@@ -1042,7 +1042,7 @@ Accepted
 Distributed workflows require traceability across services.
 
 ### Decision
-Every transported message includes identifiers such as message_id, idempotency_key, correlation_id, causation_id, message_type, occurred_at, and payload.
+Every transported message is an instance of `CommandEnvelope` or `EventEnvelope`, both subclassing a shared abstract `MessageEnvelope` base that carries `message_id`, `idempotency_key`, `correlation_id`, `causation_id`, `occurred_at`, and `payload`. `CommandEnvelope` adds a `command_type` discriminator; `EventEnvelope` adds an `event_type` discriminator and `producer`. The typed `payload` subclasses a `CommandPayload` or `EventPayload` base; the discriminator lives on the envelope only and is not repeated in the payload. No discriminator field distinguishes command from event (the class does that).
 
 ### Rationale
 These fields enable trace reconstruction, debugging, and observability.

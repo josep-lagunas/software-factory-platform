@@ -916,30 +916,52 @@ Responsibilities:
 
 ## 4.7 Message Envelope
 
-Every transported message contains:
+Every transported message is an instance of one of two concrete envelope
+subclasses of a shared abstract `MessageEnvelope` base. The base carries the
+uniform fields every message — command or event — must carry:
 
 - message_id
 - idempotency_key
 - correlation_id
 - causation_id
-- message_type
 - occurred_at
 - payload
 
-Purpose:
+The two concrete envelope subclasses are:
 
-- Tracing
-- Debugging
-- Distributed observability
-- Workflow reconstruction
+- `CommandEnvelope` — adds a `command_type: CommandType` discriminator.
+- `EventEnvelope` — adds an `event_type: EventType` discriminator and a `producer`.
 
-`message_id` identifies a transport message.
+No `message_type` field is required to tell command from event: the class itself
+does that. `command_type`/`event_type` instead identify WHICH specific command
+or event the envelope carries.
 
-`idempotency_key` identifies the business operation or business fact represented by the message.
+The `payload` is the typed business data of the message. Payload classes form a
+hierarchy mirroring the envelopes:
 
-Consumers must use `idempotency_key` for business-level duplicate detection.
+- `CommandPayload` (base) — one subclass per command.
+- `EventPayload` (base) — one subclass per event.
 
-Consumers must not rely on `message_id` alone for business idempotency.
+`CommandEnvelope.payload: CommandPayload` and `EventEnvelope.payload:
+EventPayload`. The discriminator is carried on the envelope ONLY — it is never
+repeated inside the payload, which holds purely the command/event-specific
+business data. A message is therefore a `CommandEnvelope` (or `EventEnvelope`)
+instance whose `command_type` (or `event_type`) and `payload` are consistent.
+
+Payload classes are named by a grammar convention rather than a suffix:
+commands are imperative (e.g. `ExecuteCodingJob`, `ReviewPullRequest`,
+`RequestMerge`); events are past-tense (e.g. `UserInputReceived`,
+`CodingJobUpdated`, `MergeUpdated`). No `Command`/`Event` suffix is used.
+
+At dispatch, the envelope is the transport wrapper: its metadata fields
+(`message_id`, `correlation_id`, `causation_id`, `occurred_at` → `received_at`)
+flow into the handler's `MessageContext`, and the handler receives the `payload`
+plus that context — never the raw envelope.
+
+Purpose: Tracing / Debugging / Distributed observability / Workflow
+reconstruction. (`message_id` identifies a transport message; `idempotency_key`
+identifies the business operation or fact; consumers must use `idempotency_key`
+for business duplicate detection and must not rely on `message_id` alone.)
 
 ## 4.8 Correlation
 
