@@ -18,15 +18,14 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
+from typing import Any
 
-if TYPE_CHECKING:
-    from sfp_contracts.commands.envelope import CommandEnvelope
-    from sfp_contracts.events.envelope import EventEnvelope
+from sfp_messaging.context import MessageContext
 
-# A handler is an async callable over a command or event envelope. The envelope
-# types are imported for typing ONLY (no runtime coupling on sfp-contracts).
-type _Handler = Callable[[CommandEnvelope | EventEnvelope], Awaitable[None]]
+# A handler is an async callable over a (payload, MessageContext) pair: the
+# concrete message payload, typed Any so this store stays class-agnostic and
+# policy-free (ID-052), plus the per-message context (MAS §4.7 / SFP-44).
+type _Handler = Callable[[Any, MessageContext], Awaitable[None]]
 
 
 class HandlerRegistry:

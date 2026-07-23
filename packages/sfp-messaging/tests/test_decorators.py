@@ -7,8 +7,6 @@ Covers the declarative decorator layer above :class:`HandlerRegistry`:
   returned UNCHANGED (``command_handler(T)(f) is f``);
 - concrete-class keying (TD-06): resolving the ``CommandType`` enum member
   yields ``None`` while resolving the concrete class yields the handler;
-- no ``MessageContext`` coupling (TD-11): the decorators source contains no
-  ``MessageContext`` token (sibling SFP-44 is out of scope);
 - re-export identity: the package-level names are the very objects in their
   submodules, and the module-private ``_default_registry`` is NOT re-exported
   at the package top level.
@@ -22,7 +20,6 @@ clear.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Iterator
-from pathlib import Path
 
 import pytest
 import sfp_messaging
@@ -145,15 +142,6 @@ def test_command_and_event_handlers_coexist() -> None:
     registry = get_default_registry()
     assert registry.resolve(ExecuteCodingJob) is cmd_fn
     assert registry.resolve(UserInputReceived) is evt_fn
-
-
-# --- no MessageContext coupling (TD-11) ------------------------------------
-
-
-def test_decorators_source_has_no_message_context_token() -> None:
-    """(TD-11) decorators.py contains no 'MessageContext' token (sibling SFP-44)."""
-    source = Path(decorators_module.__file__).read_text()
-    assert "MessageContext" not in source
 
 
 # --- re-export identity & module-private default registry ------------------
