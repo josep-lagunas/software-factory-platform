@@ -28,9 +28,9 @@ import pytest
 import sfp_messaging
 import sfp_messaging.decorators as decorators_module
 from sfp_contracts.commands.envelope import CommandEnvelope, CommandType
-from sfp_contracts.commands.models import ExecuteCodingJob, RequestMerge
+from sfp_contracts.commands.payloads import ExecuteCodingJob, RequestMerge
 from sfp_contracts.events.envelope import EventEnvelope
-from sfp_contracts.events.models import UserInputReceived, UserQueryReceived
+from sfp_contracts.events.payloads import UserInputReceived, UserQueryReceived
 from sfp_messaging import (
     HandlerRegistry,
     command_handler,
