@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable
 
 import pytest
 from sfp_contracts.commands.envelope import CommandEnvelope
-from sfp_contracts.commands.models import ExecuteCodingJob, RequestMerge
+from sfp_contracts.commands.payloads import ExecuteCodingJob, RequestMerge
 from sfp_contracts.events.envelope import EventEnvelope
 from sfp_messaging.registry import HandlerRegistry, get_default_registry
 

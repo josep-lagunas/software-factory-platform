@@ -40,7 +40,7 @@ SOURCE_PATH = Path(bus_module.__file__)
 
 
 def _command() -> CommandEnvelope:
-    """Build a minimal generic CommandEnvelope (SFP-38)."""
+    """Build a minimal generic CommandEnvelope (SFP-38 / SFP-219)."""
     return CommandEnvelope(
         message_id="cmd-1",
         idempotency_key="idem-1",
@@ -48,16 +48,21 @@ def _command() -> CommandEnvelope:
         causation_id="cause-1",
         occurred_at="2026-07-21T00:00:00Z",
         command_type=CommandType.EXECUTE_CODING_JOB,
+        payload={"job_id": "job-1", "pr_spec_id": "sfp-1"},
     )
 
 
 def _event() -> EventEnvelope:
-    """Build a minimal generic EventEnvelope (SFP-39)."""
+    """Build a minimal generic EventEnvelope (SFP-39 / SFP-219)."""
     return EventEnvelope(
-        event_id="evt-1",
+        message_id="evt-1",
+        idempotency_key="idem-1",
+        correlation_id="corr-1",
+        causation_id="cause-1",
         occurred_at="2026-07-21T00:00:00Z",
-        producer="orchestrator",
         event_type=EventType.TICKET_UPDATED,
+        producer="orchestrator",
+        payload={"ticket_id": "SFP-1", "status": "open"},
     )
 
 

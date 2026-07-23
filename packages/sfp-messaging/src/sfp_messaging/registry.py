@@ -1,7 +1,7 @@
 """The message-type-keyed handler registry (MAS §4.5 / ID-052 / SFP-43).
 
 A :class:`HandlerRegistry` maps a *concrete message class* (the ``type``
-object, e.g. :class:`~sfp_contracts.commands.models.ExecuteCodingJob`) to the
+object, e.g. :class:`~sfp_contracts.commands.payloads.ExecuteCodingJob`) to the
 async callable that handles it. It is the policy-free storage layer the
 declarative decorators (SFP-43) write into: it stores and retrieves callables
 keyed by class object only and performs no routing, validation, transformation,
