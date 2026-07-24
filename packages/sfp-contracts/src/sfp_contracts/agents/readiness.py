@@ -16,11 +16,13 @@ Design choices:
 - ``verdict`` is a ``StrEnum`` so JSON serialization yields the plain string
   value (per ID-013), matching :class:`~sfp_contracts.agents.coder.ValidationStatus`
   and :class:`~sfp_contracts.agents.reviewer.ReviewStatus`.
-- ``rubric_results`` is a ``dict[str, bool]`` (rubric-check name -> passed) rather
-  than a fixed-shape sub-model. The Readiness evaluator's rubric is a judgment
-  call whose checks vary per ticket, so a free-form mapping — homologous to the
-  holistic-boolean pattern in the sibling schemas — lets the rubric evolve
-  without a schema migration while still surface-checking each gate's pass/fail.
+- ``rubric_results`` is a ``dict[str, bool]`` (rubric-check name -> passed). It is
+  populated by the **deterministic readiness rubric** (ID-064 layer 1), which
+  checks the ticket carries the mandatory ID-070 sections. The dict is keyed by
+  section name so the rubric's checks are a fixed, deterministic set (not a
+  per-ticket judgment call). The **model evaluator** (ID-064 layer 2) is a
+  separate concern that populates ``blocking_ambiguities`` with semantic gaps;
+  the two layers compose into one ``ReadinessOutput``.
 """
 
 from enum import StrEnum
