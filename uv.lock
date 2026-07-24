@@ -565,6 +565,12 @@ requires-dist = [{ name = "structlog", specifier = ">=24.4.0" }]
 name = "sfp-testing"
 version = "0.1.0"
 source = { editable = "packages/sfp-testing" }
+dependencies = [
+    { name = "sfp-messaging" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "sfp-messaging", editable = "packages/sfp-messaging" }]
 
 [[package]]
 name = "sfp-workspace"

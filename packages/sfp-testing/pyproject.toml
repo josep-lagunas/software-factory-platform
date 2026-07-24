@@ -2,10 +2,17 @@
 name = "sfp-testing"
 version = "0.1.0"
 requires-python = ">=3.13,<3.14"
+dependencies = ["sfp-messaging"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# sfp-messaging is a workspace member (packages/sfp-messaging); resolve it from
+# the local workspace rather than a registry — FakeBus composes InMemoryTransport
+# at runtime (SFP-49).
+[tool.uv.sources]
+sfp-messaging = { workspace = true }
 
 [tool.coverage.run]
 source = ["src/sfp_testing"]
