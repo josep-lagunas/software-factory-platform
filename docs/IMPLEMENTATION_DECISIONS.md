@@ -2559,6 +2559,9 @@ Explicit, typed input/output contracts make cross-ticket data flow machine-check
 Positive: deterministic, checkable cross-ticket data flow with a shared type catalogue; manual-ticket facts always flow to dependents; secrets stay references only.  
 Negative: the type catalogue must be authored/versioned; per-ticket output/input declarations must be authored; the resolution/injection logic must be built; manual-ticket completion is gated on declared outputs.
 
+### Note (SFP-66)
+Completed dependency outputs are carried as `ContextBinding` instances (a name + `ContextType` + value + source_ticket). For `STR` types the value is the ordinary string; for `SECRET_REF` types the value is the reference string (ARN / secret ID), never the secret itself (ID-016). The pure `resolve_context` function walks a ticket's declared `required_inputs` against the available bindings and returns a `ResolvedContext` — the `resolved` / `missing` split, both in declaration order. Acting on a non-empty `missing` list (requesting the fact via the CONFIRM flow) remains the Orchestrator's responsibility. Implemented in SFP-66 (`sfp-contracts/context/bindings.py`, `workspace-worker/workflow/context_resolver.py`).
+
 ### References
 ID-064, ID-065, ID-069, ID-072. Master Architecture Specification §6, §7. Adopted/extended from `software-factory-handoff/` (completion-notes, human-interaction-summary.context_added).
 
