@@ -85,7 +85,7 @@ Waves computed via longest-path (Kahn): `wave(t)=0` if no deps, else `1+max(wave
 | SFP-47 | Local Execution Engine: linters/static analysis | AGENT | ai-agent | Manual Core | SFP-45 |
 | SFP-48 | Sandbox: local container isolation | AGENT | ai-agent | Manual Core | SFP-45 |
 | SFP-50 | Readiness gate: rubric (rule-checks) | AGENT | ai-agent | Manual Core | SFP-24 |
-| SFP-57 | Validation profile logic: assignment + gate enforcement | AGENT | ai-agent | Manual Core | SFP-24 |
+| SFP-57 | Validation profile logic: gate enforcement | AGENT | ai-agent | Manual Core | SFP-24 |
 | SFP-58 | Failure classification logic | AGENT | ai-agent | Manual Core | SFP-13 |
 | SFP-60 | docker compose: LocalStack (SNS/SQS/DLQ) | LOCAL | ai-agent | Manual Core | SFP-59 |
 | SFP-61 | docker compose: OTel collector (dev sink) | LOCAL | ai-agent | Manual Core | SFP-59 |

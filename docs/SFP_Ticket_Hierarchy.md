@@ -1462,11 +1462,14 @@ The Reviewer returns holistic judgments; comments live on GitHub (ID-023, ID-066
 
 ---
 
-### SFP-57 [AGENT] 🤖 — Validation profile logic: assignment + gate enforcement
+### SFP-57 [AGENT] 🤖 — Validation profile logic: gate enforcement
 **Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-24
 
 **Context:**
 Validation profiles determine gates and the human-approval requirement (ID-024, ID-067).
+
+> Scope narrowed in SFP-74: profile assignment remains Planner-owned (ID-067);
+> this ticket delivers gate enforcement only.
 
 **Requirements:**
 - Map `validation_profile` → required gates.
