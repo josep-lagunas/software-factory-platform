@@ -2,7 +2,7 @@
 name = "sfp-testing"
 version = "0.1.0"
 requires-python = ">=3.13,<3.14"
-dependencies = ["sfp-messaging"]
+dependencies = ["sfp-messaging", "pytest>=8.0.0"]
 
 [build-system]
 requires = ["hatchling"]
