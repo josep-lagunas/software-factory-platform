@@ -2,12 +2,18 @@
 name = "orchestrator"
 version = "0.1.0"
 requires-python = ">=3.13,<3.14"
+dependencies = [
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.13.0",
+    "asyncpg>=0.29.0",
+]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.coverage.run]
+omit = ['*/migrations/env.py']
 source = ["src/orchestrator"]
 
 [tool.coverage.report]
