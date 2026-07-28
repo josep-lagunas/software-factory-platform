@@ -566,11 +566,15 @@ name = "sfp-testing"
 version = "0.1.0"
 source = { editable = "packages/sfp-testing" }
 dependencies = [
+    { name = "pytest" },
     { name = "sfp-messaging" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "sfp-messaging", editable = "packages/sfp-messaging" }]
+requires-dist = [
+    { name = "pytest", specifier = ">=8.0.0" },
+    { name = "sfp-messaging", editable = "packages/sfp-messaging" },
+]
 
 [[package]]
 name = "sfp-workspace"
