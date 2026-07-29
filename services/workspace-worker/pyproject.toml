@@ -5,8 +5,10 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "httpx",
     "tenacity",
+    "claude-agent-sdk>=0.2.128",
     "sfp-contracts",
     "sfp-agent-runtime",
+    "sfp-config",
 ]
 
 [build-system]
@@ -16,10 +18,15 @@ build-backend = "hatchling.build"
 # sfp-contracts is a workspace member (packages/sfp-contracts); resolve it from
 # the local workspace rather than a registry (SFP-75 — first intra-workspace dep).
 # sfp-agent-runtime likewise (SFP-68 — readiness gate depends on the
-# AgentRuntime/PromptProvider seam + PromptBuilder).
+# AgentRuntime/PromptProvider seam + PromptBuilder). sfp-config likewise
+# (SFP-53 — the runtime resolves credentials via SecretProvider and the worker
+# settings subclass sfp_config.Settings). claude-agent-sdk is the concrete
+# provider SDK the AgentRuntime adapter drives (SFP-36 / Jira SFP-53); its
+# `query()` spawns the Claude Code CLI, so unit tests inject a fake query_fn.
 [tool.uv.sources]
 sfp-contracts = { workspace = true }
 sfp-agent-runtime = { workspace = true }
+sfp-config = { workspace = true }
 
 [tool.coverage.run]
 source = ["src/workspace_worker"]
