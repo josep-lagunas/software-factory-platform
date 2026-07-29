@@ -1464,7 +1464,7 @@ The Coder implements one PR-spec and submits it for review (ID-022).
 ---
 
 ### SFP-56 [AGENT] 🤖 — Reviewer agent + prompt (judgment-only)
-**Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-36, SFP-16, SFP-35, SFP-42, SFP-171 *(ID-073: Reviewer identity must exist)*
+**Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-36, SFP-16, SFP-35, SFP-42, SFP-171 *(ID-073: Reviewer identity must exist)* | **Context in:** `PrSpec` (SFP-14), `CoderOutput` (SFP-15), `ResolvedContext`; `AgentRuntime` (SFP-53); `PromptBuilder` (SFP-52) | **Context out:** `ReviewerOutput` (SFP-16)
 
 **Context:**
 The Reviewer returns holistic judgments; comments live on GitHub (ID-023, ID-066).

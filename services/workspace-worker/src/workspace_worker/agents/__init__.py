@@ -17,17 +17,23 @@ Members:
 - :func:`workspace_worker.agents.coder.code` (SFP-72 / DOC SFP-55) — the Coder
   evaluator; implements one PR-spec and returns a
   :class:`~sfp_contracts.agents.coder.CoderOutput`.
+- :func:`workspace_worker.agents.reviewer.review` (SFP-73 / DOC SFP-56) — the
+  Reviewer evaluator; judgment-only review returning a
+  :class:`~sfp_contracts.agents.reviewer.ReviewerOutput`.
 """
 
 from workspace_worker.agents.coder import CoderError, code
 from workspace_worker.agents.planner import PlannerError, plan
+from workspace_worker.agents.reviewer import ReviewerError, review
 from workspace_worker.agents.test_designer import TestDesignerError, design_tests
 
 __all__ = [
     "CoderError",
     "PlannerError",
+    "ReviewerError",
     "TestDesignerError",
     "code",
     "design_tests",
     "plan",
+    "review",
 ]
