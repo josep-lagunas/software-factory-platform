@@ -1438,7 +1438,7 @@ A deterministic test plan per PR-spec (ID-066).
 ---
 
 ### SFP-55 [AGENT] 🤖 — Coder agent + prompt
-**Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-36, SFP-15, SFP-35, SFP-38, SFP-41, SFP-45
+**Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-36, SFP-15, SFP-35, SFP-38, SFP-41, SFP-45 | **Context in:** `PrSpec` (SFP-14), `ResolvedContext`; `AgentRuntime` (SFP-53); `PromptBuilder` (SFP-52) | **Context out:** `CoderOutput` (SFP-15)
 
 **Context:**
 The Coder implements one PR-spec and submits it for review (ID-022).
