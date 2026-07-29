@@ -1,9 +1,9 @@
 # Local-development Docker Compose for SFP infrastructure dependencies.
 #
-# Scope of this file (SFP-76 / doc SFP-59): the Postgres cluster ONLY.
-# LocalStack (SNS/SQS/DLQ) and the OpenTelemetry Collector are added by later
-# tickets per ID-055; this file is intentionally limited to the persistence
-# dependency.
+# Scope of this file:
+#   - Postgres cluster (SFP-76 / doc SFP-59)
+#   - LocalStack — SNS/SQS/DLQ emulation (SFP-77 / doc SFP-60)
+# The OpenTelemetry Collector is added by a later ticket per ID-055.
 #
 # Per ID-055, Compose brings up *dependencies only*; application services run on
 # the host via `uv run` (one process per service) for fast reload/debugging.
@@ -18,6 +18,9 @@
 #
 # Connect from the host (e.g. for psql / Alembic) as the local-dev superuser:
 #   psql "host=localhost port=5432 user=sfp password=sfp_local_dev dbname=identity"
+#
+# Reach LocalStack from the host (e.g. for AWS CLI / boto3 under `uv run`):
+#   export AWS_ENDPOINT_URL=http://localhost:4566
 #
 # All values below are overridable from a local .env file or the shell; the
 # defaults keep `docker compose up` zero-config for local development.
@@ -51,5 +54,37 @@ services:
       retries: 10
       start_period: 5s
 
+  localstack:
+    image: localstack/localstack
+    container_name: sfp-localstack
+    restart: unless-stopped
+    environment:
+      # Comma-separated list of emulated AWS services. SFP-77 covers SNS + SQS;
+      # the DLQ pattern is an SQS queue with a redrive policy, NOT a separate
+      # service. Per ID-054, Secrets Manager is intentionally NOT emulated here.
+      SERVICES: ${LOCALSTACK_SERVICES:-sns,sqs}
+      # Persist emulated state into the named volume below so `down` (without
+      # -v) keeps topics/queues for fast local-dev iteration.
+      DATA_DIR: /var/lib/localstack
+      # AWS_ENDPOINT_URL is a *client-side* setting (not consumed by LocalStack
+      # itself); it is documented here for discoverability. Other Compose
+      # services reach LocalStack at http://localstack:4566 via service-name
+      # DNS; host-side consumers (the app under `uv run`) use
+      # http://localhost:4566 — see the export line in the file header.
+    ports:
+      - "${LOCALSTACK_PORT:-4566}:4566"
+    volumes:
+      # Named volume so emulated topics/queues survive `down`; use `down -v` to
+      # wipe. State is written here because DATA_DIR points at the same path.
+      - sfp-localstack-data:/var/lib/localstack
+    healthcheck:
+      # `localstack wait` blocks until the emulated services report ready.
+      test: ["CMD", "localstack", "wait"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
 volumes:
   sfp-postgres-data:
+  sfp-localstack-data:
