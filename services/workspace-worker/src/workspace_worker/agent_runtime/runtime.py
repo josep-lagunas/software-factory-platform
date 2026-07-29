@@ -65,7 +65,7 @@ class _TransientSDKError(Exception):
 #: ``api_error_status`` values treated as transient (retryable). 429 is the
 #: rate-limit; 5xx are upstream/server faults. Anything else reaching the
 #: hard-reject path is an output error, not infrastructure.
-_TRANSIENT_API_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+_TRANSIENT_API_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 529})
 
 #: Async sleep callable used between retry attempts; tests replace it with a
 #: no-op so retries are instantaneous (no real waiting).

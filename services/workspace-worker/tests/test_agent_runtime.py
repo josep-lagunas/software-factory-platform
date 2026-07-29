@@ -327,6 +327,23 @@ def test_transient_api_status_is_retried() -> None:
     assert len(qfn.calls) == 2
 
 
+def test_anthropic_overloaded_529_is_retried() -> None:
+    # 529 (Anthropic "Overloaded") is retryable per the SDK's own
+    # ResultMessage.api_error_status docstring -> retried, not hard-rejected.
+    qfn = FakeQuery(
+        outcomes=[
+            [FakeMessage(result="ignored", api_error_status=529)],
+            [FakeMessage(result='{"answer": "ok"}')],
+        ]
+    )
+    rt = make_runtime(qfn, max_retries=2)
+
+    res = rt.run(request())
+
+    assert res.success is True
+    assert len(qfn.calls) == 2
+
+
 def test_empty_stream_is_transient_and_retried() -> None:
     # A stream that yields nothing is a transient failure -> retried.
     qfn = FakeQuery(
