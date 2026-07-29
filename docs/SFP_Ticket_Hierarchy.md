@@ -1413,7 +1413,7 @@ The Planner decomposes a ready ticket into PR-specs (ID-021).
 ---
 
 ### SFP-54 [AGENT] 🤖 — Test Designer agent + prompt
-**Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-36, SFP-17, SFP-35
+**Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-36, SFP-17, SFP-35 | **Context in:** `ParsedTicket`, `ResolvedContext`; `AgentRuntime` (SFP-53); `PromptBuilder` (SFP-52) | **Context out:** `TestDesignerOutput` (SFP-17)
 
 **Context:**
 A deterministic test plan per PR-spec (ID-066).
