@@ -1372,6 +1372,12 @@ Some tickets cannot be executed by an agent (ID-065).
 - Detect provisioning-type tickets (accounts/secrets/domains/console) → MANUAL_REQUIRED (ID-065).
 - Conservative: when unsure, prefer MANUAL.
 
+**Binding decisions (Orchestrator, 2026-07-29 — resolve the readiness-gate ambiguities):**
+- **Source of truth = label-derived (ID-065 v0).** The classifier does NOT keyword-detect; it takes an explicit `is_manual: bool` input. The composition root / caller reads the Jira `manual` (👤) label and passes it. Deterministic; consistent with ID-065.
+- **Placement = deterministic pre-filter BEFORE `evaluate_readiness` (SFP-68).** The Orchestrator calls the classifier first; if it returns a non-`None` `ReadinessOutput`, that is the gate result; otherwise it calls `evaluate_readiness`. SFP-68's model-MANUAL path remains as a fallback for unlabeled tickets the model judges manual.
+- **No contract change.** `ReadinessOutput` (SFP-18) has no `manual_required_reason` field — the reason goes into `blocking_ambiguities` (`"Manual-required: ticket is marked manual (ID-065)."`). `MANUAL_REQUIRED` is already a valid `ReadinessVerdict`.
+- The classifier STILL runs the layer-1 rubric (`evaluate_readiness_rubric`, SFP-67) to populate `rubric_results` and surface any missing ID-070 sections. Manual precedence wins (a missing section still yields MANUAL_REQUIRED), and the human sees both the manual reason and the rubric finding.
+
 **References:** ID-065.
 
 **Acceptance criteria:**
