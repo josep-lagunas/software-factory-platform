@@ -46,6 +46,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from workspace_worker.agent_runtime.model_config import AgentModelConfig
 from workspace_worker.infrastructure.settings import WorkspaceWorkerSettings
 
 __all__ = ["ClaudeAgentRuntime"]
@@ -107,6 +108,11 @@ class ClaudeAgentRuntime:
         max_retries: Max number of RETRIES after the first attempt (so the run
             attempts at most ``max_retries + 1`` times). Default 3.
         sleep: Async sleep callable used by the retry loop (test hook).
+        model_resolver: Optional per-role model router (SFP-37 / Jira SFP-54).
+            When present, ``run()`` resolves the model for each request via
+            ``model_resolver.resolve(request.agent)``; when ``None`` (the
+            default), it falls back to ``settings.default_model`` for every role
+            (back-compat with SFP-36 — ``options.model`` is unchanged).
     """
 
     #: Exceptions that trigger a retry. ``_TransientSDKError`` covers SDK
@@ -126,6 +132,7 @@ class ClaudeAgentRuntime:
         query_fn: QueryFn | None = None,
         max_retries: int = 3,
         sleep: SleepFn | None = None,
+        model_resolver: AgentModelConfig | None = None,
     ) -> None:
         self._settings = settings
         self._secret_provider = secret_provider
@@ -133,6 +140,7 @@ class ClaudeAgentRuntime:
         self._query_fn: QueryFn | None = query_fn
         self._max_retries = max_retries
         self._sleep: SleepFn = sleep if sleep is not None else asyncio.sleep
+        self._model_resolver: AgentModelConfig | None = model_resolver
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         """Run the agent; never raises (fail-closed on any unhandled error)."""
@@ -143,8 +151,10 @@ class ClaudeAgentRuntime:
         except SecretResolutionError as exc:
             return _failure(request, f"secret resolution failed: {exc}")
 
-        # 2. Build options — routing + auth live in options.env (ID-020).
-        options = self._build_options(token)
+        # 2. Build options — routing + auth live in options.env (ID-020). The
+        #    model is resolved per-role when a resolver is injected (SFP-37),
+        #    otherwise settings.default_model is used for every role.
+        options = self._build_options(token, request.agent)
 
         # 3-8. Stream + parse + validate under the retry policy, bridging async.
         try:
@@ -154,11 +164,14 @@ class ClaudeAgentRuntime:
 
     # -- internals ---------------------------------------------------------
 
-    def _build_options(self, token: str) -> Any:
+    def _build_options(self, token: str, role: str) -> Any:
         """Build ``ClaudeAgentOptions`` with routing + auth in ``env`` (ID-020).
 
-        Importing the ``ClaudeAgentOptions`` dataclass does NOT spawn the CLI
-        (only ``query()`` does), so this is safe to exercise in tests.
+        The model is resolved per ``role`` when a ``model_resolver`` was injected
+        (SFP-37 / Jira SFP-54); otherwise ``settings.default_model`` is used
+        (back-compat with SFP-36). Importing the ``ClaudeAgentOptions`` dataclass
+        does NOT spawn the CLI (only ``query()`` does), so this is safe to
+        exercise in tests.
         """
         from claude_agent_sdk import ClaudeAgentOptions
 
@@ -170,7 +183,12 @@ class ClaudeAgentRuntime:
             # Merged AFTER the routing/auth entries; duplicate keys here would
             # overwrite ANTHROPIC_*, but extra_env is operator-controlled config.
             env.update(self._settings.extra_env)
-        return ClaudeAgentOptions(model=self._settings.default_model, env=env)
+        model = (
+            self._model_resolver.resolve(role)
+            if self._model_resolver is not None
+            else self._settings.default_model
+        )
+        return ClaudeAgentOptions(model=model, env=env)
 
     async def _run_async(self, request: AgentRunRequest, options: Any) -> AgentRunResult:
         query_fn = self._resolve_query_fn()

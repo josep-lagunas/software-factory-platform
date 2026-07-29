@@ -31,6 +31,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
 from sfp_agent_runtime.interfaces import AgentRunRequest
 from sfp_config import SecretRef, SecretResolutionError
+from workspace_worker.agent_runtime.model_config import AgentModelConfig
 from workspace_worker.agent_runtime.runtime import (
     ClaudeAgentRuntime,
     _TransientSDKError,
@@ -131,6 +132,7 @@ def make_runtime(
     max_retries: int = 2,
     provider: FakeSecretProvider | None = None,
     settings: WorkspaceWorkerSettings | None = None,
+    model_resolver: AgentModelConfig | None = None,
 ) -> ClaudeAgentRuntime:
     return ClaudeAgentRuntime(
         settings or make_settings(),
@@ -139,6 +141,7 @@ def make_runtime(
         query_fn=query_fn,
         max_retries=max_retries,
         sleep=_noop_sleep,
+        model_resolver=model_resolver,
     )
 
 
@@ -550,3 +553,77 @@ def test_settings_missing_required_field_rejected() -> None:
             anthropic_base_url="https://api.example.com",
             default_model="claude-sonnet-4",
         )
+
+
+# --------------------------------------------------------------------------- #
+# Per-role model routing (SFP-37 / Jira SFP-54)
+# --------------------------------------------------------------------------- #
+
+
+def _resolver(**overrides: Any) -> AgentModelConfig:
+    """Build an AgentModelConfig with a distinct global default + overrides."""
+    base: dict[str, Any] = {"default_model": "global-model"}
+    base.update(overrides)
+    return AgentModelConfig(**base)
+
+
+@pytest.mark.parametrize(
+    "agent,expected",
+    [("planner", "planner-x"), ("coder", "coder-x"), ("reviewer", "reviewer-x")],
+)
+def test_injected_resolver_drives_per_role_options_model(agent: str, expected: str) -> None:
+    resolver = _resolver(planner="planner-x", coder="coder-x", reviewer="reviewer-x")
+    qfn = FakeQuery(outcomes=[[FakeMessage(result='{"answer": "x"}')]])
+    rt = make_runtime(qfn, model_resolver=resolver)
+
+    rt.run(request(agent=agent))
+
+    assert qfn.calls[0]["options"].model == expected
+
+
+def test_resolver_unknown_role_uses_resolver_default_not_settings_default() -> None:
+    # readiness is a real role in use but NOT in ROLES_WITH_OVERRIDE → the
+    # resolver's default_model wins, which is DISTINCT from settings.default_model.
+    resolver = _resolver(planner="planner-x")  # default_model="global-model"
+    settings = make_settings(default_model="claude-sonnet-4")
+    qfn = FakeQuery(outcomes=[[FakeMessage(result='{"answer": "x"}')]])
+    rt = make_runtime(qfn, settings=settings, model_resolver=resolver)
+
+    rt.run(request(agent="readiness"))
+
+    assert qfn.calls[0]["options"].model == "global-model"
+    assert qfn.calls[0]["options"].model != settings.default_model
+
+
+def test_no_resolver_falls_back_to_settings_default_model() -> None:
+    # Back-compat: model_resolver=None (the default) → options.model is exactly
+    # settings.default_model, unchanged from SFP-36.
+    settings = make_settings(default_model="claude-sonnet-4")
+    qfn = FakeQuery(outcomes=[[FakeMessage(result='{"answer": "x"}')]])
+    rt = make_runtime(qfn, settings=settings)  # model_resolver=None
+
+    rt.run(request(agent="planner"))
+
+    assert qfn.calls[0]["options"].model == "claude-sonnet-4"
+    assert qfn.calls[0]["options"].model == settings.default_model
+
+
+def test_whitespace_padded_override_strips_through_runtime() -> None:
+    # The validator strips on construction; the stripped id rides into options.model.
+    resolver = _resolver(planner="  planner-x  ")
+    qfn = FakeQuery(outcomes=[[FakeMessage(result='{"answer": "x"}')]])
+    rt = make_runtime(qfn, model_resolver=resolver)
+
+    rt.run(request(agent="planner"))
+
+    assert qfn.calls[0]["options"].model == "planner-x"
+
+
+def test_resolver_case_insensitive_through_runtime() -> None:
+    resolver = _resolver(planner="planner-x")
+    qfn = FakeQuery(outcomes=[[FakeMessage(result='{"answer": "x"}')]])
+    rt = make_runtime(qfn, model_resolver=resolver)
+
+    rt.run(request(agent="PLANNER"))
+
+    assert qfn.calls[0]["options"].model == "planner-x"
