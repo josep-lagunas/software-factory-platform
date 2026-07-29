@@ -999,6 +999,12 @@ Each role (Planner/Coder/Reviewer/Test Designer) uses a configurable model (ID-0
 - Read SFP_AGENT_MODEL_* env via sfp-config; fail fast at startup if a role lacks a model (ID-020).
 - Per-role defaults may be set.
 
+**Binding decisions (Orchestrator, 2026-07-29 — resolve the readiness-gate ambiguities):**
+- **Scope**: create `model_config.py` (a typed `AgentModelConfig` role→model map + `resolve(role) -> str` + startup validation) AND wire it minimally into the landed `ClaudeAgentRuntime`: the constructor accepts an optional `model_resolver: AgentModelConfig | None`; when present, `run()`/`_build_options` resolves the model via `model_resolver.resolve(request.agent)`, otherwise it falls back to `settings.default_model` (back-compat). `default_model` stays as the global default. So per-role routing actually takes effect — not a dead module.
+- **Role universe**: per-role env vars exist only for `{planner, coder, reviewer}` per ID-063. Other roles actually in use (`test_designer`, `readiness`) and future roles resolve to the global default (no per-role var) — this resolves the Context-vs-Requirements contradiction.
+- **Fallback chain**: `resolve(role)` = `SFP_AGENT_MODEL_<ROLE>` if set (planner/coder/reviewer only) → else `WorkspaceWorkerSettings.default_model` (the global default, already startup-validated non-empty). The global default is the floor, so a role always resolves; "missing model → startup failure" is enforced by the existing `default_model` non-empty validation (SFP-53). Per-role vars are optional overrides, not required.
+- **No new env var** for a global default (reuse `default_model`); no hardcoded model-id string.
+
 **References:** ID-020, ID-063.
 
 **Acceptance criteria:**
