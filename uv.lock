@@ -703,6 +703,7 @@ version = "0.1.0"
 source = { editable = "services/workspace-worker" }
 dependencies = [
     { name = "httpx" },
+    { name = "sfp-agent-runtime" },
     { name = "sfp-contracts" },
     { name = "tenacity" },
 ]
@@ -710,6 +711,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "httpx" },
+    { name = "sfp-agent-runtime", editable = "packages/sfp-agent-runtime" },
     { name = "sfp-contracts", editable = "packages/sfp-contracts" },
     { name = "tenacity" },
 ]

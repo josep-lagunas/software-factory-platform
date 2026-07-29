@@ -6,6 +6,7 @@ dependencies = [
     "httpx",
     "tenacity",
     "sfp-contracts",
+    "sfp-agent-runtime",
 ]
 
 [build-system]
@@ -14,8 +15,11 @@ build-backend = "hatchling.build"
 
 # sfp-contracts is a workspace member (packages/sfp-contracts); resolve it from
 # the local workspace rather than a registry (SFP-75 — first intra-workspace dep).
+# sfp-agent-runtime likewise (SFP-68 — readiness gate depends on the
+# AgentRuntime/PromptProvider seam + PromptBuilder).
 [tool.uv.sources]
 sfp-contracts = { workspace = true }
+sfp-agent-runtime = { workspace = true }
 
 [tool.coverage.run]
 source = ["src/workspace_worker"]
