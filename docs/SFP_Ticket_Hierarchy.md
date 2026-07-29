@@ -1381,7 +1381,7 @@ Some tickets cannot be executed by an agent (ID-065).
 ---
 
 ### SFP-53 [AGENT] 🤖 — Planner agent + prompt
-**Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-36, SFP-14, SFP-35, SFP-24
+**Labels:** manual-core, ai-agent, agent-layer | **Deps:** SFP-36, SFP-14, SFP-35, SFP-24 | **Context in:** `ParsedTicket`, `ResolvedContext` (readiness gate SFP-67/68); `AgentRuntime` (SFP-36/Jira SFP-53); `PromptBuilder` (SFP-35/Jira SFP-52) | **Context out:** `PlannerOutput` (SFP-14/Jira SFP-31)
 
 **Context:**
 The Planner decomposes a ready ticket into PR-specs (ID-021).
