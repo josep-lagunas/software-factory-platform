@@ -9,8 +9,8 @@ into the services that need it. Configuration is injected, never hardcoded
 
 This is the *base* settings surface; each service/package is expected to
 subclass it, extending the prefix or adding fields as needed. Per-role agent
-model routing (``AgentModelConfig``) lives in SFP-41 and is intentionally not
-present here.
+model routing (``SFP_AGENT_MODEL_PLANNER/CODER/REVIEWER``) is delivered by
+SFP-54 (Jira) / SFP-37 (DOC) and is intentionally not present here.
 """
 
 from __future__ import annotations

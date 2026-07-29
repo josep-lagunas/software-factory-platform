@@ -948,7 +948,7 @@ The concrete runtime behind the SFP-34 abstraction, driving agents via the Claud
 
 **Requirements:**
 - Implement `AgentRuntime` using `claude-agent-sdk`; resolve credentials/endpoint from config (SFP-11).
-- Enforce per-role model selection (SFP-37).
+- Resolve a single default model from config (ID-020: `ANTHROPIC_BASE_URL` + a default model); startup-validate that it is configured. **Per-role model routing is SFP-37's scope (it depends on this ticket) and is intentionally NOT implemented here.**
 - Validate every agent output against its JSON contract (SFP-13…18); reject non-conformant output.
 
 **Files to create/modify:**
@@ -958,6 +958,20 @@ The concrete runtime behind the SFP-34 abstraction, driving agents via the Claud
 **Implementation notes:**
 - Startup validation of model config (ID-020); no raw provider credentials.
 - Unit-test with a stubbed SDK (no live calls in CI).
+
+**Binding decisions (Orchestrator, 2026-07-29 — resolve the readiness-gate ambiguities):**
+- **Model**: single default model resolved from env per ID-020 (`ANTHROPIC_BASE_URL` + `ANTHROPIC_DEFAULT_SONNET_MODEL`); startup-validate presence. Per-role routing is SFP-37's scope, NOT here.
+- **Contract validation**: the runtime validates the SDK's parsed output against a pydantic output contract (one of SFP-13…18) **injected at construction** (or resolved by `agent` role); on `ValidationError` it returns `AgentRunResult(success=False, error=…)`. The vendor-neutral `AgentRunRequest` is unchanged (no schema field added); this runtime is the sole place output-contract validation lives.
+- **Config surface**: typed fields on sfp-config `Settings` — `anthropic_base_url` and `llm_provider_secret_ref: SecretRef`; resolve the secret via the landed `SecretProvider` (SFP-11). Never log/hold raw credentials.
+- **Retry/timeout policy**: `tenacity` retries only transient SDK failures (connection/timeout/5xx), N=3 with exponential backoff, configurable timeout; non-conformant output is a hard reject (NOT retried). Fail-closed on any unhandled error (ID-067).
+- **SDK dependency + CI stub**: add `claude-agent-sdk` (and the `sfp-agent-runtime` workspace dep) to `services/workspace-worker/pyproject.toml`; the concrete adapter's constructor takes an injectable `query_fn` so unit tests inject a fake (an async generator yielding a final `ResultMessage`-like object) — zero live calls in CI.
+
+**Verified `claude-agent-sdk` contract (introspected v0.2.128, 2026-07-29 — supersedes any HTTP-client assumption):**
+- Entry point `query(*, prompt, options=None, transport=None) -> AsyncIterator[…message types…]`; the **final** `ResultMessage` carries `result: str | None` (the agent's text output), `is_error: bool`, `errors: list[str]`, `api_error_status: int | None`, `total_cost_usd`, `usage`. Consume by `async for`.
+- `ClaudeAgentOptions` (dataclass): `model: str | None`, and crucially **`env: dict[str, str]`** — provider routing and credentials are injected here (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`), consistent with ID-020. There is **NO** `base_url`/`api_key`/`timeout` option; the adapter reads its typed Settings fields and writes them into `options.env`.
+- The SDK spawns the **Claude Code CLI** subprocess (`CLINotFoundError`); the production runtime requires the `claude` CLI on PATH, routed to the configured endpoint. This is the ID-019 path ("preserves Agent SDK / Claude Code capabilities").
+- The landed `AgentRuntime.run()` is **sync**; the SDK is **async** → the adapter bridges via `asyncio.run(...)` inside `run()` (v0 call sites like `readiness_gate.evaluate_readiness` are sync). Injecting `query_fn` lets tests avoid the CLI entirely.
+- Retry (tenacity) targets transient conditions surfaced by the SDK (`CLIConnectionError`, `api_error_status` 5xx, `RateLimitEvent`); the adapter translates these into its `TRANSIENT_EXCEPTIONS`. Non-conformant output / `is_error` → hard reject, not retried.
 
 **References:** ID-018, ID-019, ID-020, ID-066.
 
