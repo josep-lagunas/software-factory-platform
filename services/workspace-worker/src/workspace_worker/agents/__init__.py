@@ -14,14 +14,20 @@ Members:
 - :func:`workspace_worker.agents.test_designer.design_tests` (SFP-71 / DOC SFP-54)
   — the Test Designer evaluator; designs a
   :class:`~sfp_contracts.agents.test_designer.TestDesignerOutput` test plan.
+- :func:`workspace_worker.agents.coder.code` (SFP-72 / DOC SFP-55) — the Coder
+  evaluator; implements one PR-spec and returns a
+  :class:`~sfp_contracts.agents.coder.CoderOutput`.
 """
 
+from workspace_worker.agents.coder import CoderError, code
 from workspace_worker.agents.planner import PlannerError, plan
 from workspace_worker.agents.test_designer import TestDesignerError, design_tests
 
 __all__ = [
+    "CoderError",
     "PlannerError",
     "TestDesignerError",
+    "code",
     "design_tests",
     "plan",
 ]
