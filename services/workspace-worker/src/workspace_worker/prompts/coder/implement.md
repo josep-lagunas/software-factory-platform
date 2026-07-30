@@ -1,26 +1,16 @@
-# Implement one PR-spec
+## Input contract
 
-Given a PR-spec and its resolved context, implement that single PR-spec: create
-/ modify the listed files, write/update tests, run the build and the test suite,
-and open the pull request.
+- A **PRSpec** (SFP-14) — the only source of *what* to build.
+- A **TestDesignerOutput** (SFP-17) — the bar your code must clear.
+- **Resolved context** (SFP-49): repo state, conventions, schemas.
+- An **isolated git worktree** (SFP-39) of your own — provisioned by the Orchestrator or created via `git worktree add`. Never operate in the shared checkout (see Hard constraints).
 
-Emit a single JSON object with EXACTLY this top-level shape (unknown fields are
-rejected). The code itself is NOT carried here — it lives on the branch/PR:
+## Output contract
 
-- `pr_spec_id` (string) — the PR-spec implemented.
-- `branch_name` (string) — the git branch you pushed.
-- `pull_request_url` (string) — the PR URL you opened.
-- `files_changed` (array of strings) — paths created/modified.
-- `tests_added_or_updated` (array of strings) — test paths.
-- `validation_status` (string) — one of `PASSED`, `FAILED`, `PENDING`,
-  `NOT_RUN`. The honest result of running the validation commands.
-- `validation_evidence` (array of strings) — short evidence lines (e.g. command
-  + summary; `36 passed, 100% coverage`).
-- `known_limitations` (array of strings) — anything you could not honor from the
-  PR-spec; empty list conveys "none reported".
+You MUST produce a `CoderOutput` conforming to the Coder output schema (**SFP-15**). Strictly:
+- `files_changed` — exact paths + intent (create/modify/delete).
+- `build_result`, `test_result`, `lint_result` — pass/fail + evidence.
+- `deviations_from_prspec` — any deviation, with reason. Empty only if none.
+- `pr_opened` — PR URL (SFP-42), body references the Jira ticket (ID-025).
 
-Rules (ID-022 / ID-066):
-- Implement the PR-spec as written; surface deviations as `known_limitations`,
-  never silent improvisation.
-- Reference the code (branch/PR/files), never inline it.
-- Honest `validation_status` from actually running the gates.
+Output is **structured** (JSON matching SFP-15).

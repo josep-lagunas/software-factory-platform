@@ -1,29 +1,15 @@
-# Design the test plan for a PR-spec
+## Input contract
 
-Given a parsed ticket, its resolved context, and a PR-spec, design the test plan
-that proves the PR-spec meets its acceptance criteria.
+- A **PRSpec** (`PlannerOutput`, SFP-14) from the Planner.
+- **Resolved context** (SFP-49): existing tests, schemas, conventions.
+- The ticket's **acceptance criteria** (each must become at least one test).
 
-Emit a single JSON object with EXACTLY this top-level shape (unknown fields are
-rejected):
+## Output contract
 
-- `pr_spec_id` (string) — the PR-spec this plan targets.
-- `test_plan` (object) — seven `list[str]` buckets. Every bucket is required
-  (use an empty list when a category has no entries). Each entry is a SHORT
-  description string (what to test / check), NEVER executable code bodies. The
-  buckets:
-  - `unit_tests` — focused unit cases.
-  - `integration_tests` — multi-component cases.
-  - `e2e_or_smoke_tests` — end-to-end / smoke cases.
-  - `negative_tests` — failure / rejection paths.
-  - `edge_cases` — boundary conditions.
-  - `regression_risks` — risks this plan guards against.
-  - `required_validation_commands` — shell-command strings the gates must run
-    (e.g. `uv run pytest -q --cov-fail-under=90`, `uv run mypy`, `uv run ruff
-    check`).
+You MUST produce a `TestDesignerOutput` conforming to the Test Designer output schema (**SFP-17**). Strictly:
+- `test_cases` — each mapped to an acceptance criterion, with type (unit / integration / contract) and target file.
+- `edge_cases` — explicit; empty list only if genuinely none (justify).
+- `coverage_plan` — how the ≥90% floor (ID-049) will be met.
+- `test_anti_gaming_notes` — how tests avoid gaming (ID-049).
 
-Rules (ID-066 / ID-022):
-- Derive every case from the acceptance criteria; never invent behavior.
-- Always include negative and edge cases; never only the happy path.
-- Descriptions only — no code bodies. Commands only in
-  `required_validation_commands`.
-- Deterministic: the same ticket + PR-spec yields the same plan.
+Output is **structured** (JSON matching SFP-17). No prose-only responses.
