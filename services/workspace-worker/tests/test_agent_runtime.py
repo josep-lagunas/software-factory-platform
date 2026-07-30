@@ -131,6 +131,7 @@ def make_runtime(
     *,
     max_retries: int = 2,
     max_turns: int | None = None,
+    cwd: str | None = None,
     provider: FakeSecretProvider | None = None,
     settings: WorkspaceWorkerSettings | None = None,
     model_resolver: AgentModelConfig | None = None,
@@ -143,6 +144,8 @@ def make_runtime(
     }
     if max_turns is not None:
         kwargs["max_turns"] = max_turns
+    if cwd is not None:
+        kwargs["cwd"] = cwd
     return ClaudeAgentRuntime(
         settings or make_settings(),
         provider or FakeSecretProvider(),
@@ -655,3 +658,17 @@ def test_explicit_max_turns_forwarded_into_options() -> None:
     qfn = FakeQuery(outcomes=[[FakeMessage(result='{"answer": "x"}')]])
     make_runtime(qfn, max_turns=3).run(request())
     assert qfn.calls[0]["options"].max_turns == 3
+
+
+def test_cwd_forwarded_into_options() -> None:
+    """cwd is forwarded into ClaudeAgentOptions (run in a worktree)."""
+    qfn = FakeQuery(outcomes=[[FakeMessage(result='{"answer": "x"}')]])
+    make_runtime(qfn, cwd="/tmp/worktree").run(request())
+    assert qfn.calls[0]["options"].cwd == "/tmp/worktree"
+
+
+def test_cwd_default_none_in_options() -> None:
+    """cwd defaults to None (no worktree override)."""
+    qfn = FakeQuery(outcomes=[[FakeMessage(result='{"answer": "x"}')]])
+    make_runtime(qfn).run(request())
+    assert qfn.calls[0]["options"].cwd is None

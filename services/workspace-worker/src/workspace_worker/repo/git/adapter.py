@@ -148,6 +148,30 @@ class GitSyncResult:
 
 
 @dataclass(frozen=True, slots=True)
+class GitMergeResult:
+    """Outcome of :meth:`GitProviderAdapter.merge_pr`.
+
+    Attributes:
+        owner: Repository owner (account or organization).
+        repo: Repository name.
+        pull_number: The pull request number that was merged.
+        sha: The merge-commit SHA (from the response ``sha`` field; empty string
+            when absent).
+        merged: Whether the PR was merged by this call (the response ``merged``
+            field). ``True`` on a clean merge; ``False`` when GitHub reports the
+            PR was already merged (200 with ``merged: false``).
+        merge_method: The merge method used (``squash`` / ``merge`` / ``rebase``).
+    """
+
+    owner: str
+    repo: str
+    pull_number: int
+    sha: str
+    merged: bool
+    merge_method: str
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewResult:
     """Outcome of :meth:`GitProviderAdapter.submit_review`.
 
@@ -658,3 +682,59 @@ class GitProviderAdapter:
         response_url = data.get("url") if isinstance(data, dict) else None
         sha = _last_url_path_segment(response_url) if response_url else ""
         return GitSyncResult(owner=owner, repo=repo, pull_number=pull_number, sha=sha)
+
+    def merge_pr(
+        self,
+        owner: str,
+        repo: str,
+        pull_number: int,
+        *,
+        merge_method: str = "squash",
+    ) -> GitMergeResult:
+        """Merge a pull request (``PUT /pulls/{n}/merge``).
+
+        Default ``merge_method="squash"`` (one commit on base, matching the SFP
+        squash convention). Issues ``PUT {base}/repos/{owner}/{repo}/pulls/{n}/merge``
+        with ``{"merge_method": ...}`` via :meth:`_request` (bearer + tenacity
+        retry on ``{429,500,502,503,504}``) and :meth:`_raise_for_status` (a
+        redacted :class:`GitProviderAdapterError` on any non-success).
+
+        GitHub returns ``200`` on success with ``{"sha": ..., "merged": true,
+        "message": "Pull Request successfully merged"}``. A ``405`` (PR not
+        mergeable — e.g. failing required checks) or ``409`` (merge conflict) is
+        a normal, non-retried failure surfacing as a plain redacted error.
+
+        Args:
+            owner: Repository owner (account or organization).
+            repo: Repository name.
+            pull_number: The pull request number to merge (``>= 1``).
+            merge_method: ``squash`` (default), ``merge``, or ``rebase``.
+
+        Returns:
+            The :class:`GitMergeResult` describing the outcome.
+
+        Raises:
+            ValueError: if ``owner`` / ``repo`` is empty or ``pull_number < 1``.
+            GitProviderAdapterError: on any non-success (incl. ``405``/``409``).
+                The token is redacted from the message.
+        """
+        if not owner:
+            raise ValueError("owner must not be empty")
+        if not repo:
+            raise ValueError("repo must not be empty")
+        if pull_number < 1:
+            raise ValueError("pull_number must be >= 1")
+        url = f"{self._base}/repos/{owner}/{repo}/pulls/{pull_number}/merge"
+        response = self._request("PUT", url, json={"merge_method": merge_method})
+        self._raise_for_status("merge", response, url)
+        data = response.json()
+        sha = data.get("sha", "") if isinstance(data, dict) else ""
+        merged = data.get("merged", True) if isinstance(data, dict) else True
+        return GitMergeResult(
+            owner=owner,
+            repo=repo,
+            pull_number=pull_number,
+            sha=sha,
+            merged=bool(merged),
+            merge_method=merge_method,
+        )

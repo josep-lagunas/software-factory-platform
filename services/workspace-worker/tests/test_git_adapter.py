@@ -1606,3 +1606,47 @@ def test_submit_review_body_optionality_empty_body_succeeds() -> None:
     assert result == ReviewResult(
         owner=OWNER, repo=REPO, number=PR_NUMBER, review_id=REVIEW_ID, state=REVIEW_STATE
     )
+
+
+def test_merge_pr_success() -> None:
+    # PUT /pulls/{n}/merge with merge_method=squash; returns GitMergeResult.
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.method == "PUT"
+        assert request.url.path == f"/repos/{OWNER}/{REPO}/pulls/{PR_NUMBER}/merge"
+        import json as _json
+
+        body = _json.loads(request.content) if request.content else {}
+        assert body.get("merge_method") == "squash"
+        return httpx.Response(
+            200,
+            json={"sha": "abc123", "merged": True, "message": "Pull Request successfully merged"},
+        )
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.merge_pr(OWNER, REPO, PR_NUMBER)
+
+    assert result.merged is True
+    assert result.sha == "abc123"
+    assert result.merge_method == "squash"
+    assert len(seen) == 1
+
+
+def test_merge_pr_405_not_mergeable_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(405, json={"message": "Pull Request is not mergeable"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError):
+        adapter.merge_pr(OWNER, REPO, PR_NUMBER)
+
+
+def test_merge_pr_409_conflict_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"message": "merge conflict"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError):
+        adapter.merge_pr(OWNER, REPO, PR_NUMBER)
