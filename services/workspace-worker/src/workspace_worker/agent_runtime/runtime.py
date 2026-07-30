@@ -87,6 +87,30 @@ def _failure(request: AgentRunRequest, message: str) -> AgentRunResult:
     )
 
 
+def _extract_json(text: str) -> str:
+    """Return ``text`` with any surrounding markdown fence stripped.
+
+    Anthropic-compatible providers (e.g. the GLM endpoint, per ID-019) often
+    wrap a JSON result in a `````json ... ````` fence despite the prompt asking
+    for raw JSON. The runtime parses ``ResultMessage.result`` as JSON; this
+    helper makes that parse robust to such wrapping without changing the
+    contract. If ``text`` is not fenced, it is returned unchanged (stripped of
+    surrounding whitespace). Non-fenced, non-JSON input still raises below.
+    """
+    s = text.strip()
+    if s.startswith("```"):
+        # Drop the opening fence line (``` or ```json / ```JSON).
+        first_nl = s.find("\n")
+        if first_nl != -1:
+            s = s[first_nl + 1 :]
+        elif s.endswith("```"):
+            s = ""  # degenerate "```" only
+        # Drop a trailing closing fence.
+        if s.endswith("```"):
+            s = s[:-3]
+    return s.strip()
+
+
 class ClaudeAgentRuntime:
     """AgentRuntime backed by the Claude Agent SDK.
 
@@ -107,6 +131,12 @@ class ClaudeAgentRuntime:
             ``sys.modules`` until a run needs it).
         max_retries: Max number of RETRIES after the first attempt (so the run
             attempts at most ``max_retries + 1`` times). Default 3.
+        max_turns: Bound on the agent's agentic turns, forwarded to
+            ``ClaudeAgentOptions(max_turns=...)``. Bounds run-away agent loops
+            (and cost) and forces a clean finalization so a run does not return
+            an empty ``ResultMessage.result`` (ID-019 empirical finding). Default
+            50 — enough for a multi-step Coder run, bounded enough to fail-fast;
+            the composition root may override per agent.
         sleep: Async sleep callable used by the retry loop (test hook).
         model_resolver: Optional per-role model router (SFP-37 / Jira SFP-54).
             When present, ``run()`` resolves the model for each request via
@@ -131,6 +161,7 @@ class ClaudeAgentRuntime:
         *,
         query_fn: QueryFn | None = None,
         max_retries: int = 3,
+        max_turns: int = 50,
         sleep: SleepFn | None = None,
         model_resolver: AgentModelConfig | None = None,
     ) -> None:
@@ -139,6 +170,7 @@ class ClaudeAgentRuntime:
         self._output_contract = output_contract
         self._query_fn: QueryFn | None = query_fn
         self._max_retries = max_retries
+        self._max_turns = max_turns
         self._sleep: SleepFn = sleep if sleep is not None else asyncio.sleep
         self._model_resolver: AgentModelConfig | None = model_resolver
 
@@ -188,7 +220,7 @@ class ClaudeAgentRuntime:
             if self._model_resolver is not None
             else self._settings.default_model
         )
-        return ClaudeAgentOptions(model=model, env=env)
+        return ClaudeAgentOptions(model=model, env=env, max_turns=self._max_turns)
 
     async def _run_async(self, request: AgentRunRequest, options: Any) -> AgentRunResult:
         query_fn = self._resolve_query_fn()
@@ -209,9 +241,11 @@ class ClaudeAgentRuntime:
             )
             return _failure(request, f"agent run errored: {detail}")
 
-        # 5. Parse JSON (hard reject, no retry).
+        # 5. Parse JSON (hard reject, no retry). Strip markdown fences first —
+        #    Anthropic-compatible providers often wrap JSON in ```json fences
+        #    (ID-019 empirical finding).
         try:
-            parsed = json.loads(result_text)
+            parsed = json.loads(_extract_json(result_text))
         except json.JSONDecodeError as exc:
             return _failure(request, f"agent output was not valid JSON: {exc}")
 
