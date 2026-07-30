@@ -130,18 +130,24 @@ def make_runtime(
     query_fn: Any | None,
     *,
     max_retries: int = 2,
+    max_turns: int | None = None,
     provider: FakeSecretProvider | None = None,
     settings: WorkspaceWorkerSettings | None = None,
     model_resolver: AgentModelConfig | None = None,
 ) -> ClaudeAgentRuntime:
+    kwargs: dict[str, Any] = {
+        "query_fn": query_fn,
+        "max_retries": max_retries,
+        "sleep": _noop_sleep,
+        "model_resolver": model_resolver,
+    }
+    if max_turns is not None:
+        kwargs["max_turns"] = max_turns
     return ClaudeAgentRuntime(
         settings or make_settings(),
         provider or FakeSecretProvider(),
         OutputContract,
-        query_fn=query_fn,
-        max_retries=max_retries,
-        sleep=_noop_sleep,
-        model_resolver=model_resolver,
+        **kwargs,
     )
 
 
@@ -627,3 +633,25 @@ def test_resolver_case_insensitive_through_runtime() -> None:
     rt.run(request(agent="PLANNER"))
 
     assert qfn.calls[0]["options"].model == "planner-x"
+
+
+def test_fenced_json_is_parsed() -> None:
+    """ID-019: JSON wrapped in a ```json fence is parsed (fence stripped)."""
+    qfn = FakeQuery(outcomes=[[FakeMessage(result='```json\n{"answer": "42"}\n```')]])
+    res = make_runtime(qfn).run(request())
+    assert res.success is True
+    assert res.output == {"answer": "42"}
+
+
+def test_max_turns_default_forwarded_into_options() -> None:
+    """max_turns default (50) is forwarded into ClaudeAgentOptions."""
+    qfn = FakeQuery(outcomes=[[FakeMessage(result='{"answer": "x"}')]])
+    make_runtime(qfn).run(request())
+    assert qfn.calls[0]["options"].max_turns == 50
+
+
+def test_explicit_max_turns_forwarded_into_options() -> None:
+    """An explicit max_turns overrides the default in options."""
+    qfn = FakeQuery(outcomes=[[FakeMessage(result='{"answer": "x"}')]])
+    make_runtime(qfn, max_turns=3).run(request())
+    assert qfn.calls[0]["options"].max_turns == 3
