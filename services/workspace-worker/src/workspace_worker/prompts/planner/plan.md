@@ -1,39 +1,26 @@
-# Plan a ready ticket
+## Input contract
 
-Given a parsed ticket and its resolved context, decompose the ticket into one or
-more self-contained PR-sized tasks.
+You receive, from the Orchestrator (the human, during Phase A):
+- A **ticket** in AI-Implementation-Specification form (ID-070): Context, Requirements, Files to create/modify, Implementation notes, References, Acceptance criteria.
+- **Resolved context** (SFP-49): referenced Implementation Decisions (ID-xxx), relevant MAS sections, existing code, schemas.
+- The **validation profile** assigned to the ticket (SFP-24).
 
-Emit a single JSON object with EXACTLY this top-level shape (unknown fields are
-rejected):
+## Output contract
 
-- `pr_specs` (array, **non-empty**) — one element per PR task. Each element has
-  EXACTLY these fields (unknown fields are rejected):
-  - `id` (string) — stable PR-spec identifier.
-  - `title` (string) — concise PR title.
-  - `goal` (string) — the single outcome this PR delivers.
-  - `scope` (array of short strings) — what this PR touches.
-  - `out_of_scope` (array of short strings) — what is deliberately deferred.
-  - `acceptance_criteria` (array of short strings) — verifiable outcomes.
-  - `dependencies` (array of short strings) — upstream ids/tickets this PR needs.
-  - `validation_profile` (string) — one of `"LEVEL_1_INTERNAL"`,
-    `"LEVEL_2_BACKEND_OR_API"`, `"LEVEL_3_USER_FACING"`, `"LEVEL_4_HIGH_RISK"`.
-  - `validation_profile_reason` (string) — why this tier was chosen.
-  - `required_gates` (array of short strings) — the gates the workflow must
-    enforce for this PR.
-  - `likely_files_or_modules` (array of short strings) — expected file surface.
-  - `risks` (array of short strings) — what could go wrong.
-  - `implementation_notes` (string) — design guidance for the coder.
+You MUST produce a `PlannerOutput` conforming to the Planner output schema (**SFP-14 / ID-021**), as a JSON object. This output is **execution-pinned** and is structurally validated by `tools/check_prspec.py` (run after the Planner, before the Coder). The required top-level keys (a missing key fails validation; see `validate()` in that tool) are:
 
-Rules:
+- `pr_spec_id`, `ticket`, `title`, `branch_name`, `validation_profile_acknowledged` — identity & profile in effect.
+- `files` — non-empty list; each entry `{path: non-empty str, action: create|modify|delete}`. For `action=modify`, an `anchor` is REQUIRED and must carry EXACTLY ONE of `{before: non-empty str}` (literal text to locate) or `{line_range: [start, end]}` (ints, `start>=1`, `end>=start`, exactly 2 elements; bools rejected). An anchor that is missing, or carries both, or carries neither, fails validation. (`create`/`delete` entries may carry an anchor; it is ignored, not rejected.)
+- `implementation_steps` — non-empty, ordered, deterministic, each mapped to files.
+- `dependencies` — dict or list (on other tickets / ID-xxx decisions / existing code).
+- `risks` — non-empty; explicitly flagged, never omitted (state "none" explicitly if so).
+- `commit_plan` — `{strategy: non-empty, commit_message: non-empty}`.
+- `pr_title`, `pr_body_must_include` — the PR title and the mandatory PR-body line (e.g. the JIRA link).
+- `acceptance_criteria_mapping` — dict mapping each acceptance criterion to where it is satisfied (list/scalar rejected).
+- `verification` — `{type: script|command, body: non-empty str}`.
+- `read_allowlist` — non-empty list of paths the Coder may read.
+- `rig_reference` — non-empty str naming the rig + Coder identity in effect (e.g. Phase A local execution, `sfp-coder-bot`).
 
-- Each PR-spec must be self-contained: a single coder run can complete it
-  end-to-end without another PR landing first. Use `dependencies` only for true
-  ordering constraints between otherwise-independent PRs.
-- Never invent product requirements. When the ticket is ambiguous, surface it as
-  a `risk` and pick the higher `validation_profile` (ID-067: "when in doubt,
-  choose the higher level").
-- Assign every PR-spec a `validation_profile` from the four-level enum — the
-  chosen tier determines which gates the workflow enforces and whether a human
-  approval is required before merge.
-- Produce deterministic JSON: stable field order, no prose outside the JSON
-  object, no markdown fencing.
+Unknown/extra top-level keys are tolerated (presence + shape only); duplicate file paths are tolerated.
+
+Output is **structured** (JSON matching SFP-14). No prose-only responses. If a path or anchor cannot be pinned (e.g. a `modify` target whose text has moved or cannot be located), emit a blocker — do not guess (MAS §12.9).
