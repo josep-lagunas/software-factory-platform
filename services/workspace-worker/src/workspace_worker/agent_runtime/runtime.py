@@ -162,6 +162,7 @@ class ClaudeAgentRuntime:
         query_fn: QueryFn | None = None,
         max_retries: int = 3,
         max_turns: int = 50,
+        cwd: str | None = None,
         sleep: SleepFn | None = None,
         model_resolver: AgentModelConfig | None = None,
     ) -> None:
@@ -171,6 +172,7 @@ class ClaudeAgentRuntime:
         self._query_fn: QueryFn | None = query_fn
         self._max_retries = max_retries
         self._max_turns = max_turns
+        self._cwd: str | None = cwd
         self._sleep: SleepFn = sleep if sleep is not None else asyncio.sleep
         self._model_resolver: AgentModelConfig | None = model_resolver
 
@@ -220,7 +222,7 @@ class ClaudeAgentRuntime:
             if self._model_resolver is not None
             else self._settings.default_model
         )
-        return ClaudeAgentOptions(model=model, env=env, max_turns=self._max_turns)
+        return ClaudeAgentOptions(model=model, env=env, max_turns=self._max_turns, cwd=self._cwd)
 
     async def _run_async(self, request: AgentRunRequest, options: Any) -> AgentRunResult:
         query_fn = self._resolve_query_fn()
