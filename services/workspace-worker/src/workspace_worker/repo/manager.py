@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-__all__ = ["CloneResult", "RepoManager", "RepoManagerError"]
+__all__ = ["CloneResult", "PushResult", "RepoManager", "RepoManagerError"]
 
 #: GitHub's conventional username for PAT authentication over HTTPS.
 _TOKEN_USER = "x-access-token"
@@ -66,6 +66,25 @@ class CloneResult:
 
     path: Path
     cloned: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PushResult:
+    """Outcome of :meth:`RepoManager.push` (SFP-224).
+
+    Mirrors :class:`CloneResult`. The push is a one-shot authenticated
+    ``git push`` whose authed URL lives only on the argv; the on-disk ``origin``
+    is left untouched (the token is NEVER written to ``.git/config``).
+
+    Attributes:
+        path: The local repository path pushed from (the worktree).
+        branch: The branch name that was pushed.
+        pushed: ``True`` if the push was issued during this call.
+    """
+
+    path: Path
+    branch: str
+    pushed: bool
 
 
 def _default_runner(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -188,3 +207,78 @@ class RepoManager:
             ) from exc
 
         return CloneResult(path=dest, cloned=True)
+
+    def push(
+        self,
+        repo_path: str | Path,
+        branch: str,
+        *,
+        remote_url: str | None = None,
+    ) -> PushResult:
+        """Push ``branch`` from ``repo_path`` to its origin, authenticating in-memory.
+
+        Symmetric to :meth:`clone` (SFP-224). Builds the authed URL via
+        :func:`_inject_token` and runs ``git -C <repo_path> push <authed_url>
+        <branch>`` through ``self._runner``. The token is held in memory only —
+        it appears transiently on the push argv and is NEVER written to
+        ``.git/config``: this method issues NO ``git remote set-url``, so the
+        on-disk ``origin`` stays token-free exactly as :meth:`clone` left it.
+
+        This is the object-upload path for locally-committed Coder work. The Git
+        Provider Adapter's ``push_branch`` (Git Data refs API) CANNOT upload
+        locally-committed objects — only this slice can, via a real ``git push``
+        (ID-034 / ID-035 / MAS §9.6). The slice is therefore on the critical
+        path of the end-to-end vertical slice.
+
+        Args:
+            repo_path: Local repository path to push from (the per-job worktree).
+            branch: Branch name to push (carried verbatim as the push refspec).
+            remote_url: Remote URL to push to. When ``None`` (the default) the
+                on-disk ``origin`` URL is read via
+                ``git -C repo_path remote get-url origin`` — which is the
+                token-free URL :meth:`clone` wrote — and the token is injected
+                into a throwaway authed URL for the single push invocation.
+
+        Returns:
+            The :class:`PushResult` (``pushed=True`` on a successful push).
+
+        Raises:
+            RepoManagerError: if reading the on-disk origin or the push itself
+                fails. The token is redacted from the message.
+        """
+        path = Path(repo_path)
+
+        # Resolve the remote URL: caller-supplied, else read the on-disk origin
+        # (the token-free URL clone() wrote). The token is injected ONLY into
+        # the throwaway authed URL below — origin stays clean.
+        if remote_url is None:
+            try:
+                origin = self._runner(["git", "-C", str(path), "remote", "get-url", "origin"])
+            except subprocess.CalledProcessError as exc:
+                raise RepoManagerError(
+                    _redact(
+                        f"failed to read origin for {path}: "
+                        + _redact(str(exc.stderr or exc), self._token),
+                        self._token,
+                    )
+                ) from exc
+            remote_url = (origin.stdout or "").strip()
+
+        authed_url = _inject_token(remote_url, self._token)
+        clean_url = _strip_userinfo(remote_url)
+
+        # One-shot authenticated push. The authed URL lives only on this argv;
+        # NO `git remote set-url` — the on-disk origin is never touched, so the
+        # token never lands in .git/config.
+        try:
+            self._runner(["git", "-C", str(path), "push", authed_url, branch])
+        except subprocess.CalledProcessError as exc:
+            raise RepoManagerError(
+                _redact(
+                    f"git push failed for {clean_url} branch={branch}: "
+                    + _redact(str(exc.stderr or exc), self._token),
+                    self._token,
+                )
+            ) from exc
+
+        return PushResult(path=path, branch=branch, pushed=True)

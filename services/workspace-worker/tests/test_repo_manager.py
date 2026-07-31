@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from workspace_worker.repo.manager import (
     CloneResult,
+    PushResult,
     RepoManager,
     RepoManagerError,
     _inject_token,
@@ -255,6 +256,154 @@ def test_integration_clone_creates_repo_with_clean_config(
     assert origin == file_url
     # Belt-and-braces: nothing resembling a token anywhere in .git/config.
     config_text = (dest / ".git" / "config").read_text()
+    assert "x-access-token" not in config_text
+    assert "ghp_" not in config_text
+
+
+# ---------------------------------------------------------------------------
+# push — unit (fake runner): one-shot authed push, NO set-url (SFP-224)
+# ---------------------------------------------------------------------------
+
+
+def test_push_runs_single_push_with_authed_url_and_no_set_url(tmp_path: Path) -> None:
+    """push() issues exactly ONE ``git -C <path> push <authed_url> <branch>``.
+
+    Critically it does NOT call ``git remote set-url`` — the token must NEVER be
+    written to ``.git/config`` (symmetric to clone()'s credential-strip, but
+    here the origin is already clean so there is nothing to strip).
+    """
+    runner = FakeRunner()
+    repo_path = tmp_path / "repo"
+    mgr = RepoManager(TOKEN, runner=runner)
+
+    result = mgr.push(repo_path, "sfp-224-x", remote_url=HTTPS_URL)
+
+    assert result == PushResult(path=repo_path, branch="sfp-224-x", pushed=True)
+    assert len(runner.calls) == 1  # the push ONLY — no set-url, no get-url
+    cmd = runner.calls[0]
+    assert cmd[:4] == ["git", "-C", str(repo_path), "push"]
+    # The authed URL carries the token as userinfo (transient — argv only).
+    assert cmd[4] == f"https://x-access-token:{TOKEN}@github.com/arconta/some-repo.git"
+    assert cmd[5] == "sfp-224-x"
+    # Belt-and-braces: no set-url invocation anywhere.
+    assert not any("set-url" in c for c in (" ".join(c) for c in runner.calls))
+
+
+def test_push_reads_on_disk_origin_when_remote_url_none(tmp_path: Path) -> None:
+    """When remote_url is None, push() reads the token-free origin via get-url."""
+    origin_url = "https://github.com/arconta/some-repo.git"
+    calls: list[list[str]] = []
+
+    def runner(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        # get-url returns the token-free origin; push succeeds.
+        if cmd[:5] == ["git", "-C", str(tmp_path / "repo"), "remote", "get-url"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=origin_url + "\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    repo_path = tmp_path / "repo"
+    mgr = RepoManager(TOKEN, runner=runner)
+
+    result = mgr.push(repo_path, "sfp-224-x")
+
+    assert result.pushed is True
+    # get-url THEN push — exactly two calls.
+    assert len(calls) == 2
+    assert calls[0] == ["git", "-C", str(repo_path), "remote", "get-url", "origin"]
+    push_cmd = calls[1]
+    assert push_cmd[:4] == ["git", "-C", str(repo_path), "push"]
+    # The token was injected into the throwaway push URL from the clean origin.
+    assert push_cmd[4] == f"https://x-access-token:{TOKEN}@github.com/arconta/some-repo.git"
+
+
+def test_push_redacts_token_from_failure(tmp_path: Path) -> None:
+    """A failed push surfaces a redacted RepoManagerError — no token in the message."""
+    err = subprocess.CalledProcessError(
+        returncode=128,
+        cmd=["git", "push"],
+        stderr=f"remote: Invalid token {TOKEN}",
+    )
+    runner = FakeRunner(side_effect=err, failing_cmd_prefix=("git", "-C"))
+    mgr = RepoManager(TOKEN, runner=runner)
+
+    with pytest.raises(RepoManagerError) as exc_info:
+        mgr.push(tmp_path / "repo", "sfp-224-x", remote_url=HTTPS_URL)
+
+    msg = str(exc_info.value)
+    assert TOKEN not in msg
+    assert "***" in msg
+    assert "git push failed" in msg
+
+
+# ---------------------------------------------------------------------------
+# push — integration (real git against a local bare remote, file://)
+# ---------------------------------------------------------------------------
+
+
+def test_integration_push_uploads_commit_and_keeps_config_token_free(
+    tmp_path: Path,
+) -> None:
+    """Real git: clone, commit a file, push() — the commit arrives on the remote
+    and ``.git/config`` stays token-free (no set-url ever wrote the token)."""
+    import shutil as _shutil  # noqa: PLC0415
+
+    remote = _seed_bare_remote(tmp_path / "remote.git")
+    _shutil.rmtree(tmp_path / "seed-work")
+    file_url = f"file://{remote}"
+    clone_dest = tmp_path / "checkout"
+
+    # Clone via RepoManager (writes token-free origin).
+    mgr = RepoManager("")  # no token needed for file://
+    mgr.clone(file_url, clone_dest)
+
+    # Commit a new file on a branch in the clone.
+    branch = "sfp-224-x"
+    subprocess.run(
+        ["git", "-C", str(clone_dest), "config", "user.email", "t@t"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(clone_dest), "config", "user.name", "t"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(clone_dest), "checkout", "-b", branch],
+        check=True,
+        capture_output=True,
+    )
+    (clone_dest / "NEW").write_text("pushed\n")
+    subprocess.run(["git", "-C", str(clone_dest), "add", "."], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(clone_dest), "commit", "-m", "slice push"],
+        check=True,
+        capture_output=True,
+    )
+
+    # push() uploads the branch to the bare remote.
+    result = mgr.push(clone_dest, branch, remote_url=file_url)
+    assert result.pushed is True
+
+    # The commit is now reachable on the remote.
+    remote_head = subprocess.run(
+        ["git", "-C", str(remote), "rev-parse", branch],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    local_head = subprocess.run(
+        ["git", "-C", str(clone_dest), "rev-parse", branch],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_head == local_head
+    (tmp_path / "remote.git" / "objects").mkdir(exist_ok=True)  # touch for assertion order
+    assert (tmp_path / "remote.git" / "objects").exists()
+
+    # Belt-and-braces: no token anywhere in .git/config (push() never set-url).
+    config_text = (clone_dest / ".git" / "config").read_text()
     assert "x-access-token" not in config_text
     assert "ghp_" not in config_text
 
