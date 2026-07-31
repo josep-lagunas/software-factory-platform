@@ -9,13 +9,13 @@ takes a ticket from "fetched" to "merged + Done".
 Two halves (MAS §9.6 — the composition root owns all REAL construction; the loop
 owns none):
 
-* :func:`run_ticket` — a **pure** orchestrator loop. Every collaborator is a
+* :func:`run_pipeline` — a **pure** orchestrator loop. Every collaborator is a
   keyword argument; the loop constructs nothing. It executes the linear pipeline
   in the exact order pinned by the tests and fails fast at every pre-merge gate.
 * :func:`build` — the **composition-root factory**. Constructs the REAL
   collaborators from env + :class:`WorkspaceWorkerSettings` (no fakes). Tests
   monkeypatch these constructors with recording fakes; :func:`main` calls
-  :func:`build` then :func:`run_ticket`.
+  :func:`build` then :func:`run_pipeline`.
 
 Binding resolutions (Orchestrator-decided; implemented exactly):
 
@@ -82,7 +82,7 @@ from workspace_worker.repo.worktree import WorktreeManager
 from workspace_worker.workflow.context_resolver import resolve_context
 from workspace_worker.workflow.readiness_gate import evaluate_readiness
 
-__all__ = ["SliceDeps", "SliceResult", "build", "main", "run_ticket"]
+__all__ = ["PipelineDeps", "PipelineResult", "build", "main", "run_pipeline"]
 
 #: Jira transition id for "Done" (the only status transition the loop emits;
 #: 31/41/51 are the workflow's ids — PRSpec risk). Applied AFTER a confirmed
@@ -116,8 +116,8 @@ _OUTPUT_CONTRACTS: Mapping[str, type[Any]] = {
 
 
 @dataclass(frozen=True, slots=True)
-class SliceResult:
-    """Outcome of :func:`run_ticket`.
+class PipelineResult:
+    """Outcome of :func:`run_pipeline`.
 
     Attributes:
         success: ``True`` iff the ticket reached a merged + Done state.
@@ -135,10 +135,10 @@ class SliceResult:
 
 
 @dataclass(frozen=True, slots=True)
-class SliceDeps:
-    """The collaborators + derived kwargs :func:`build` hands to :func:`run_ticket`.
+class PipelineDeps:
+    """The collaborators + derived kwargs :func:`build` hands to :func:`run_pipeline`.
 
-    Every field is a keyword argument of :func:`run_ticket` except
+    Every field is a keyword argument of :func:`run_pipeline` except
     :attr:`ticket_key`/``pr_title``/``pr_body`` style meta. The composition root
     (:func:`build`) owns all REAL construction; the pure loop consumes this.
     """
@@ -163,12 +163,12 @@ class SliceDeps:
     extra: Mapping[str, str] = field(default_factory=dict)
 
 
-def _abort(trace: list[str], pr_number: int | None, error: str) -> SliceResult:
-    """Build a fail-fast :class:`SliceResult` carrying the partial trace."""
-    return SliceResult(success=False, pr_number=pr_number, error=error, trace=tuple(trace))
+def _abort(trace: list[str], pr_number: int | None, error: str) -> PipelineResult:
+    """Build a fail-fast :class:`PipelineResult` carrying the partial trace."""
+    return PipelineResult(success=False, pr_number=pr_number, error=error, trace=tuple(trace))
 
 
-def run_ticket(
+def run_pipeline(
     ticket_key: str,
     *,
     jira: JiraClient,
@@ -191,7 +191,7 @@ def run_ticket(
     job_id: str | None = None,
     pr_title: str | None = None,
     pr_body: str | None = None,
-) -> SliceResult:
+) -> PipelineResult:
     """Run the linear SFP pipeline for ``ticket_key`` to a merged + Done state.
 
     Pure: every collaborator is an injected kwarg; the loop constructs nothing.
@@ -226,7 +226,7 @@ def run_ticket(
         pr_title / pr_body: Optional PR title/body overrides.
 
     Returns:
-        The :class:`SliceResult`. On success ``success=True``, ``pr_number`` is
+        The :class:`PipelineResult`. On success ``success=True``, ``pr_number`` is
         set, and the trace runs the full pipeline through merge + Done.
     """
     trace: list[str] = []
@@ -388,7 +388,7 @@ def run_ticket(
     trace.append("jira.transition")
     jira.transition(ticket_key, done_transition_id)
 
-    return SliceResult(success=True, pr_number=pr.number, error=None, trace=tuple(trace))
+    return PipelineResult(success=True, pr_number=pr.number, error=None, trace=tuple(trace))
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +430,7 @@ def build(
     prompts_dir: Path | None = None,
     settings: WorkspaceWorkerSettings | None = None,
     secret_provider: LocalSecretProvider | None = None,
-) -> SliceDeps:
+) -> PipelineDeps:
     """Composition-root factory: construct the REAL collaborators from env+CLI.
 
     Reads GitHub coordinates + tokens from the environment, the LLM endpoint /
@@ -488,7 +488,7 @@ def build(
     runtimes = _build_runtimes(settings, secret_provider, model_resolver)
     prompt_provider = PromptBuilder(prompts_dir or _DEFAULT_PROMPT_DIR)
 
-    return SliceDeps(
+    return PipelineDeps(
         jira=JiraClient(jira_site, jira_email, jira_token),
         repo_manager=RepoManager(coder_token),
         coder_adapter=GitProviderAdapter(coder_token),
@@ -510,14 +510,14 @@ def build(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entrypoint: ``python -m workspace_worker.entrypoints.slice --ticket SFP-XXX``.
+    """CLI entrypoint: ``python -m workspace_worker.entrypoints.ticket_pipeline --ticket SFP-XXX``.
 
     Parses ``--ticket`` (required), an optional ``--slug`` (branch slug), and
-    env-derived coordinates; calls :func:`build` then :func:`run_ticket`, prints
+    env-derived coordinates; calls :func:`build` then :func:`run_pipeline`, prints
     a one-line outcome, and returns a process exit code (``0`` on success).
     """
     parser = argparse.ArgumentParser(
-        prog="workspace_worker.entrypoints.slice",
+        prog="workspace_worker.entrypoints.ticket_pipeline",
         description="Run one ticket through the SFP vertical slice.",
     )
     parser.add_argument("--ticket", required=True, help="Jira issue key, e.g. SFP-224")
@@ -526,7 +526,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     deps = build(args.ticket, slug=args.slug, base_branch=args.base_branch)
-    result = run_ticket(
+    result = run_pipeline(
         args.ticket,
         jira=deps.jira,
         repo_manager=deps.repo_manager,

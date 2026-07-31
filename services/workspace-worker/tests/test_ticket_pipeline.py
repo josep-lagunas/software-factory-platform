@@ -1,6 +1,6 @@
-"""Tests for :mod:`workspace_worker.entrypoints.slice` — the vertical slice (SFP-224).
+"""Tests for :mod:`workspace_worker.entrypoints.ticket_pipeline` — the vertical slice (SFP-224).
 
-The loop (:func:`run_ticket`) is PURE — every collaborator is injected, so these
+The loop (:func:`run_pipeline`) is PURE — every collaborator is injected, so these
 tests drive it with fakes:
 
 * :class:`FakeJiraClient` — canned :class:`ParsedTicket` + recorded transitions.
@@ -30,8 +30,13 @@ import pytest
 from sfp_agent_runtime.interfaces import AgentRunRequest, AgentRunResult
 from sfp_config import LocalSecretProvider, SecretRef
 from sfp_contracts.agents.readiness import ParsedTicket
-from workspace_worker.entrypoints import slice as slice_mod
-from workspace_worker.entrypoints.slice import SliceDeps, SliceResult, build, run_ticket
+from workspace_worker.entrypoints import ticket_pipeline as pipeline_mod
+from workspace_worker.entrypoints.ticket_pipeline import (
+    PipelineDeps,
+    PipelineResult,
+    build,
+    run_pipeline,
+)
 from workspace_worker.infrastructure.settings import WorkspaceWorkerSettings
 from workspace_worker.repo.branch import BranchResult
 from workspace_worker.repo.git.adapter import (
@@ -378,8 +383,8 @@ def _run(
     coder_adapter: FakeGitAdapter | None = None,
     reviewer_adapter: FakeGitAdapter | None = None,
     exec_runners: Mapping[str, Any] | None = None,
-) -> tuple[SliceResult, dict[str, Any]]:
-    """Wire every fake and call run_ticket; return (result, fakes-dict)."""
+) -> tuple[PipelineResult, dict[str, Any]]:
+    """Wire every fake and call run_pipeline; return (result, fakes-dict)."""
     jira = jira or FakeJiraClient()
     repo_manager = repo_manager or FakeRepoManager()
     coder_adapter = coder_adapter or FakeGitAdapter()
@@ -390,7 +395,7 @@ def _run(
     clone_dest = tmp_path / "clone"
     worktree_base = tmp_path / "wt"
 
-    result = run_ticket(
+    result = run_pipeline(
         TICKET,
         jira=jira,
         repo_manager=repo_manager,
@@ -652,13 +657,13 @@ def test_build_constructs_dual_adapters_and_four_runtimes_from_env(
     def fake_prompt_ctor(path, **kw):
         return object()
 
-    monkeypatch.setattr(slice_mod, "ClaudeAgentRuntime", fake_runtime_ctor)
-    monkeypatch.setattr(slice_mod, "JiraClient", fake_jira_ctor)
-    monkeypatch.setattr(slice_mod, "RepoManager", fake_repo_ctor)
-    monkeypatch.setattr(slice_mod, "GitProviderAdapter", fake_adapter_ctor)
-    monkeypatch.setattr(slice_mod, "WorktreeManager", fake_wt_ctor)
-    monkeypatch.setattr(slice_mod, "BranchManager", fake_branch_ctor)
-    monkeypatch.setattr(slice_mod, "PromptBuilder", fake_prompt_ctor)
+    monkeypatch.setattr(pipeline_mod, "ClaudeAgentRuntime", fake_runtime_ctor)
+    monkeypatch.setattr(pipeline_mod, "JiraClient", fake_jira_ctor)
+    monkeypatch.setattr(pipeline_mod, "RepoManager", fake_repo_ctor)
+    monkeypatch.setattr(pipeline_mod, "GitProviderAdapter", fake_adapter_ctor)
+    monkeypatch.setattr(pipeline_mod, "WorktreeManager", fake_wt_ctor)
+    monkeypatch.setattr(pipeline_mod, "BranchManager", fake_branch_ctor)
+    monkeypatch.setattr(pipeline_mod, "PromptBuilder", fake_prompt_ctor)
 
     deps = build(
         TICKET,
@@ -670,7 +675,7 @@ def test_build_constructs_dual_adapters_and_four_runtimes_from_env(
         secret_provider=sp,
     )
 
-    assert isinstance(deps, SliceDeps)
+    assert isinstance(deps, PipelineDeps)
     # Four runtimes, one per role; the coder was built with cwd=None (RESOLUTION 3).
     assert len(runtime_instances) == 4
     coder_inst = next(r for r in runtime_instances if r["contract"].__name__ == "CoderOutput")
@@ -696,11 +701,11 @@ def test_build_constructs_dual_adapters_and_four_runtimes_from_env(
 def test_main_returns_zero_on_success_and_nonzero_on_abort(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """main() parses --ticket, calls build() + run_ticket, returns an exit code."""
-    # Stub build() to return SliceDeps-shaped fakes so no real I/O occurs.
+    """main() parses --ticket, calls build() + run_pipeline, returns an exit code."""
+    # Stub build() to return PipelineDeps-shaped fakes so no real I/O occurs.
     runtimes, _ = _make_runtimes(approved=True)
 
-    fake_deps = SliceDeps(
+    fake_deps = PipelineDeps(
         jira=FakeJiraClient(),
         repo_manager=FakeRepoManager(),
         coder_adapter=FakeGitAdapter(),
@@ -717,15 +722,15 @@ def test_main_returns_zero_on_success_and_nonzero_on_abort(
         worktree_base=tmp_path,
         branch_name=BRANCH,
     )
-    monkeypatch.setattr(slice_mod, "build", lambda *a, **kw: fake_deps)
+    monkeypatch.setattr(pipeline_mod, "build", lambda *a, **kw: fake_deps)
 
-    rc = slice_mod.main(["--ticket", TICKET, "--slug", "slice"])
+    rc = pipeline_mod.main(["--ticket", TICKET, "--slug", "slice"])
     assert rc == 0
 
     # Abort path: readiness not ready -> rc == 1.
     runtimes_abort, _ = _make_runtimes(readiness=_readiness_not_ready(), approved=True)
     # Rebuild a fresh deps with the aborting runtimes (dataclass is frozen).
-    fake_deps_abort = SliceDeps(
+    fake_deps_abort = PipelineDeps(
         jira=FakeJiraClient(),
         repo_manager=FakeRepoManager(),
         coder_adapter=FakeGitAdapter(),
@@ -742,6 +747,6 @@ def test_main_returns_zero_on_success_and_nonzero_on_abort(
         worktree_base=tmp_path,
         branch_name=BRANCH,
     )
-    monkeypatch.setattr(slice_mod, "build", lambda *a, **kw: fake_deps_abort)
-    rc_abort = slice_mod.main(["--ticket", TICKET])
+    monkeypatch.setattr(pipeline_mod, "build", lambda *a, **kw: fake_deps_abort)
+    rc_abort = pipeline_mod.main(["--ticket", TICKET])
     assert rc_abort == 1
