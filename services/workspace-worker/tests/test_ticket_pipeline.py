@@ -236,25 +236,27 @@ def _make_runtimes(
     planner_specs: int = 1,
     approved: bool = True,
 ) -> tuple[dict[str, FakeRuntime], dict[str, FakeRuntime]]:
-    """Build the 4 per-role runtimes + return (runtimes_dict, handles).
+    """Build the 5 per-role runtimes + return (runtimes_dict, handles).
 
-    The planner runtime serves BOTH the readiness (agent="readiness") and plan
-    (agent="planner") requests (RESOLUTION 6: readiness reuses the planner
-    runtime). Other roles serve only their own agent name.
+    Readiness has its OWN runtime (a dedicated ``runtimes["readiness"]`` keyed on
+    the ReadinessOutput contract) — the slice's readiness gate reads that key
+    directly rather than reusing the planner runtime (whose PlannerOutput
+    contract made the gate fail-closed). Each role serves only its own agent name.
     """
-    planner = FakeRuntime(
-        {"readiness": readiness or _readiness_ready(), "planner": _planner_output(planner_specs)}
-    )
+    readiness_rt = FakeRuntime({"readiness": readiness or _readiness_ready()})
+    planner = FakeRuntime({"planner": _planner_output(planner_specs)})
     test_designer = FakeRuntime({"test_designer": _test_designer_output()})
     coder = FakeRuntime({"coder": _coder_output()})
     reviewer = FakeRuntime({"reviewer": _reviewer_output(approved)})
     runtimes = {
+        "readiness": readiness_rt,
         "planner": planner,
         "test_designer": test_designer,
         "coder": coder,
         "reviewer": reviewer,
     }
     return runtimes, {
+        "readiness": readiness_rt,
         "planner": planner,
         "test_designer": test_designer,
         "coder": coder,
@@ -326,10 +328,12 @@ class FakeWorktreeManager:
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...]] = []
 
-    def add(self, job_id: str, ref: str, base_dir: Path) -> WorktreeResult:
+    def add(
+        self, job_id: str, ref: str, base_dir: Path, *, new_branch: str | None = None
+    ) -> WorktreeResult:
         path = base_dir / job_id
         path.mkdir(parents=True, exist_ok=True)
-        self.calls.append(("add", job_id, ref, str(base_dir)))
+        self.calls.append(("add", job_id, ref, str(base_dir), new_branch))
         return WorktreeResult(path=path, job_id=job_id)
 
     def remove(self, *args: Any, **kwargs: Any) -> None:
@@ -464,8 +468,6 @@ def test_happy_path_trace_is_the_exact_linear_order(tmp_path: Path) -> None:
         "design_tests",
         "repo_manager.clone",
         "worktree.add",
-        "branch_manager.create_branch",
-        "branch_manager.checkout",
         "code",
         "build",
         "run_tests",
@@ -519,9 +521,10 @@ def test_readiness_not_ready_aborts_before_plan(tmp_path: Path) -> None:
     assert fakes["repo_manager"].calls == []
     assert fakes["coder_adapter"].calls == []
     assert fakes["jira"].transitions == []
-    # The planner runtime served readiness but plan never ran (only 1 call).
-    assert len(handles["planner"].calls) == 1
-    assert handles["planner"].calls[0]["agent"] == "readiness"
+    # The dedicated readiness runtime served readiness; plan never ran.
+    assert len(handles["readiness"].calls) == 1
+    assert handles["readiness"].calls[0]["agent"] == "readiness"
+    assert handles["planner"].calls == []
 
 
 def test_build_failure_aborts_before_push_and_pr(tmp_path: Path) -> None:
@@ -604,11 +607,12 @@ def test_more_than_one_pr_spec_is_a_deterministic_error(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_build_constructs_dual_adapters_and_four_runtimes_from_env(
+def test_build_constructs_dual_adapters_and_five_runtimes_from_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """build() wires: 4 ClaudeAgentRuntime (coder cwd=None), 2 GitProviderAdapter
-    (coder+reviewer tokens), 1 RepoManager (coder token), 1 JiraClient."""
+    """build() wires: 5 ClaudeAgentRuntime (coder cwd=None; incl. a dedicated
+    readiness runtime), 2 GitProviderAdapter (coder+reviewer tokens), 1
+    RepoManager (coder token), 1 JiraClient."""
     # Tokens resolved from env by LocalSecretProvider.
     monkeypatch.setenv("GITHUB_TOKEN_CODER", "coder-tok")
     monkeypatch.setenv("GITHUB_TOKEN_REVIEWER", "reviewer-tok")
@@ -676,16 +680,19 @@ def test_build_constructs_dual_adapters_and_four_runtimes_from_env(
     )
 
     assert isinstance(deps, PipelineDeps)
-    # Four runtimes, one per role; the coder was built with cwd=None (RESOLUTION 3).
-    assert len(runtime_instances) == 4
+    # Five runtimes, one per role (incl. a dedicated readiness runtime); the
+    # coder was built with cwd=None (RESOLUTION 3).
+    assert len(runtime_instances) == 5
     coder_inst = next(r for r in runtime_instances if r["contract"].__name__ == "CoderOutput")
     assert coder_inst["cwd"] is None
-    # Per-role max_turns (RESOLUTION 6).
+    # Per-role max_turns (RESOLUTION 6). Readiness is bounded tight (8); the
+    # coder gets room (50); judgment roles are mid-bounded (15).
     turns_by_contract = {r["contract"].__name__: r["max_turns"] for r in runtime_instances}
-    assert turns_by_contract["PlannerOutput"] == 5
-    assert turns_by_contract["TestDesignerOutput"] == 5
+    assert turns_by_contract["PlannerOutput"] == 15
+    assert turns_by_contract["TestDesignerOutput"] == 15
     assert turns_by_contract["CoderOutput"] == 50
-    assert turns_by_contract["ReviewerOutput"] == 5
+    assert turns_by_contract["ReviewerOutput"] == 15
+    assert turns_by_contract["ReadinessOutput"] == 8
     # Dual adapters: coder token + reviewer token (RESOLUTION 2 / ID-073).
     assert adapter_calls == ["coder-tok", "reviewer-tok"]
     # RepoManager uses the CODER token (object upload is a Coder-side op, ID-035).

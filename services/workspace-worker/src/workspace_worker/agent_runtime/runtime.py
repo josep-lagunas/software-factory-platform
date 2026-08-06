@@ -165,6 +165,8 @@ class ClaudeAgentRuntime:
         cwd: str | None = None,
         sleep: SleepFn | None = None,
         model_resolver: AgentModelConfig | None = None,
+        effort: str | None = None,
+        enforce_schema: bool = True,
     ) -> None:
         self._settings = settings
         self._secret_provider = secret_provider
@@ -175,6 +177,15 @@ class ClaudeAgentRuntime:
         self._cwd: str | None = cwd
         self._sleep: SleepFn = sleep if sleep is not None else asyncio.sleep
         self._model_resolver: AgentModelConfig | None = model_resolver
+        # SMOKE-PATCH (local, NOT committed — formalize via PR): per-role
+        # reasoning effort forwarded to ClaudeAgentOptions(effort=...). None
+        # leaves the SDK/model default. "low" makes emit-JSON agents finalize
+        # in few turns (the main per-call speed + reliability lever).
+        self._effort: str | None = effort
+        # When False, do NOT pass output_format — the agent must DO tool work
+        # before reporting (the Coder). Forcing JSON makes such agents emit the
+        # report without performing the work. Emit-JSON agents keep it True.
+        self._enforce_schema: bool = enforce_schema
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
         """Run the agent; never raises (fail-closed on any unhandled error)."""
@@ -222,34 +233,84 @@ class ClaudeAgentRuntime:
             if self._model_resolver is not None
             else self._settings.default_model
         )
-        return ClaudeAgentOptions(model=model, env=env, max_turns=self._max_turns, cwd=self._cwd)
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "env": env,
+            "max_turns": self._max_turns,
+            "cwd": self._cwd,
+        }
+        # SMOKE-PATCH (local, NOT committed): the spawned CLI is NON-interactive,
+        # so the default permission mode ("default") would PROMPT for Write/Edit/
+        # Bash and, with no human to answer, the tool call is silently DENIED —
+        # the Coder could not write any files. bypassPermissions lets tools run
+        # unprompted. Safe: agents run in an ephemeral, pre-trusted worktree.
+        kwargs["permission_mode"] = "bypassPermissions"
+        # SMOKE-PATCH (local, NOT committed): pass the contract as a JSON schema
+        # so the SDK constrains the model and returns parsed, schema-valid JSON
+        # on ResultMessage.structured_output (verified GLM honors it). Kills the
+        # prompt<->contract drift class. Per-role effort bounds reasoning depth.
+        # Skipped for do-then-report agents (the Coder) that must perform tool
+        # work before emitting — forcing JSON there makes them skip the work.
+        if self._enforce_schema:
+            try:
+                kwargs["output_format"] = {
+                    "type": "json_schema",
+                    "schema": self._output_contract.model_json_schema(),
+                }
+            except Exception:  # noqa: BLE001 — defensive: not every BaseModel emits a schema
+                pass
+        if self._effort is not None:
+            kwargs["effort"] = self._effort
+        return ClaudeAgentOptions(**kwargs)
 
     async def _run_async(self, request: AgentRunRequest, options: Any) -> AgentRunResult:
         query_fn = self._resolve_query_fn()
         # The retryer wraps ONLY stream consumption — transient failures
         # (CLIConnectionError / 5xx / rate-limit / empty stream) are retried;
         # the hard-reject checks below run once, after a clean consume.
+        # SMOKE-PATCH (local, NOT committed — formalize via PR): forward
+        # request.context to the agent by appending it to the prompt (the SDK
+        # query() takes only `prompt`). Without this the model gets the prompt
+        # template but no ticket data → empty result.
+        import json as _json
+
+        effective_prompt = request.prompt
+        if request.context:
+            effective_prompt += "\n\n--- RUN CONTEXT (JSON) ---\n" + _json.dumps(
+                dict(request.context), default=str, ensure_ascii=False
+            )
         final_message: Any = await self._retryer()(
-            self._consume_stream, query_fn, request.prompt, options
+            self._consume_stream, query_fn, effective_prompt, options
         )
 
         # 4. Hard-reject an SDK error or missing result (NOT retried).
         is_error = bool(getattr(final_message, "is_error", False))
         result_text = getattr(final_message, "result", None)
-        if is_error or result_text is None:
+        structured = getattr(final_message, "structured_output", None)
+        # SMOKE-PATCH: when the SDK enforced output_format, structured_output is
+        # already parsed + schema-valid — prefer it. Require result_text only as
+        # the text-fallback path.
+        if is_error or (structured is None and result_text is None):
             errors = getattr(final_message, "errors", None) or []
             detail = (
                 "; ".join(str(e) for e in errors) if errors else "agent produced no usable result"
             )
             return _failure(request, f"agent run errored: {detail}")
 
-        # 5. Parse JSON (hard reject, no retry). Strip markdown fences first —
-        #    Anthropic-compatible providers often wrap JSON in ```json fences
-        #    (ID-019 empirical finding).
-        try:
-            parsed = json.loads(_extract_json(result_text))
-        except json.JSONDecodeError as exc:
-            return _failure(request, f"agent output was not valid JSON: {exc}")
+        # 5. Parse: prefer structured_output (already a dict); fall back to
+        #    fence-stripped JSON parse of result_text (ID-019 fence handling).
+        if isinstance(structured, dict):
+            parsed: Any = structured
+        else:
+            # Text-fallback path: result_text must be a str. The empty case
+            # (structured is None and result_text is None) was caught above; this
+            # guard narrows the type and fail-closes any remaining non-str result.
+            if not isinstance(result_text, str):
+                return _failure(request, "agent produced no usable result")
+            try:
+                parsed = json.loads(_extract_json(result_text))
+            except json.JSONDecodeError as exc:
+                return _failure(request, f"agent output was not valid JSON: {exc}")
 
         # 6. Validate against the injected output contract (hard reject, no retry).
         try:
@@ -274,8 +335,14 @@ class ClaudeAgentRuntime:
         surfaced to :meth:`_run_async` for a hard-reject decision.
         """
         final_message: Any = None
-        async for message in query_fn(prompt=prompt, options=options):
-            final_message = message
+        try:
+            async for message in query_fn(prompt=prompt, options=options):
+                final_message = message
+        except Exception as exc:  # noqa: BLE001 — SMOKE-PATCH (local, NOT committed):
+            # the SDK sometimes raises an opaque "Claude Code returned an error
+            # result" on transient CLI/endpoint hiccups; retry rather than
+            # hard-fail the whole pipeline on one flaky call.
+            raise _TransientSDKError(f"sdk stream raised: {type(exc).__name__}: {exc}") from exc
 
         if final_message is None:
             raise _TransientSDKError("agent produced no messages")
@@ -283,6 +350,20 @@ class ClaudeAgentRuntime:
         status = getattr(final_message, "api_error_status", None)
         if status is not None and status in _TRANSIENT_API_STATUSES:
             raise _TransientSDKError(f"transient api_error_status={status}")
+
+        # SMOKE-PATCH (local, NOT committed — formalize via PR): treat an empty
+        # / whitespace-only `result` as TRANSIENT (retryable). GLM sometimes
+        # finalizes without emitting (ID-019 agentic symptom); a retry usually
+        # yields output. Without this the fail-closed gate blocks
+        # non-deterministically on a single empty response.
+        result = getattr(final_message, "result", None)
+        structured = getattr(final_message, "structured_output", None)
+        # Only retry when BOTH the text result and the structured output are
+        # empty — a populated structured_output is a valid result even if the
+        # text result is empty (the SDK populated it from output_format).
+        result_empty = result is None or (isinstance(result, str) and not result.strip())
+        if result_empty and structured is None:
+            raise _TransientSDKError("agent produced an empty result")
 
         return final_message
 

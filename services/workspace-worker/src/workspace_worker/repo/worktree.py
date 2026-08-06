@@ -134,7 +134,14 @@ class WorktreeManager:
         self._repo_path = repo_path
         self._runner: Runner = runner or _default_runner
 
-    def add(self, job_id: str, ref: str, base_dir: Path) -> WorktreeResult:
+    def add(
+        self,
+        job_id: str,
+        ref: str,
+        base_dir: Path,
+        *,
+        new_branch: str | None = None,
+    ) -> WorktreeResult:
         """Create a fresh, isolated worktree for ``job_id``.
 
         Materialises ``<base_dir>/<job_id>`` as a new git worktree of the main
@@ -177,19 +184,22 @@ class WorktreeManager:
 
         # `git worktree add <path> <ref>` checks out `ref` into the worktree and
         # creates any missing parent directories (base_dir need not pre-exist).
-        # argv order is path THEN ref; `ref` is opaque (no `-b`, no branch ops).
+        # argv order is path THEN ref; `ref` is opaque. When `new_branch` is set,
+        # SMOKE-PATCH (local, NOT committed): create the worktree on a NEW branch
+        # via `-b` (avoids colliding with a ref already checked out elsewhere,
+        # e.g. the clone on `main`).
+        argv = [
+            "git",
+            "-C",
+            str(self._repo_path),
+            "worktree",
+            "add",
+        ]
+        if new_branch is not None:
+            argv += ["-b", new_branch]
+        argv += [str(worktree_path), ref]
         try:
-            self._runner(
-                [
-                    "git",
-                    "-C",
-                    str(self._repo_path),
-                    "worktree",
-                    "add",
-                    str(worktree_path),
-                    ref,
-                ]
-            )
+            self._runner(argv)
         except subprocess.CalledProcessError as exc:
             raise WorktreeError(
                 f"failed to create worktree for job {job_id!r} "

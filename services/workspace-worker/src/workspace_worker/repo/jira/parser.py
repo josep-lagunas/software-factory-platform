@@ -122,11 +122,16 @@ def adf_to_parsed_ticket(adf: dict[str, object]) -> ParsedTicket:
     parts: list[str] = []
     for block in blocks:
         stripped = block.strip()
-        if stripped in _SECTION_TO_FIELD:
+        # SMOKE-PATCH (local, NOT committed — formalize via PR): real Jira
+        # descriptions created via create_sfp_ticket carry markdown header
+        # prefixes ("## Context"). Strip leading "#" / whitespace before the
+        # literal header match so the 8 sections resolve.
+        header = stripped.lstrip("#").strip()
+        if header in _SECTION_TO_FIELD:
             if current is not None:
                 fields[current] = _join_body(parts)
                 parts = []
-            current = _SECTION_TO_FIELD[stripped]
+            current = _SECTION_TO_FIELD[header]
         elif current is not None:
             parts.append(block)
     if current is not None:

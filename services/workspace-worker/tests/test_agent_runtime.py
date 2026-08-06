@@ -2,10 +2,11 @@
 
 Covers the binding decisions encoded in the SFP-36 doc:
 - success path: valid JSON conforming to the output contract.
-- hard rejects (NOT retried, query_fn called once): ``is_error`` / missing
-  result, non-JSON result, non-conformant output (missing/extra/wrong-type).
-- transient failures retried up to ``max_retries + 1`` attempts; succeeds-on-
-  third-attempt; non-transient exception fails immediately (called once).
+- hard rejects (NOT retried, query_fn called once): non-JSON result and
+  non-conformant output (missing/extra/wrong-type).
+- transient failures retried up to ``max_retries + 1`` attempts then surfaced:
+  an empty result, a stream/SDK exception, and a 5xx/429 ``api_error_status``;
+  succeeds-on-third-attempt.
 - secret resolved once per run outside the retry loop; resolution failure →
   query_fn never called; the resolved token is forwarded into
   ``options.env["ANTHROPIC_AUTH_TOKEN"]`` and never appears in error/result text.
@@ -254,28 +255,6 @@ def test_non_conformant_output_hard_rejected_once(result_json: str) -> None:
     assert len(qfn.calls) == 1  # NOT retried
 
 
-def test_sdk_error_hard_rejected_once() -> None:
-    qfn = FakeQuery(outcomes=[[FakeMessage(is_error=True, result=None, errors=["model refused"])]])
-    rt = make_runtime(qfn, max_retries=3)
-
-    res = rt.run(request())
-
-    assert res.success is False
-    assert res.error is not None
-    assert "model refused" in res.error
-    assert len(qfn.calls) == 1
-
-
-def test_null_result_hard_rejected_once() -> None:
-    qfn = FakeQuery(outcomes=[[FakeMessage(result=None, is_error=False)]])
-    rt = make_runtime(qfn, max_retries=3)
-
-    res = rt.run(request())
-
-    assert res.success is False
-    assert len(qfn.calls) == 1
-
-
 def test_non_json_result_hard_rejected_once() -> None:
     qfn = FakeQuery(outcomes=[[FakeMessage(result="not-json{")]])
     rt = make_runtime(qfn, max_retries=3)
@@ -374,16 +353,46 @@ def test_empty_stream_is_transient_and_retried() -> None:
     assert len(qfn.calls) == 3
 
 
-def test_non_transient_exception_fails_immediately() -> None:
+def test_empty_result_retried_then_failed() -> None:
+    # An empty result (no text, no structured output) is TRANSIENT — GLM
+    # sometimes finalizes without emitting; a retry usually yields output. All
+    # attempts empty -> retried up to max_retries + 1, then surfaced as a failure.
+    qfn = FakeQuery(outcomes=[[FakeMessage(result=None, is_error=False)]])
+    rt = make_runtime(qfn, max_retries=2)  # -> 3 attempts max
+
+    res = rt.run(request())
+
+    assert res.success is False
+    assert res.error is not None
+    assert len(qfn.calls) == 3
+
+
+def test_errored_empty_result_retried_then_failed() -> None:
+    # An is_error message carrying no result text reaches the same transient
+    # empty-result path (the is_error hard-reject only fires when a result is
+    # present); retried up to max_retries + 1, then surfaced.
+    qfn = FakeQuery(outcomes=[[FakeMessage(is_error=True, result=None, errors=["model refused"])]])
+    rt = make_runtime(qfn, max_retries=2)  # -> 3 attempts max
+
+    res = rt.run(request())
+
+    assert res.success is False
+    assert len(qfn.calls) == 3
+
+
+def test_stream_exception_retried_then_failed() -> None:
+    # Any exception raised by the SDK stream (opaque CLI/endpoint hiccups) is
+    # treated as transient and retried up to max_retries + 1, then surfaced with
+    # the wrapped cause type named in the error.
     qfn = FakeQuery(outcomes=[RuntimeError])
-    rt = make_runtime(qfn, max_retries=3)
+    rt = make_runtime(qfn, max_retries=2)  # -> 3 attempts max
 
     res = rt.run(request())
 
     assert res.success is False
     assert res.error is not None
     assert "RuntimeError" in res.error
-    assert len(qfn.calls) == 1  # non-transient -> not retried
+    assert len(qfn.calls) == 3
 
 
 def test_transient_exceptions_class_attribute_exposed() -> None:

@@ -174,8 +174,27 @@ def run_tests(workdir: str | Path, *, runner: Runner | None = None) -> TestResul
         # build._default_runner, build.py:150-157). cwd=workdir is set here,
         # inside the closure, so the shared Runner type stays cwd-free and
         # reusable for SFP-64.
+        # SMOKE-PATCH (local, NOT committed): scrub the orchestrator's own
+        # config (SFP_* / ANTHROPIC_* / GITHUB_TOKEN* / JIRA_*) from the child
+        # env so the suite runs as in CI. Without this, env-sensitive unit
+        # tests (e.g. test_build_..._from_env) see the live SFP_* and fail.
+        import os as _os
+
+        child_env = {
+            k: v
+            for k, v in _os.environ.items()
+            if not (
+                k.startswith("SFP_")
+                or k.startswith("ANTHROPIC_")
+                or k.startswith("GITHUB_TOKEN")
+                or k.startswith("JIRA_")
+            )
+        }
+        # uv/PATH still needed for the child to find `uv` + `python`.
+        child_env["PATH"] = _os.environ.get("PATH", "")
+        child_env["HOME"] = _os.environ.get("HOME", "")
         return subprocess.run(  # noqa: S603 — trusted argv, pinned by tests
-            cmd, cwd=cwd, check=False, capture_output=True, text=True
+            cmd, cwd=cwd, check=False, capture_output=True, text=True, env=child_env
         )
 
     run: Runner = runner or _default_runner
