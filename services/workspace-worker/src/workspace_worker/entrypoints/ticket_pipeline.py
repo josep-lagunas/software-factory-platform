@@ -46,6 +46,8 @@ operator-run smoke against the live stack, NOT a CI test (PRSpec risk).
 from __future__ import annotations
 
 import argparse
+import json
+import logging
 import os
 import sys
 from collections.abc import Mapping
@@ -53,6 +55,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ValidationError
 from sfp_agent_runtime.interfaces import AgentRuntime, PromptProvider
 from sfp_agent_runtime.prompt_builder import PromptBuilder
 from sfp_config import LocalSecretProvider, SecretRef
@@ -60,6 +63,7 @@ from sfp_contracts.agents.coder import CoderOutput
 from sfp_contracts.agents.planner import PlannerOutput, PrSpec
 from sfp_contracts.agents.readiness import ReadinessVerdict
 from sfp_contracts.agents.reviewer import ReviewerOutput, ReviewStatus
+from sfp_contracts.agents.test_designer import TestDesignerOutput
 from sfp_contracts.context.bindings import ResolvedContext
 from sfp_contracts.context.declaration import TicketContextDeclaration
 
@@ -119,9 +123,7 @@ _ROLE_EFFORT: Mapping[str, str] = {
 #: Output contract per agent role (one :class:`ClaudeAgentRuntime` each).
 _OUTPUT_CONTRACTS: Mapping[str, type[Any]] = {
     "planner": PlannerOutput,
-    "test_designer": __import__(
-        "sfp_contracts.agents.test_designer", fromlist=["TestDesignerOutput"]
-    ).TestDesignerOutput,
+    "test_designer": TestDesignerOutput,
     "coder": CoderOutput,
     "reviewer": ReviewerOutput,
     # SMOKE-PATCH (local, NOT committed — formalize via PR): readiness emits
@@ -131,6 +133,50 @@ _OUTPUT_CONTRACTS: Mapping[str, type[Any]] = {
         "sfp_contracts.agents.readiness", fromlist=["ReadinessOutput"]
     ).ReadinessOutput,
 }
+
+#: Module logger — checkpoint load/skip events land here for resume observability.
+_log = logging.getLogger(__name__)
+
+
+def _checkpoint_dir(worktree_base: Path, ticket_key: str) -> Path:
+    """Default checkpoints dir: ``<worktree_base>/<ticket>/checkpoints``.
+
+    Kept OUTSIDE the worktree (keyed by ticket under ``worktree_base``) so a
+    worktree mishap cannot lose the checkpoints. ``main()`` uses this default;
+    tests inject their own dir via :func:`run_pipeline`'s ``checkpoints_dir``.
+    """
+    return worktree_base / ticket_key / "checkpoints"
+
+
+def _write_checkpoint(checkpoints_dir: Path, stage: str, output: BaseModel) -> None:
+    """Persist a stage's contract output as JSON (pydantic round-trippable).
+
+    Writes ``<checkpoints_dir>/<stage>.json``. The payload is
+    :meth:`BaseModel.model_dump_json`, which :func:`_load_checkpoint` re-validates
+    via ``model_validate`` — a clean round-trip under the ``extra='forbid'``
+    contracts.
+    """
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    (checkpoints_dir / f"{stage}.json").write_text(output.model_dump_json())
+
+
+def _load_checkpoint[T: BaseModel](checkpoints_dir: Path, stage: str, model: type[T]) -> T | None:
+    """Load + validate a stage checkpoint; fail-closed on corruption.
+
+    Returns the typed object on success, or ``None`` if the checkpoint is absent
+    or corrupt. A corrupt/unreadable checkpoint (bad JSON, schema mismatch, or
+    OS error) is DELETED so the stage re-runs cleanly from scratch rather than
+    crashing the resume — the spec's "delete it and re-run that stage" rule.
+    """
+    path = checkpoints_dir / f"{stage}.json"
+    if not path.exists():
+        return None
+    try:
+        return model.model_validate(json.loads(path.read_text()))
+    except (json.JSONDecodeError, ValidationError, OSError):
+        _log.warning("deleting corrupt checkpoint %s; stage %s will re-run", path, stage)
+        path.unlink(missing_ok=True)
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +255,8 @@ def run_pipeline(
     job_id: str | None = None,
     pr_title: str | None = None,
     pr_body: str | None = None,
+    resume: bool = False,
+    checkpoints_dir: Path | None = None,
 ) -> PipelineResult:
     """Run the linear SFP pipeline for ``ticket_key`` to a merged + Done state.
 
@@ -242,12 +290,31 @@ def run_pipeline(
         done_transition_id: Jira "Done" transition id (default ``51``).
         job_id: Worktree job id (defaults to ``ticket_key``).
         pr_title / pr_body: Optional PR title/body overrides.
+        resume: When ``True``, load existing stage checkpoints and SKIP the
+            stages whose checkpoint is present (``plan`` / ``design`` / ``code``),
+            restarting at the first missing stage; REUSE an existing worktree
+            (clone + branch + Coder commits) instead of re-creating it. Readiness
+            is never checkpointed and always re-runs. A clean run
+            (``resume=False``, the default) behaves EXACTLY as before — it still
+            WRITES checkpoints after each checkpointed stage but never reads them.
+        checkpoints_dir: Where checkpoints live (injectable for tests). Defaults
+            to ``<worktree_base>/<ticket_key>/checkpoints`` — kept OUTSIDE the
+            worktree so a worktree mishap cannot lose them.
 
     Returns:
         The :class:`PipelineResult`. On success ``success=True``, ``pr_number`` is
         set, and the trace runs the full pipeline through merge + Done.
     """
     trace: list[str] = []
+
+    # Resolve the checkpoints directory (injectable for tests; defaults to a
+    # ticket-keyed subdir of worktree_base). Checkpoints are written on EVERY run
+    # (clean or resume); they are only READ when ``resume`` is True.
+    ckpt_dir = (
+        checkpoints_dir
+        if checkpoints_dir is not None
+        else _checkpoint_dir(worktree_base, ticket_key)
+    )
 
     # 1. Fetch the issue + parse its ADF description into a ParsedTicket.
     trace.append("jira.fetch_issue")
@@ -274,15 +341,25 @@ def run_pipeline(
     if readiness.verdict is not ReadinessVerdict.READY:
         return _abort(trace, None, f"readiness gate not READY: {readiness.verdict.value}")
 
-    # 3. Plan — decompose the ticket into one or more PR-specs.
-    trace.append("plan")
-    planner_output = plan(
-        ticket,
-        resolved,
-        runtime=runtimes["planner"],
-        prompt_provider=prompt_provider,
-        ticket_id=ticket_key,
+    # 3. Plan — decompose the ticket into one or more PR-specs. On resume, a
+    # valid ``plan`` checkpoint is loaded and the Planner run is SKIPPED (the
+    # ~seconds planner is cheap, but skipping it keeps resume deterministic and
+    # avoids re-decomposing a ticket whose downstream stages may already be done).
+    planner_output: PlannerOutput | None = (
+        _load_checkpoint(ckpt_dir, "plan", PlannerOutput) if resume else None
     )
+    if planner_output is None:
+        trace.append("plan")
+        planner_output = plan(
+            ticket,
+            resolved,
+            runtime=runtimes["planner"],
+            prompt_provider=prompt_provider,
+            ticket_id=ticket_key,
+        )
+        _write_checkpoint(ckpt_dir, "plan", planner_output)
+    else:
+        _log.info("resume: skipping plan stage (checkpoint present) for %s", ticket_key)
     # RESOLUTION 5 — single-PR slice: process pr_specs[0] only. More than one
     # spec is a deterministic error (no fan-out in this slice).
     if len(planner_output.pr_specs) != 1:
@@ -293,45 +370,73 @@ def run_pipeline(
         )
     pr_spec: PrSpec = planner_output.pr_specs[0]
 
-    # 4. Design the test plan (drives the Coder's test writing downstream).
-    trace.append("design_tests")
-    design_tests(
-        ticket,
-        resolved,
-        runtime=runtimes["test_designer"],
-        prompt_provider=prompt_provider,
-        ticket_id=ticket_key,
+    # 4. Design the test plan (drives the Coder's test writing downstream). On
+    # resume, a valid ``design`` checkpoint is loaded and the Test Designer run
+    # is SKIPPED. The output is captured (not discarded) so it is checkpointable.
+    design_output: TestDesignerOutput | None = (
+        _load_checkpoint(ckpt_dir, "design", TestDesignerOutput) if resume else None
     )
+    if design_output is None:
+        trace.append("design_tests")
+        design_output = design_tests(
+            ticket,
+            resolved,
+            runtime=runtimes["test_designer"],
+            prompt_provider=prompt_provider,
+            ticket_id=ticket_key,
+        )
+        _write_checkpoint(ckpt_dir, "design", design_output)
+    else:
+        _log.info("resume: skipping design stage (checkpoint present) for %s", ticket_key)
 
-    # 5. Clone the repo (token-free origin written by RepoManager.clone).
-    trace.append("repo_manager.clone")
-    repo_manager.clone(repo_url, clone_dest)
+    # 5-6. Clone + worktree. On resume, if the worktree already exists it is
+    # REUSED (clone + branch + the Coder's commits already present — the ``code``
+    # checkpoint implies all three). We detect reuse by the worktree path's
+    # existence; otherwise clone + ``worktree add -b <branch>`` as on a clean
+    # run.
+    worktree_job_id = job_id or ticket_key
+    worktree_path = worktree_base / worktree_job_id
+    if resume and worktree_path.exists():
+        _log.info("resume: reusing existing worktree %s for %s", worktree_path, ticket_key)
+    else:
+        # 5. Clone the repo (token-free origin written by RepoManager.clone).
+        trace.append("repo_manager.clone")
+        repo_manager.clone(repo_url, clone_dest)
 
-    # 6. Materialise an isolated per-job worktree off the clone, directly on a
-    # NEW branch (branch_name) based off base_branch. Creating the worktree with
-    # `-b` avoids colliding with the clone's checkout of base_branch (main) and
-    # makes the separate create_branch/checkout unnecessary.
-    trace.append("worktree.add")
-    worktree = worktree_manager.add(
-        job_id or ticket_key, base_branch, worktree_base, new_branch=branch_name
-    )
-    worktree_path = worktree.path
+        # 6. Materialise an isolated per-job worktree off the clone, directly on
+        # a NEW branch (branch_name) based off base_branch. Creating the worktree
+        # with `-b` avoids colliding with the clone's checkout of base_branch
+        # (main) and makes the separate create_branch/checkout unnecessary.
+        trace.append("worktree.add")
+        worktree = worktree_manager.add(
+            worktree_job_id, base_branch, worktree_base, new_branch=branch_name
+        )
+        worktree_path = worktree.path
 
     # 8. Coder implements the PR-spec. RESOLUTION 3: the Coder runtime's cwd is
     #    set at LOOP time — the worktree path only exists after step 6. build()
     #    constructed the runtime with cwd=None; rebind it here. The runtime
     #    reads its `_cwd` when .run() builds options, so the rebind takes effect
     #    for this run. (Within the composition-root package boundary.)
-    trace.append("code")
-    coder_runtime: Any = runtimes["coder"]
-    coder_runtime._cwd = str(worktree_path)
-    coder_output = code(
-        pr_spec,
-        resolved,
-        runtime=runtimes["coder"],
-        prompt_provider=prompt_provider,
-        ticket_id=ticket_key,
+    #    On resume, a valid ``code`` checkpoint is loaded and the Coder run (the
+    #    expensive ~10-min stage) is SKIPPED — this is the primary cost lever.
+    coder_output: CoderOutput | None = (
+        _load_checkpoint(ckpt_dir, "code", CoderOutput) if resume else None
     )
+    if coder_output is None:
+        trace.append("code")
+        coder_runtime: Any = runtimes["coder"]
+        coder_runtime._cwd = str(worktree_path)
+        coder_output = code(
+            pr_spec,
+            resolved,
+            runtime=runtimes["coder"],
+            prompt_provider=prompt_provider,
+            ticket_id=ticket_key,
+        )
+        _write_checkpoint(ckpt_dir, "code", coder_output)
+    else:
+        _log.info("resume: skipping code stage (checkpoint present) for %s", ticket_key)
 
     # 9-11. Local Execution Engine gates — build, tests, lint. Each is fail-fast:
     # a non-success aborts BEFORE push (no PR is opened against a red tree).
@@ -550,9 +655,10 @@ def build(
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint: ``python -m workspace_worker.entrypoints.ticket_pipeline --ticket SFP-XXX``.
 
-    Parses ``--ticket`` (required), an optional ``--slug`` (branch slug), and
-    env-derived coordinates; calls :func:`build` then :func:`run_pipeline`, prints
-    a one-line outcome, and returns a process exit code (``0`` on success).
+    Parses ``--ticket`` (required), an optional ``--slug`` (branch slug),
+    ``--resume`` (skip stages whose checkpoint is present), and env-derived
+    coordinates; calls :func:`build` then :func:`run_pipeline`, prints a one-line
+    outcome, and returns a process exit code (``0`` on success).
     """
     parser = argparse.ArgumentParser(
         prog="workspace_worker.entrypoints.ticket_pipeline",
@@ -561,6 +667,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ticket", required=True, help="Jira issue key, e.g. SFP-224")
     parser.add_argument("--slug", default="slice", help="Short branch slug (default: slice)")
     parser.add_argument("--base-branch", default="main", help="PR base branch")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from stage checkpoints at <worktree_base>/<ticket>/checkpoints/ "
+        "(skip plan/design/code whose checkpoint is present; reuse an existing worktree).",
+    )
     args = parser.parse_args(argv)
 
     deps = build(args.ticket, slug=args.slug, base_branch=args.base_branch)
@@ -583,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
         branch_name=deps.branch_name,
         base_branch=deps.base_branch,
         done_transition_id=deps.done_transition_id,
+        resume=args.resume,
     )
 
     if result.success:

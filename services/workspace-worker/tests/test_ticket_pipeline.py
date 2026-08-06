@@ -21,6 +21,7 @@ recording fakes (no real SDK / HTTP / env parsing for the typed settings).
 
 from __future__ import annotations
 
+import json
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
@@ -29,7 +30,10 @@ from typing import Any
 import pytest
 from sfp_agent_runtime.interfaces import AgentRunRequest, AgentRunResult
 from sfp_config import LocalSecretProvider, SecretRef
+from sfp_contracts.agents.coder import CoderOutput
+from sfp_contracts.agents.planner import PlannerOutput
 from sfp_contracts.agents.readiness import ParsedTicket
+from sfp_contracts.agents.test_designer import TestDesignerOutput
 from workspace_worker.entrypoints import ticket_pipeline as pipeline_mod
 from workspace_worker.entrypoints.ticket_pipeline import (
     PipelineDeps,
@@ -387,6 +391,8 @@ def _run(
     coder_adapter: FakeGitAdapter | None = None,
     reviewer_adapter: FakeGitAdapter | None = None,
     exec_runners: Mapping[str, Any] | None = None,
+    resume: bool = False,
+    checkpoints_dir: Path | None = None,
 ) -> tuple[PipelineResult, dict[str, Any]]:
     """Wire every fake and call run_pipeline; return (result, fakes-dict)."""
     jira = jira or FakeJiraClient()
@@ -398,6 +404,7 @@ def _run(
     branch_manager = FakeBranchManager()
     clone_dest = tmp_path / "clone"
     worktree_base = tmp_path / "wt"
+    checkpoints_dir = checkpoints_dir or (tmp_path / "ckpts")
 
     result = run_pipeline(
         TICKET,
@@ -416,6 +423,8 @@ def _run(
         clone_dest=clone_dest,
         worktree_base=worktree_base,
         branch_name=BRANCH,
+        resume=resume,
+        checkpoints_dir=checkpoints_dir,
     )
     fakes = {
         "jira": jira,
@@ -757,3 +766,156 @@ def test_main_returns_zero_on_success_and_nonzero_on_abort(
     monkeypatch.setattr(pipeline_mod, "build", lambda *a, **kw: fake_deps_abort)
     rc_abort = pipeline_mod.main(["--ticket", TICKET])
     assert rc_abort == 1
+
+
+# --------------------------------------------------------------------------- #
+# Stage checkpointing / --resume (SFP-230)
+# --------------------------------------------------------------------------- #
+
+
+_FULL_TRACE: tuple[str, ...] = (
+    "jira.fetch_issue",
+    "evaluate_readiness",
+    "plan",
+    "design_tests",
+    "repo_manager.clone",
+    "worktree.add",
+    "code",
+    "build",
+    "run_tests",
+    "lint",
+    "repo_manager.push",
+    "coder_adapter.create_pr",
+    "review",
+    "reviewer_adapter.submit_review",
+    "coder_adapter.merge_pr",
+    "jira.transition",
+)
+
+
+def _write_ckpt(checkpoints_dir: Path, stage: str, payload: str) -> None:
+    """Write a raw checkpoint file (``<stage>.json``) for resume-test setup."""
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    (checkpoints_dir / f"{stage}.json").write_text(payload)
+
+
+def test_resume_skips_plan_when_checkpoint_present(tmp_path: Path) -> None:
+    """(a) plan checkpoint present -> planner NOT called; design + code run."""
+    ckpts = tmp_path / "ckpts"
+    _write_ckpt(
+        ckpts,
+        "plan",
+        PlannerOutput.model_validate(_planner_output()).model_dump_json(),
+    )
+
+    runtimes, handles = _make_runtimes(approved=True)
+    result, _ = _run(tmp_path, runtimes, resume=True, checkpoints_dir=ckpts)
+
+    assert result.success is True
+    # Plan skipped (checkpoint loaded); design + code still ran.
+    assert handles["planner"].calls == []
+    assert len(handles["test_designer"].calls) == 1
+    assert len(handles["coder"].calls) == 1
+    # Readiness is never checkpointed - it always re-runs.
+    assert len(handles["readiness"].calls) == 1
+    # 'plan' absent from the trace; design_tests present.
+    assert "plan" not in result.trace
+    assert "design_tests" in result.trace
+    assert "code" in result.trace
+
+
+def test_resume_skips_through_code_when_all_checkpoints_present(
+    tmp_path: Path,
+) -> None:
+    """(b) plan+design+code checkpoints present + worktree exists -> coder NOT
+    called; exec/push/PR/review run against the fakes."""
+    ckpts = tmp_path / "ckpts"
+    _write_ckpt(ckpts, "plan", PlannerOutput.model_validate(_planner_output()).model_dump_json())
+    _write_ckpt(
+        ckpts,
+        "design",
+        TestDesignerOutput.model_validate(_test_designer_output()).model_dump_json(),
+    )
+    _write_ckpt(ckpts, "code", CoderOutput.model_validate(_coder_output()).model_dump_json())
+    # The code checkpoint implies clone + branch + Coder commits already exist -
+    # materialise the worktree dir so the reuse branch is taken.
+    (tmp_path / "wt" / TICKET).mkdir(parents=True)
+
+    runtimes, handles = _make_runtimes(approved=True)
+    result, fakes = _run(tmp_path, runtimes, resume=True, checkpoints_dir=ckpts)
+
+    assert result.success is True
+    # plan / design / code all skipped.
+    assert handles["planner"].calls == []
+    assert handles["test_designer"].calls == []
+    assert handles["coder"].calls == []
+    # Readiness re-ran (never checkpointed).
+    assert len(handles["readiness"].calls) == 1
+    # Downstream stages ran: exec gates + push + create_pr + review + merge.
+    assert "build" in result.trace
+    assert "run_tests" in result.trace
+    assert "lint" in result.trace
+    assert any(c[0] == "push" for c in fakes["repo_manager"].calls)
+    assert any(c[0] == "create_pr" for c in fakes["coder_adapter"].calls)
+    assert any(c[0] == "submit_review" for c in fakes["reviewer_adapter"].calls)
+    assert any(c[0] == "merge_pr" for c in fakes["coder_adapter"].calls)
+    # clone + worktree.add skipped (worktree reused).
+    assert "repo_manager.clone" not in result.trace
+    assert "worktree.add" not in result.trace
+
+
+def test_resume_corrupt_checkpoint_is_deleted_and_stage_reruns(
+    tmp_path: Path,
+) -> None:
+    """(c) corrupt plan checkpoint -> deleted + plan re-runs; the rewritten
+    checkpoint validates."""
+    ckpts = tmp_path / "ckpts"
+    plan_path = ckpts / "plan.json"
+    _write_ckpt(ckpts, "plan", "{ not valid json")
+
+    runtimes, handles = _make_runtimes(approved=True)
+    result, _ = _run(tmp_path, runtimes, resume=True, checkpoints_dir=ckpts)
+
+    assert result.success is True
+    # Plan re-ran (the corrupt checkpoint was discarded).
+    assert len(handles["planner"].calls) == 1
+    assert "plan" in result.trace
+    # The checkpoint file was rewritten with valid JSON that round-trips.
+    assert plan_path.exists()
+    PlannerOutput.model_validate(json.loads(plan_path.read_text()))
+
+
+def test_no_resume_does_not_read_checkpoints_and_behaves_as_today(
+    tmp_path: Path,
+) -> None:
+    """(d) without --resume, checkpoints are never read - even when present, the
+    planner runs and the full clean-run trace is produced exactly as before."""
+    ckpts = tmp_path / "ckpts"
+    # Pre-populate a plan checkpoint that WOULD skip plan under --resume.
+    _write_ckpt(
+        ckpts,
+        "plan",
+        PlannerOutput.model_validate(_planner_output()).model_dump_json(),
+    )
+
+    runtimes, handles = _make_runtimes(approved=True)
+    result, _ = _run(tmp_path, runtimes, resume=False, checkpoints_dir=ckpts)
+
+    assert result.success is True
+    # Plan ran despite a checkpoint being present (resume=False).
+    assert len(handles["planner"].calls) == 1
+    assert tuple(result.trace) == _FULL_TRACE
+
+
+def test_checkpoints_are_written_on_a_normal_run(tmp_path: Path) -> None:
+    """(e) a clean run (resume=False) writes plan/design/code checkpoints that
+    round-trip through their contract models."""
+    ckpts = tmp_path / "ckpts"
+    runtimes, _ = _make_runtimes(approved=True)
+    result, _ = _run(tmp_path, runtimes, resume=False, checkpoints_dir=ckpts)
+
+    assert result.success is True
+    # All three checkpoint files exist and validate.
+    PlannerOutput.model_validate(json.loads((ckpts / "plan.json").read_text()))
+    TestDesignerOutput.model_validate(json.loads((ckpts / "design.json").read_text()))
+    CoderOutput.model_validate(json.loads((ckpts / "code.json").read_text()))
