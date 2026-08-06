@@ -98,10 +98,22 @@ _DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 #: Reviewer are bounded tight (judgment runs); the Coder is given room for a
 #: multi-step implementation run, capped to fail-fast.
 _MAX_TURNS: Mapping[str, int] = {
-    "planner": 5,
-    "test_designer": 5,
+    "planner": 15,
+    "test_designer": 15,
     "coder": 50,
-    "reviewer": 5,
+    "reviewer": 15,
+    "readiness": 8,
+}
+
+#: SMOKE-PATCH (local, NOT committed): per-role reasoning effort forwarded to
+#: the runtime -> ClaudeAgentOptions(effort=...). Emit-JSON agents finalize in
+#: few turns at "low"; the Coder keeps "medium" for real implementation work.
+_ROLE_EFFORT: Mapping[str, str] = {
+    "planner": "low",
+    "test_designer": "low",
+    "reviewer": "low",
+    "readiness": "low",
+    "coder": "medium",
 }
 
 #: Output contract per agent role (one :class:`ClaudeAgentRuntime` each).
@@ -112,6 +124,12 @@ _OUTPUT_CONTRACTS: Mapping[str, type[Any]] = {
     ).TestDesignerOutput,
     "coder": CoderOutput,
     "reviewer": ReviewerOutput,
+    # SMOKE-PATCH (local, NOT committed — formalize via PR): readiness emits
+    # ReadinessOutput, NOT PlannerOutput — reusing the planner runtime made the
+    # contract validation fail (fail-closed -> NEEDS_CLARIFICATION).
+    "readiness": __import__(
+        "sfp_contracts.agents.readiness", fromlist=["ReadinessOutput"]
+    ).ReadinessOutput,
 }
 
 
@@ -242,12 +260,14 @@ def run_pipeline(
     declaration = TicketContextDeclaration()
     resolved: ResolvedContext = resolve_context(declaration, {}, ticket_id=ticket_key)
 
-    # 2. Readiness gate (reuse the planner runtime per RESOLUTION 6).
+    # 2. Readiness gate — uses a DEDICATED readiness runtime (ReadinessOutput
+    # contract), NOT the planner runtime (PlannerOutput) — contract mismatch
+    # made the gate fail-closed (SMOKE-PATCH, local, formalize via PR).
     trace.append("evaluate_readiness")
     readiness = evaluate_readiness(
         ticket,
         resolved,
-        runtime=runtimes["planner"],
+        runtime=runtimes["readiness"],
         prompt_provider=prompt_provider,
         ticket_id=ticket_key,
     )
@@ -287,16 +307,15 @@ def run_pipeline(
     trace.append("repo_manager.clone")
     repo_manager.clone(repo_url, clone_dest)
 
-    # 6. Materialise an isolated per-job worktree off the clone.
+    # 6. Materialise an isolated per-job worktree off the clone, directly on a
+    # NEW branch (branch_name) based off base_branch. Creating the worktree with
+    # `-b` avoids colliding with the clone's checkout of base_branch (main) and
+    # makes the separate create_branch/checkout unnecessary.
     trace.append("worktree.add")
-    worktree = worktree_manager.add(job_id or ticket_key, base_branch, worktree_base)
+    worktree = worktree_manager.add(
+        job_id or ticket_key, base_branch, worktree_base, new_branch=branch_name
+    )
     worktree_path = worktree.path
-
-    # 7. Create + check out the PR branch in the worktree.
-    trace.append("branch_manager.create_branch")
-    branch_manager.create_branch(branch_name, ref=base_branch)
-    trace.append("branch_manager.checkout")
-    branch_manager.checkout(branch_name)
 
     # 8. Coder implements the PR-spec. RESOLUTION 3: the Coder runtime's cwd is
     #    set at LOOP time — the worktree path only exists after step 6. build()
@@ -324,12 +343,24 @@ def run_pipeline(
     trace.append("run_tests")
     test_result = _run_tests(worktree_path, runner=exec_runners["test"])
     if not test_result.success:
-        return _abort(trace, None, f"tests failed: exit_code={test_result.exit_code}")
+        return _abort(
+            trace,
+            None,
+            (
+                f"tests failed: exit_code={test_result.exit_code}\n"
+                f"--STDOUT tail--\n{test_result.stdout_tail[-1200:]}\n"
+                f"--STDERR tail--\n{test_result.stderr_tail[-1200:]}"
+            ),
+        )
 
     trace.append("lint")
     lint_result = _run_lint(worktree_path, runner=exec_runners["lint"])
     if not lint_result.success:
-        return _abort(trace, None, f"lint failed: {lint_result}")
+        return _abort(
+            trace,
+            None,
+            f"lint failed:\n{lint_result}",
+        )
 
     # 12. Push the branch — RESOLUTION 4: object upload via RepoManager.push,
     #     NEVER GitProviderAdapter.push_branch (the Git Data refs API cannot
@@ -415,6 +446,13 @@ def _build_runtimes(
             max_turns=_MAX_TURNS[role],
             cwd=None,
             model_resolver=model_resolver,
+            effort=_ROLE_EFFORT.get(role),
+            # All roles get schema enforcement (output_format). The earlier
+            # "Coder didn't write with output_format" was the permission prompt
+            # (fixed via permission_mode=bypassPermissions in the runtime), NOT
+            # output_format — so the Coder now both writes files AND emits a
+            # clean CoderOutput JSON.
+            enforce_schema=True,
         )
     return runtimes
 
