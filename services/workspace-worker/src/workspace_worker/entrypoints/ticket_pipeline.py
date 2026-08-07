@@ -139,13 +139,16 @@ _log = logging.getLogger(__name__)
 
 
 def _checkpoint_dir(worktree_base: Path, ticket_key: str) -> Path:
-    """Default checkpoints dir: ``<worktree_base>/<ticket>/checkpoints``.
+    """Default checkpoints dir: ``<worktree_base>/checkpoints/<ticket>``.
 
-    Kept OUTSIDE the worktree (keyed by ticket under ``worktree_base``) so a
+    A SIBLING of the per-ticket worktree (not its parent) — the worktree path is
+    ``<worktree_base>/<ticket>``, so a checkpoints dir nested under
+    ``<worktree_base>/<ticket>/`` would collide with ``WorktreeManager.add``
+    (which refuses to clobber an existing path). Kept OUTSIDE the worktree so a
     worktree mishap cannot lose the checkpoints. ``main()`` uses this default;
     tests inject their own dir via :func:`run_pipeline`'s ``checkpoints_dir``.
     """
-    return worktree_base / ticket_key / "checkpoints"
+    return worktree_base / "checkpoints" / ticket_key
 
 
 def _write_checkpoint(checkpoints_dir: Path, stage: str, output: BaseModel) -> None:
@@ -670,7 +673,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume from stage checkpoints at <worktree_base>/<ticket>/checkpoints/ "
+        help="Resume from stage checkpoints at <worktree_base>/checkpoints/<ticket>/ "
         "(skip plan/design/code whose checkpoint is present; reuse an existing worktree).",
     )
     args = parser.parse_args(argv)
