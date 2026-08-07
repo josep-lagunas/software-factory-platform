@@ -38,6 +38,7 @@ from workspace_worker.entrypoints import ticket_pipeline as pipeline_mod
 from workspace_worker.entrypoints.ticket_pipeline import (
     PipelineDeps,
     PipelineResult,
+    _checkpoint_dir,
     build,
     run_pipeline,
 )
@@ -919,3 +920,31 @@ def test_checkpoints_are_written_on_a_normal_run(tmp_path: Path) -> None:
     PlannerOutput.model_validate(json.loads((ckpts / "plan.json").read_text()))
     TestDesignerOutput.model_validate(json.loads((ckpts / "design.json").read_text()))
     CoderOutput.model_validate(json.loads((ckpts / "code.json").read_text()))
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoints-dir / worktree-path collision (SFP-231 regression)
+# --------------------------------------------------------------------------- #
+
+
+def test_checkpoint_dir_is_sibling_of_worktree_path_not_parent() -> None:
+    """The default checkpoints dir must NOT collide with the worktree path.
+
+    The worktree path is ``<worktree_base>/<ticket>``; the checkpoints dir must
+    be a SIBLING (``<worktree_base>/checkpoints/<ticket>``), not its parent
+    (``<worktree_base>/<ticket>/checkpoints``) — otherwise creating the
+    checkpoints dir materializes ``<worktree_base>/<ticket>/`` and
+    ``WorktreeManager.add`` then refuses the worktree as "path already exists".
+    """
+    worktree_base = Path("/tmp/sfp-wt")
+    ticket = "SFP-231"
+
+    ckpt = _checkpoint_dir(worktree_base, ticket)
+    worktree_path = worktree_base / ticket
+
+    # Sibling, not parent/child: the checkpoints dir is NOT under the worktree.
+    assert ckpt != worktree_path
+    assert worktree_path not in ckpt.parents
+    assert ckpt.parent.parent == worktree_base  # <base>/checkpoints/<ticket>
+    assert ckpt.name == ticket
+    assert ckpt.parent.name == "checkpoints"
