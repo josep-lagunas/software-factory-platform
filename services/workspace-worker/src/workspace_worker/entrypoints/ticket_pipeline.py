@@ -82,7 +82,7 @@ from workspace_worker.repo.branch import BranchManager
 from workspace_worker.repo.git.adapter import GitProviderAdapter
 from workspace_worker.repo.jira.client import JiraClient
 from workspace_worker.repo.manager import RepoManager
-from workspace_worker.repo.worktree import WorktreeManager
+from workspace_worker.repo.worktree import WorktreeManager, _sanitize_job_id
 from workspace_worker.workflow.context_resolver import resolve_context
 from workspace_worker.workflow.readiness_gate import evaluate_readiness
 
@@ -398,7 +398,10 @@ def run_pipeline(
     # existence; otherwise clone + ``worktree add -b <branch>`` as on a clean
     # run.
     worktree_job_id = job_id or ticket_key
-    worktree_path = worktree_base / worktree_job_id
+    # Sanitize the SAME way WorktreeManager.add does, so the resume-reuse path
+    # matches the fresh-run worktree path for ALL job_ids (a raw job_id with a
+    # path separator would otherwise diverge from where .add created the worktree).
+    worktree_path = worktree_base / _sanitize_job_id(worktree_job_id)
     if resume and worktree_path.exists():
         _log.info("resume: reusing existing worktree %s for %s", worktree_path, ticket_key)
     else:

@@ -182,13 +182,17 @@ class RepoManager:
         try:
             self._runner(["git", "clone", authed_url, str(dest)])
         except subprocess.CalledProcessError as exc:
+            # `from None` (not `from exc`): the chained CalledProcessError's
+            # `.cmd` carries the token-bearing argv (`x-access-token:<PAT>@...`)
+            # and is never redacted — a traceback would leak the PAT. The
+            # redacted message above already carries the (redacted) git stderr.
             raise RepoManagerError(
                 _redact(
                     f"git clone failed for {clean_url}: "
                     + _redact(str(exc.stderr or exc), self._token),
                     self._token,
                 )
-            ) from exc
+            ) from None
 
         # Rewrite the on-disk `origin` to the token-free URL so .git/config
         # never carries the token. If this fails, tear down the clone — a
@@ -204,7 +208,7 @@ class RepoManager:
                     + _redact(str(exc.stderr or exc), self._token),
                     self._token,
                 )
-            ) from exc
+            ) from None
 
         return CloneResult(path=dest, cloned=True)
 
@@ -261,7 +265,7 @@ class RepoManager:
                         + _redact(str(exc.stderr or exc), self._token),
                         self._token,
                     )
-                ) from exc
+                ) from None
             remote_url = (origin.stdout or "").strip()
 
         authed_url = _inject_token(remote_url, self._token)
@@ -273,12 +277,14 @@ class RepoManager:
         try:
             self._runner(["git", "-C", str(path), "push", authed_url, branch])
         except subprocess.CalledProcessError as exc:
+            # `from None`: the push argv carries the token-bearing authed URL;
+            # the chained CalledProcessError.cmd would leak the PAT via traceback.
             raise RepoManagerError(
                 _redact(
                     f"git push failed for {clean_url} branch={branch}: "
                     + _redact(str(exc.stderr or exc), self._token),
                     self._token,
                 )
-            ) from exc
+            ) from None
 
         return PushResult(path=path, branch=branch, pushed=True)

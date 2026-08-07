@@ -173,6 +173,14 @@ def test_clone_redacts_token_from_clone_failure(tmp_path: Path) -> None:
     assert TOKEN not in msg
     assert "***" in msg
     assert "git clone failed" in msg
+    # The chain is suppressed (`from None`): the original CalledProcessError's
+    # `.cmd` carries the token-bearing argv and would leak via the traceback.
+    assert exc_info.value.__cause__ is None
+    import traceback as _tb
+
+    full_tb = "".join(_tb.format_exception(exc_info.value))
+    assert TOKEN not in full_tb
+    assert "x-access-token" not in full_tb
 
 
 def test_clone_tears_down_and_redacts_when_set_url_fails(tmp_path: Path) -> None:
@@ -190,6 +198,12 @@ def test_clone_tears_down_and_redacts_when_set_url_fails(tmp_path: Path) -> None
         mgr.clone(HTTPS_URL, dest)
 
     assert TOKEN not in str(exc_info.value)
+    # Chain suppressed (`from None`) — the set-url CalledProcessError's argv
+    # could carry the token via the cloned config; the traceback must stay clean.
+    assert exc_info.value.__cause__ is None
+    import traceback as _tb
+
+    assert TOKEN not in "".join(_tb.format_exception(exc_info.value))
     # The clone was rolled back — dest must not linger with a token in config.
     assert not dest.exists()
 
@@ -317,10 +331,18 @@ def test_push_reads_on_disk_origin_when_remote_url_none(tmp_path: Path) -> None:
 
 
 def test_push_redacts_token_from_failure(tmp_path: Path) -> None:
-    """A failed push surfaces a redacted RepoManagerError — no token in the message."""
+    """A failed push surfaces a redacted RepoManagerError — no token in message or traceback."""
+    authed_cmd = [
+        "git",
+        "-C",
+        str(tmp_path / "repo"),
+        "push",
+        f"https://x-access-token:{TOKEN}@github.com/arconta/some-repo.git",
+        "sfp-224-x",
+    ]
     err = subprocess.CalledProcessError(
         returncode=128,
-        cmd=["git", "push"],
+        cmd=authed_cmd,
         stderr=f"remote: Invalid token {TOKEN}",
     )
     runner = FakeRunner(side_effect=err, failing_cmd_prefix=("git", "-C"))
@@ -333,6 +355,14 @@ def test_push_redacts_token_from_failure(tmp_path: Path) -> None:
     assert TOKEN not in msg
     assert "***" in msg
     assert "git push failed" in msg
+    # Chain suppressed (`from None`) — the push CalledProcessError's argv carries
+    # the token-bearing authed URL; the traceback must stay clean.
+    assert exc_info.value.__cause__ is None
+    import traceback as _tb
+
+    full_tb = "".join(_tb.format_exception(exc_info.value))
+    assert TOKEN not in full_tb
+    assert "x-access-token" not in full_tb
 
 
 # ---------------------------------------------------------------------------

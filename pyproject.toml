@@ -60,6 +60,7 @@ source = [
     "services/orchestrator/src",
     "services/external-events/src",
 ]
+omit = ['*/migrations/env.py']
 
 [tool.coverage.report]
 fail_under = 90
