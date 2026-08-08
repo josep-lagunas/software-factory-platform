@@ -23,6 +23,37 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..validation.profiles import ValidationProfile
 
 
+class DeferredForeignKeyObligation(BaseModel):
+    """A declared-but-deferred intra-service foreign key (ID-058 deferral protocol).
+
+    When an intra-service cross-aggregate reference cannot be created as a real
+    ``FOREIGN KEY`` because the target table does not yet exist (the target
+    aggregate lands in a separate, later ticket), the originating ticket
+    *declares* the obligation here instead of silently shipping a plain column.
+    The deferral is also tracked on the target ticket ("close on landing":
+    creating the target table MUST add the deferred FK). A deferral is never
+    silent — a reference is either a real FK or a declared, tracked obligation.
+
+    Promotes the policy mis-applied in SFP-101 (``Ticket.project_id`` shipped
+    no-FK, framed as "§6.5 policy") into a normative, recorded rule: ID-058
+    requires intra-service cross-aggregate FKs (MAS §2854-2855, precedent
+    ``UserExternalIdentity.user_id``), and this model is the mechanism by which
+    a *temporary* omission is declared and tracked rather than dropped.
+
+    Fields are non-empty strings; unknown fields are rejected
+    (``extra='forbid'``) so shape drift between the Planner producer and the
+    structural linter (``tools/check_prspec.py``) surfaces immediately rather
+    than being silently dropped.
+    """
+
+    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
+
+    column: str
+    target_aggregate: str
+    blocked_on: str
+    follow_up: str
+
+
 class PrSpec(BaseModel):
     """A single self-contained pull-request task produced by the Planner.
 
@@ -50,6 +81,7 @@ class PrSpec(BaseModel):
     likely_files_or_modules: list[str]
     risks: list[str]
     implementation_notes: str
+    deferred_fk_obligations: list[DeferredForeignKeyObligation] = Field(default_factory=list)
 
 
 class PlannerOutput(BaseModel):

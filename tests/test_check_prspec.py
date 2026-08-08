@@ -574,3 +574,102 @@ def test_tc_017_coverage_threshold(tmp_path):
         env={**env_cov},
     )
     assert r2.returncode == 0, f"check_prspec.py coverage below 90%:\n{r2.stdout}"
+
+
+# ============================================================
+# TC-018 — deferred_fk_obligations shape (ID-058 deferral protocol)
+# ============================================================
+#
+# Optional field (absent is fine). When present, each entry must carry non-empty
+# column/target_aggregate/blocked_on/follow_up strings. Collects violations; no
+# short-circuit. Shape only — does NOT inspect migrations (SFP-235's concern).
+
+DEFERRED_KEYS = ["column", "target_aggregate", "blocked_on", "follow_up"]
+
+
+def _valid_deferral():
+    return {
+        "column": "project_id",
+        "target_aggregate": "business.projects(project_id)",
+        "blocked_on": "SFP-100",
+        "follow_up": "Add FK business.tickets.project_id -> business.projects(project_id).",
+    }
+
+
+def test_tc_018_absence_ok():
+    # Absent is fine — the field is optional (no deferrals declared).
+    spec = _spec()
+    assert "deferred_fk_obligations" not in spec
+    assert check_prspec.validate(spec) == []
+
+
+def test_tc_018_empty_list_ok():
+    # An explicit empty list is fine (no deferrals declared).
+    spec = _spec()
+    spec["deferred_fk_obligations"] = []
+    assert check_prspec.validate(spec) == []
+
+
+def test_tc_018_valid_entry_passes():
+    spec = _spec()
+    spec["deferred_fk_obligations"] = [_valid_deferral()]
+    assert check_prspec.validate(spec) == []
+
+
+def test_tc_018_not_a_list_rejected():
+    spec = _spec()
+    spec["deferred_fk_obligations"] = {"column": "project_id"}
+    v = check_prspec.validate(spec)
+    assert any("deferred_fk_obligations" in m and "list" in m for m in v), v
+
+
+def test_tc_018_entry_not_a_dict_rejected():
+    spec = _spec()
+    spec["deferred_fk_obligations"] = ["project_id"]
+    v = check_prspec.validate(spec)
+    assert any("deferred_fk_obligations[0]" in m and "dict" in m for m in v), v
+
+
+@pytest.mark.parametrize("missing_key", DEFERRED_KEYS)
+def test_tc_018_entry_missing_each_key_named(missing_key):
+    spec = _spec()
+    entry = _valid_deferral()
+    del entry[missing_key]
+    spec["deferred_fk_obligations"] = [entry]
+    v = check_prspec.validate(spec)
+    # The missing key NAME must appear in at least one violation.
+    assert _violations_mentioning(v, missing_key), (
+        f"no violation names the missing key {missing_key!r}: {v}"
+    )
+
+
+@pytest.mark.parametrize("blank_key", DEFERRED_KEYS)
+def test_tc_018_entry_blank_each_key_named(blank_key):
+    spec = _spec()
+    entry = _valid_deferral()
+    entry[blank_key] = "   "
+    spec["deferred_fk_obligations"] = [entry]
+    v = check_prspec.validate(spec)
+    assert _violations_mentioning(v, blank_key), (
+        f"no violation names the blanked key {blank_key!r}: {v}"
+    )
+
+
+def test_tc_018_no_short_circuit():
+    # One entry missing ALL required keys -> >= 4 violations (one per key).
+    spec = _spec()
+    spec["deferred_fk_obligations"] = [{}]
+    v = check_prspec.validate(spec)
+    assert len(v) >= 4, v
+    for key in DEFERRED_KEYS:
+        assert _violations_mentioning(v, key), f"key {key!r} not named: {v}"
+
+
+def test_tc_018_multiple_entries_indexed():
+    # Violations are indexed by entry position (deferred_fk_obligations[i]).
+    spec = _spec()
+    bad = {"column": "project_id"}  # missing 3 keys
+    spec["deferred_fk_obligations"] = [bad, bad]
+    v = check_prspec.validate(spec)
+    assert any("deferred_fk_obligations[0]" in m for m in v), v
+    assert any("deferred_fk_obligations[1]" in m for m in v), v
