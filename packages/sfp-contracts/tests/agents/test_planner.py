@@ -17,7 +17,11 @@ import json
 
 import pytest
 from pydantic import ValidationError
-from sfp_contracts.agents.planner import PlannerOutput, PrSpec
+from sfp_contracts.agents.planner import (
+    DeferredForeignKeyObligation,
+    PlannerOutput,
+    PrSpec,
+)
 from sfp_contracts.validation.profiles import ValidationProfile
 
 VALID_PRSPEC_KWARGS: dict[str, object] = {
@@ -204,3 +208,68 @@ def test_malformed_json_rejected() -> None:
     """Malformed JSON raises ValidationError via model_validate_json."""
     with pytest.raises(ValidationError):
         PlannerOutput.from_json("{not valid json")
+
+
+# --- (h) deferred_fk_obligations (ID-058 deferral protocol) -------------------
+#
+# The field defaults to an empty list (so existing PRSpecs — SFP-232's, the
+# dogfood's — stay valid), round-trips through JSON, rejects unknown sub-fields
+# (extra='forbid'), and each DeferredForeignKeyObligation field is required.
+
+VALID_DEFERRAL_KWARGS: dict[str, object] = {
+    "column": "project_id",
+    "target_aggregate": "business.projects(project_id)",
+    "blocked_on": "SFP-100",
+    "follow_up": "Add FK business.tickets.project_id -> business.projects(project_id).",
+}
+
+
+def test_deferred_fk_obligations_defaults_empty() -> None:
+    """(h) deferred_fk_obligations defaults to an empty list (not required)."""
+    spec = make_prspec()
+    assert spec.deferred_fk_obligations == []
+
+
+def test_deferred_fk_obligations_round_trips() -> None:
+    """(h) A declared deferral round-trips losslessly through JSON."""
+    deferral = DeferredForeignKeyObligation(**VALID_DEFERRAL_KWARGS)
+    spec = make_prspec(deferred_fk_obligations=[deferral])
+    restored = PlannerOutput.from_json(make_output([spec]).to_json())
+    assert restored == make_output([spec])
+    entry = restored.pr_specs[0].deferred_fk_obligations[0]
+    assert entry.column == "project_id"
+    assert entry.target_aggregate == "business.projects(project_id)"
+    assert entry.blocked_on == "SFP-100"
+    assert entry.follow_up.startswith("Add FK")
+
+
+def test_deferred_fk_obligation_extra_fields_rejected() -> None:
+    """(h) Unknown fields on a DeferredForeignKeyObligation are rejected."""
+    kwargs = dict(VALID_DEFERRAL_KWARGS)
+    kwargs["unexpected"] = "x"
+    with pytest.raises(ValidationError):
+        DeferredForeignKeyObligation(**kwargs)
+
+
+@pytest.mark.parametrize("missing_field", list(VALID_DEFERRAL_KWARGS.keys()))
+def test_deferred_fk_obligation_missing_field_raises(missing_field: str) -> None:
+    """(h) Dropping any DeferredForeignKeyObligation field raises ValidationError."""
+    kwargs = {k: v for k, v in VALID_DEFERRAL_KWARGS.items() if k != missing_field}
+    with pytest.raises(ValidationError):
+        DeferredForeignKeyObligation(**kwargs)
+
+
+def test_deferred_fk_obligation_extra_field_rejected_via_from_json() -> None:
+    """(h) A nested extra field on a deferred entry is rejected on deserialize."""
+    payload = json.loads(make_output().to_json())
+    payload["pr_specs"][0]["deferred_fk_obligations"] = [{**VALID_DEFERRAL_KWARGS, "rogue": "no"}]
+    with pytest.raises(ValidationError):
+        PlannerOutput.from_json(json.dumps(payload))
+
+
+def test_default_empty_list_serializes_in_round_trip() -> None:
+    """(h) The default empty list serializes and round-trips (stays [])."""
+    payload = json.loads(make_output().to_json())
+    assert payload["pr_specs"][0]["deferred_fk_obligations"] == []
+    restored = PlannerOutput.from_json(json.dumps(payload))
+    assert restored.pr_specs[0].deferred_fk_obligations == []
