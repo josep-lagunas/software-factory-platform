@@ -48,6 +48,7 @@ import argparse
 import importlib
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 from sqlalchemy import MetaData
 from sqlalchemy.schema import Column, Table
@@ -131,7 +132,7 @@ def infer_target_table(column_name: str, table_names: set[str]) -> str | None:
 # ============================================================
 
 
-def _location(table: Table, column: Column) -> str:
+def _location(table: Table, column: Column[Any]) -> str:
     qualified = f"{table.schema}.{table.name}" if table.schema else table.name
     return f"{qualified}.{column.name}"
 
@@ -218,7 +219,7 @@ def load_service_metadata(service: str) -> MetaData:
     base = getattr(module, "Base", None)
     if base is None:
         raise AttributeError(f"{module_path} does not expose a `Base` declarative class")
-    return base.metadata
+    return cast("MetaData", base.metadata)
 
 
 def check_service(service: str) -> tuple[list[str], list[str]]:
