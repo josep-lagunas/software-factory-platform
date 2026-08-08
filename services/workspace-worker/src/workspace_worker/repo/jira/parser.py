@@ -23,9 +23,17 @@ Unknown / extra headers are **ignored as delimiters**: a block whose stripped
 text is not one of the eight recognized headers does not start a new section.
 When a section is active such a block simply joins the active section's body;
 when no section is active it is dropped. An unknown section therefore never
-populates a *neighbor* recognized field (PRSpec test case 3). Missing or
-whitespace-only bodies map to ``None`` (the rubric treats ``None`` and
-whitespace-only identically — SFP-67).
+populates a *neighbor* recognized field (PRSpec test case 3).
+
+Presence vs absence (SFP-232): a section whose **header was seen** maps to a
+string value — the joined body when non-empty, or ``""`` when the body is
+empty/whitespace-only (present-but-empty). A section whose **header was never
+seen** maps to ``None`` (absent). This distinction is load-bearing for the
+readiness rubric: the two *boundary* ID-070 sections
+(``context_outputs_required_inputs``, ``dependencies``) are required as
+**presence only** at the human/automatic frontier, so the parser must let the
+rubric tell a declared-but-empty header (``""``) apart from a missing one
+(``None``). The field type stays ``str | None``.
 """
 
 from __future__ import annotations
@@ -91,7 +99,14 @@ def _adf_blocks(adf: dict[str, object]) -> list[str]:
 
 
 def _join_body(parts: list[str]) -> str | None:
-    """Join a section's body blocks and return ``None`` if empty/whitespace-only."""
+    """Join a section's body blocks; return ``None`` if empty/whitespace-only.
+
+    Low-level helper: it does NOT distinguish a *seen* header with an empty body
+    from an *absent* header — both yield ``None`` here. The caller
+    (:func:`adf_to_parsed_ticket`) tracks which section headers were declared and
+    post-processes declared-but-empty sections back to ``""`` so the rubric can
+    tell presence (``""``) apart from absence (``None``) — SFP-232.
+    """
     text = "\n".join(parts).strip()
     return text or None
 
@@ -102,9 +117,16 @@ def adf_to_parsed_ticket(adf: dict[str, object]) -> ParsedTicket:
     Walks the ADF tree depth-first to plain text at the block granularity, then
     splits the block stream on the eight recognized ID-070 section headers.
     Each section body is the text of the blocks between its header and the next
-    recognized header, stripped; a missing or whitespace-only body maps to
-    ``None``. Unknown / extra headers are ignored as delimiters (they do not
-    start a new section); blocks before the first recognized header are dropped.
+    recognized header, stripped.
+
+    Presence vs absence (SFP-232): a section whose **header was seen** maps to a
+    string — the body when non-empty, or ``""`` when its body is empty /
+    whitespace-only (present-but-empty). A section whose **header was never
+    seen** maps to ``None`` (absent). The field type stays ``str | None``; the
+    ``""`` vs ``None`` distinction is what lets the readiness rubric require the
+    two *boundary* sections as presence-only at the frontier. Unknown / extra
+    headers are ignored as delimiters (they do not start a new section); blocks
+    before the first recognized header are dropped.
 
     Args:
         adf: The ADF document (``{type: 'doc', content: [...]}``) — typically the
@@ -114,10 +136,15 @@ def adf_to_parsed_ticket(adf: dict[str, object]) -> ParsedTicket:
 
     Returns:
         A :class:`ParsedTicket` with each of the eight fields set to its section
-        body, or ``None`` where the section was absent / empty.
+        body (a non-empty string), ``""`` where the header was present but the
+        body was empty/whitespace-only, or ``None`` where the section header was
+        absent entirely.
     """
     blocks = _adf_blocks(adf)
     fields: dict[str, str | None] = {field: None for field in _SECTION_TO_FIELD.values()}
+    # SFP-232: track which section headers were *declared* (seen in the stream)
+    # so a declared-but-empty section can be distinguished from an absent one.
+    declared: set[str] = set()
     current: str | None = None
     parts: list[str] = []
     for block in blocks:
@@ -132,8 +159,16 @@ def adf_to_parsed_ticket(adf: dict[str, object]) -> ParsedTicket:
                 fields[current] = _join_body(parts)
                 parts = []
             current = _SECTION_TO_FIELD[header]
+            declared.add(current)
         elif current is not None:
             parts.append(block)
     if current is not None:
         fields[current] = _join_body(parts)
+    # SFP-232: a declared section whose body joined to ``None`` (empty /
+    # whitespace-only) is *present-but-empty* — map to ``""`` so the rubric can
+    # distinguish it from an absent section (``None``). Non-empty bodies and
+    # never-declared sections are left untouched.
+    for field in declared:
+        if fields[field] is None:
+            fields[field] = ""
     return ParsedTicket.model_validate(fields)

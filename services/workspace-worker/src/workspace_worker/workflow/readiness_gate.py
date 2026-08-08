@@ -127,6 +127,7 @@ def evaluate_readiness(
     runtime: AgentRuntime,
     prompt_provider: PromptProvider | None = None,
     ticket_id: str,
+    at_frontier: bool = False,
 ) -> ReadinessOutput:
     """Evaluate a ticket's readiness, composing the rubric (layer 1) with the
     model evaluator (layer 2).
@@ -166,12 +167,18 @@ def evaluate_readiness(
             :class:`PromptBuilder` against :data:`_DEFAULT_PROMPT_DIR` is used.
         ticket_id: The ticket identifier — always echoed into the result and
             never taken from the model output.
+        at_frontier: Whether the ticket sits at the human/automatic frontier
+            (SFP-232). Forwarded to the layer-1 rubric, where the two *boundary*
+            ID-070 sections are required as presence only iff this is ``True``.
+            Computed deterministically by
+            :func:`workspace_worker.workflow.frontier.compute_at_frontier`.
+            Defaults to ``False`` (off-frontier).
 
     Returns:
         The combined :class:`ReadinessOutput`.
     """
     # (1) Layer-1 rubric — authoritative, always runs (even on a model failure).
-    rubric = evaluate_readiness_rubric(ticket, ticket_id=ticket_id)
+    rubric = evaluate_readiness_rubric(ticket, ticket_id=ticket_id, at_frontier=at_frontier)
     rubric_failed = any(not passed for passed in rubric.rubric_results.values())
 
     # (2) Resolve the readiness prompt (ID-059: prompts live on disk, not here).

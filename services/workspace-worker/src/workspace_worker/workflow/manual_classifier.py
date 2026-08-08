@@ -72,6 +72,12 @@ def classify_manual(
     surface any missing ID-070 sections, then return a :class:`ReadinessOutput`
     whose ``verdict`` is :attr:`~ReadinessVerdict.MANUAL_REQUIRED`.
 
+    Note (SFP-232): a 👤-labeled ticket **is** the frontier by definition, so the
+    rubric is invoked with ``at_frontier=True`` — its two *boundary* sections are
+    required as presence only. (When ``is_manual`` is ``False`` this function
+    returns ``None`` before the rubric is ever called, so no frontier computation
+    is needed here.)
+
     Args:
         ticket: The parsed ticket whose ID-070 sections are rule-checked by the
             layer-1 rubric (its findings are surfaced to the human).
@@ -90,7 +96,9 @@ def classify_manual(
     if not is_manual:
         return None
 
-    rubric = evaluate_readiness_rubric(ticket, ticket_id=ticket_id)
+    # A 👤 ticket IS the frontier (SFP-232): the boundary sections are required
+    # as presence only. (is_manual False already returned above.)
+    rubric = evaluate_readiness_rubric(ticket, ticket_id=ticket_id, at_frontier=True)
 
     # Manual-required reason leads (the decisive classification); the rubric's
     # missing-section messages follow so a human sees any structural gaps too.
