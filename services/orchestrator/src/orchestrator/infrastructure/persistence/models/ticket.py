@@ -54,7 +54,12 @@ class Ticket(Base):
 
     One row per source ticket (e.g. a Jira issue). ``ticket_id`` is the immutable
     primary key (MAS §6.6); ``project_id`` is an identifier reference to the
-    parent Project with NO foreign key (MAS §6.5).
+    parent Project with NO foreign key (MAS §6.5). Per ID-058's bidirectional
+    deferral protocol, ``project_id`` is a *declared deferral* — the target
+    ``business.projects`` table lands in SFP-100, at which point SFP-100 MUST
+    add the real FK (close-on-landing). The in-code ``info`` marker below is how
+    a deferral is declared (never silent) and is what ``tools/fk_lint.py``
+    recognizes.
     """
 
     __tablename__ = "tickets"
@@ -76,7 +81,19 @@ class Ticket(Base):
     project_id: Mapped[uuid.UUID] = mapped_column(
         sa.Uuid(),
         nullable=False,
-        comment="Identifier reference to parent Project (no FK, MAS §6.5).",
+        # ID-058 deferral marker (recognized by tools/fk_lint.py, SFP-235):
+        # declares this plain column as a tracked same-service deferral, NOT a
+        # silent omission. `deferred_fk` is the FK obligation to be closed when
+        # the target lands; `blocked_on` is the ticket delivering that target.
+        # `info` is SQLAlchemy's tooling dict and does not change runtime
+        # behavior. SFP-100 owns the Project model and MUST add the real
+        # ``business.tickets.project_id -> business.projects(project_id)`` FK.
+        info={
+            "deferred_fk": "business.projects.project_id",
+            "blocked_on": "SFP-100",
+        },
+        comment="Identifier reference to parent Project (no FK, MAS §6.5); declared "
+        "deferral per ID-058 — target business.projects lands in SFP-100.",
     )
     workflow_status: Mapped[WorkflowStatus] = mapped_column(
         Enum(WorkflowStatus),

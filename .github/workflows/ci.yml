@@ -41,6 +41,12 @@ jobs:
         run: uv sync --all-packages --frozen
       - name: Mypy typecheck
         run: uv run mypy packages services
+      - name: Intra-service FK lint (ID-058, SFP-235)
+        # Introspects each service's ORM Base.metadata and fails on any plain
+        # _id column that references a same-service table without a FK (or a
+        # declared info={"deferred_fk",...} deferral). Needs all workspace
+        # packages installed so each service's Base is importable.
+        run: uv run python tools/fk_lint.py --all
 
   discover-members:
     runs-on: ubuntu-latest
