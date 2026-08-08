@@ -1,14 +1,17 @@
-"""Tests for :func:`workspace_worker.repo.jira.parser.adf_to_parsed_ticket` (SFP-225).
+"""Tests for :func:`workspace_worker.repo.jira.parser.adf_to_parsed_ticket` (SFP-225 / SFP-232).
 
 Pure unit tests — no network, no httpx. Covers the acceptance criteria:
 - (1) the eight-section oracle — a synthetic ADF with one heading + paragraph
   per ID-070 section (literal slash-bearing headers) populates every
   :class:`ParsedTicket` field;
-- (2) a missing section maps to ``None``;
+- (2) a missing section (header never seen) maps to ``None``;
 - (3) an unknown / extra section header is ignored (does not leak into a
   neighbor recognized field);
 - (4) nested ADF (paragraph inside list / table) is walked to text correctly;
-- (5) an empty / ``{}`` ADF yields an all-None :class:`ParsedTicket` (no raise).
+- (5) an empty / ``{}`` ADF yields an all-None :class:`ParsedTicket` (no raise);
+- (6) SFP-232 presence vs absence: a section whose header was SEEN but whose
+  body is empty/whitespace maps to ``""`` (present-but-empty), distinct from an
+  absent section whose header was never seen (``None``).
 
 The 8-header -> field oracle is encoded INDEPENDENTLY here (not imported from
 the implementation's ``_SECTION_TO_FIELD``) so the test is a genuine oracle —
@@ -124,18 +127,20 @@ def test_missing_sections_are_none() -> None:
             assert getattr(parsed, field) is None, f"field {field!r} should be None"
 
 
-def test_whitespace_only_body_is_none() -> None:
-    """A whitespace-only section body maps to None (same as absent — SFP-67)."""
+def test_whitespace_only_body_is_present_empty() -> None:
+    """SFP-232: a SEEN header with a whitespace-only body maps to ``""
+    (present-but-empty), NOT ``None``."""
     adf = _adf(_heading("Context"), _paragraph("   \n\t  "))
     parsed = adf_to_parsed_ticket(adf)
-    assert parsed.context is None
+    assert parsed.context == ""  # header was seen -> present-but-empty
 
 
-def test_header_with_no_body_is_none() -> None:
-    """A section header immediately followed by the next header has a None body."""
+def test_header_with_no_body_is_present_empty() -> None:
+    """SFP-232: a header immediately followed by the next header (no body blocks)
+    maps to ``""`` (present-but-empty), NOT ``None``."""
     adf = _adf(_heading("Context"), _heading("Requirements"), _paragraph("req body"))
     parsed = adf_to_parsed_ticket(adf)
-    assert parsed.context is None  # no body blocks between the two headers
+    assert parsed.context == ""  # header was seen but no body -> ""
     assert parsed.requirements == "req body"
 
 
@@ -306,3 +311,61 @@ def test_multi_paragraph_body_joined() -> None:
     assert parsed.context is not None
     assert "first paragraph" in parsed.context
     assert "second paragraph" in parsed.context
+
+
+# ---------------------------------------------------------------------------
+# (6) SFP-232: present-but-empty ("") distinguished from absent (None)
+# ---------------------------------------------------------------------------
+
+
+def test_present_empty_distinguished_from_absent() -> None:
+    """SFP-232: a SEEN header with an empty body is ``""``; an UNSEEN header is
+    ``None`` — the two are now distinguishable."""
+    adf = _adf(
+        _heading("Context"),  # seen, no body -> ""
+        _heading("Requirements"),  # seen, no body -> ""
+        _heading("Acceptance criteria"),  # seen, no body -> ""
+        _paragraph("ac body"),
+    )
+    parsed = adf_to_parsed_ticket(adf)
+
+    assert parsed.context == ""  # seen but empty
+    assert parsed.requirements == ""  # seen but empty
+    assert parsed.acceptance_criteria == "ac body"  # seen with body
+    # Headers never seen stay None (absent), NOT "".
+    assert parsed.files_to_create_modify is None
+    assert parsed.implementation_notes is None
+    assert parsed.references is None
+    assert parsed.context_outputs_required_inputs is None
+    assert parsed.dependencies is None
+
+
+def test_markdown_boundary_header_empty_then_next_section() -> None:
+    """SFP-232: real Jira descriptions carry ``## Header`` markdown prefixes.
+    A ``## Context outputs / required inputs`` header immediately followed by
+    ``## Acceptance criteria`` yields ``context_outputs_required_inputs == ""``,
+    NOT ``None`` (presence detected)."""
+    adf = _adf(
+        _heading("## Context outputs / required inputs"),
+        _heading("## Acceptance criteria"),
+        _paragraph("ac body"),
+    )
+    parsed = adf_to_parsed_ticket(adf)
+
+    assert parsed.context_outputs_required_inputs == ""  # seen, empty body
+    assert parsed.acceptance_criteria == "ac body"
+
+
+def test_markdown_boundary_header_with_body() -> None:
+    """SFP-232: a markdown boundary header WITH a body is parsed normally
+    (non-empty content preserved; not collapsed to ``""``)."""
+    adf = _adf(
+        _heading("## Dependencies"),
+        _paragraph("depends on SFP-X"),
+        _heading("## Acceptance criteria"),
+        _paragraph("ac body"),
+    )
+    parsed = adf_to_parsed_ticket(adf)
+
+    assert parsed.dependencies == "depends on SFP-X"
+    assert parsed.acceptance_criteria == "ac body"

@@ -185,17 +185,23 @@ def _reviewer_output(approved: bool) -> dict[str, Any]:
 
 
 class FakeJiraClient:
-    def __init__(self, parsed: ParsedTicket | None = None) -> None:
+    def __init__(
+        self,
+        parsed: ParsedTicket | None = None,
+        labels: tuple[str, ...] = (),
+    ) -> None:
         self.parsed = parsed if parsed is not None else _ready_ticket()
+        self.labels = labels
         self.transitions: list[tuple[str, str]] = []
 
     def fetch_issue(self, key: str) -> Any:
         class _Issue:
-            def __init__(self, k: str, p: ParsedTicket) -> None:
+            def __init__(self, k: str, p: ParsedTicket, lbls: tuple[str, ...]) -> None:
                 self.key = k
                 self.parsed = p
+                self.labels = lbls  # SFP-232: JiraIssueResult carries .labels
 
-        return _Issue(key, self.parsed)
+        return _Issue(key, self.parsed, self.labels)
 
     def transition(self, key: str, transition_id: str) -> Any:
         self.transitions.append((key, transition_id))
