@@ -29,15 +29,23 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Args: first positional (or $TICKET) is the ticket; the rest forward through.
+# Args: first positional (or $TICKET env) is the ticket; the rest forward
+# through. Only consume $1 when it was actually used as the ticket — if $TICKET
+# came from the environment, $1 is the first pipeline arg and must NOT shift.
 # ---------------------------------------------------------------------------
-TICKET="${TICKET:-${1:-}}"
-if [[ -z "$TICKET" ]]; then
+TICKET_FROM_ARG=0
+if [[ -z "${TICKET:-}" && -n "${1:-}" ]]; then
+  TICKET="$1"
+  TICKET_FROM_ARG=1
+fi
+if [[ -z "${TICKET:-}" ]]; then
   echo "usage: $0 <SFP-XXX> [--slug <slug>] [--resume] [--base-branch <branch>]" >&2
+  echo "       (or: TICKET=SFP-XXX $0 [--resume])" >&2
   exit 64
 fi
-# Drop the ticket from $1 so "$@" is pure pipeline args; re-add it explicitly.
-shift 2>/dev/null || true
+# Drop the ticket positional only if we consumed $1 as it; "$@" is then pure
+# pipeline args, re-added explicitly via --ticket below.
+[[ "$TICKET_FROM_ARG" -eq 1 ]] && shift
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
@@ -63,8 +71,16 @@ fi
 : "${SFP_ANTHROPIC_BASE_URL:="$ANTHROPIC_BASE_URL"}"
 : "${SFP_DEFAULT_MODEL:="glm-4.6"}"                       # floor for emit-JSON agents
 : "${SFP_AGENT_MODEL_CODER:="${MODEL_CODER:-glm-5.2}"}"   # Coder on the capable tier
-: "${SFP_AGENT_MODEL_PLANNER:="${MODEL_PLANNER:-}"}"
-: "${SFP_AGENT_MODEL_REVIEWER:="${MODEL_REVIEWER:-}"}"
+# Planner/Reviewer overrides are OPTIONAL: AgentModelConfig rejects empty/
+# whitespace strings (model_config.py _check_non_empty), so only set them when a
+# value is actually provided (an existing SFP_AGENT_MODEL_* or the convenience
+# MODEL_PLANNER/MODEL_REVIEWER). Unset => os.environ.get returns None => optional.
+if [[ -z "${SFP_AGENT_MODEL_PLANNER:-}" && -n "${MODEL_PLANNER:-}" ]]; then
+  SFP_AGENT_MODEL_PLANNER="$MODEL_PLANNER"
+fi
+if [[ -z "${SFP_AGENT_MODEL_REVIEWER:-}" && -n "${MODEL_REVIEWER:-}" ]]; then
+  SFP_AGENT_MODEL_REVIEWER="$MODEL_REVIEWER"
+fi
 # SecretRef is a pydantic model (extra="forbid", field `name`) -> the env value
 # is parsed as JSON; a bare name raises SettingsError. MUST be JSON. The literal
 # is held in single quotes (so its inner double-quotes are data, not delimiters)
@@ -81,10 +97,12 @@ SECRET_REF_JSON='{"name":"ANTHROPIC_AUTH_TOKEN"}'
 : "${SFP_GIT_REPO:="software-factory-platform"}"
 : "${SFP_WORKTREE_BASE:="/tmp/sfp-worktrees"}"
 
-export SFP_ANTHROPIC_BASE_URL SFP_DEFAULT_MODEL \
-       SFP_AGENT_MODEL_CODER SFP_AGENT_MODEL_PLANNER SFP_AGENT_MODEL_REVIEWER \
+export SFP_ANTHROPIC_BASE_URL SFP_DEFAULT_MODEL SFP_AGENT_MODEL_CODER \
        SFP_LLM_PROVIDER_SECRET_REF SFP_JIRA_EMAIL SFP_JIRA_SITE \
        SFP_GIT_OWNER SFP_GIT_REPO SFP_WORKTREE_BASE
+# Optional per-role overrides: export only when set (empty would crash the gate).
+[[ -n "${SFP_AGENT_MODEL_PLANNER:-}" ]] && export SFP_AGENT_MODEL_PLANNER
+[[ -n "${SFP_AGENT_MODEL_REVIEWER:-}" ]] && export SFP_AGENT_MODEL_REVIEWER
 # Secrets the LocalSecretProvider resolves by name (kept unprefixed, as in .env):
 export ANTHROPIC_AUTH_TOKEN JIRA_API_TOKEN GITHUB_TOKEN_CODER GITHUB_TOKEN_REVIEWER
 
