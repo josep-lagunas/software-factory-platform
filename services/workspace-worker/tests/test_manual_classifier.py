@@ -61,12 +61,32 @@ def test_manual_full_ticket_is_manual_required() -> None:
     # The manual reason leads blocking_ambiguities; a clean ticket adds nothing else.
     assert result.blocking_ambiguities == [MANUAL_REQUIRED_REASON]
     # rubric_results are the layer-1 pass-through (all True for a full ticket).
+    # SFP-232: classify_manual invokes the rubric with at_frontier=True (a 👤
+    # ticket IS the frontier); compare against that same call.
     assert (
         result.rubric_results
-        == evaluate_readiness_rubric(_full_ticket(), ticket_id=_TICKET_ID).rubric_results
+        == evaluate_readiness_rubric(
+            _full_ticket(), ticket_id=_TICKET_ID, at_frontier=True
+        ).rubric_results
     )
     assert all(result.rubric_results.values())
     assert result.missing_inputs == []
+
+
+def test_manual_ticket_runs_rubric_at_frontier() -> None:
+    """SFP-232: a 👤 ticket IS the frontier, so the rubric runs at_frontier=True
+    — an absent BOUNDARY section is surfaced (presence required) even though the
+    manual verdict still wins precedence."""
+    boundary = "dependencies"
+    ticket = _ticket_with(boundary, None)  # boundary absent
+    result = classify_manual(ticket, is_manual=True, ticket_id=_TICKET_ID)
+
+    assert result is not None
+    # Manual precedence: still MANUAL_REQUIRED (not NEEDS_CLARIFICATION).
+    assert result.verdict is ReadinessVerdict.MANUAL_REQUIRED
+    # The frontier rubric finding IS surfaced to the human.
+    assert f"Missing required section (frontier): {boundary}" in result.blocking_ambiguities
+    assert result.rubric_results[boundary] is False
 
 
 def test_manual_reason_leads_even_with_missing_section() -> None:

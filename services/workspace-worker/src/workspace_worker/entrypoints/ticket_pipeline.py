@@ -84,6 +84,7 @@ from workspace_worker.repo.jira.client import JiraClient
 from workspace_worker.repo.manager import RepoManager
 from workspace_worker.repo.worktree import WorktreeManager, _sanitize_job_id
 from workspace_worker.workflow.context_resolver import resolve_context
+from workspace_worker.workflow.frontier import compute_at_frontier
 from workspace_worker.workflow.readiness_gate import evaluate_readiness
 
 __all__ = ["PipelineDeps", "PipelineResult", "build", "main", "run_pipeline"]
@@ -333,13 +334,19 @@ def run_pipeline(
     # 2. Readiness gate — uses a DEDICATED readiness runtime (ReadinessOutput
     # contract), NOT the planner runtime (PlannerOutput) — contract mismatch
     # made the gate fail-closed (SMOKE-PATCH, local, formalize via PR).
+    # SFP-232: compute the human/automatic frontier flag deterministically from
+    # the issue's labels + the offline DAG, and forward it to the rubric so the
+    # two *boundary* ID-070 sections are required (presence only) just at the
+    # frontier. compute_at_frontier fails safe on a missing/corrupt DAG file.
     trace.append("evaluate_readiness")
+    at_frontier = compute_at_frontier(ticket_key, issue.labels)
     readiness = evaluate_readiness(
         ticket,
         resolved,
         runtime=runtimes["readiness"],
         prompt_provider=prompt_provider,
         ticket_id=ticket_key,
+        at_frontier=at_frontier,
     )
     if readiness.verdict is not ReadinessVerdict.READY:
         return _abort(trace, None, f"readiness gate not READY: {readiness.verdict.value}")

@@ -1,17 +1,20 @@
-"""Tests for :func:`evaluate_readiness_rubric` (SFP-67; ID-064 layer 1).
+"""Tests for :func:`evaluate_readiness_rubric` (SFP-67 / SFP-232; ID-064 layer 1).
 
-Covers the acceptance criteria:
-- (a) all-present ticket -> READY, every section True, empty blocking_ambiguities;
-- (b) each section missing (None) in isolation -> that section False, a reason
-  naming it, NEEDS_CLARIFICATION, all others True;
-- (c) each whitespace-only section in isolation -> missing (same as None);
-- (d) ticket_id is echoed into the output;
-- (e) the verdict is never MANUAL_REQUIRED (always READY or NEEDS_CLARIFICATION);
-- (f) rubric_results keys are exactly the fixed eight ID-070 section names;
-- (g) determinism: the same inputs always yield an equal output.
+Covers the *calibrated* acceptance criteria (SFP-232):
+- 6 CORE sections required ALWAYS (present + non-empty), off- and on-frontier;
+- 2 BOUNDARY sections (``context_outputs_required_inputs``, ``dependencies``):
+  - at the frontier (``at_frontier=True``): absent (``None``) FAILS with a
+    "(frontier)" reason; present-empty (``""``) PASSES; non-empty PASSES;
+  - off the frontier (``at_frontier=False``, the default): always PASS, whether
+    absent (``None``) or present-empty (``"");
+- ``at_frontier`` defaults to ``False``;
+- ``rubric_results`` always carries all 8 keys (stable contract);
+- the verdict is never ``MANUAL_REQUIRED`` (always READY or NEEDS_CLARIFICATION);
+- determinism.
 
-The expected section set is encoded INDEPENDENTLY here (not imported from the
-implementation's ``_REQUIRED_SECTIONS``) so the test is a genuine oracle.
+The section sets are encoded INDEPENDENTLY here (not imported from the
+implementation's ``_CORE_SECTIONS`` / ``_BOUNDARY_SECTIONS``) so the test is a
+genuine oracle.
 """
 
 import pytest
@@ -22,21 +25,27 @@ from sfp_contracts.agents.readiness import (
 )
 from workspace_worker.workflow.readiness_rubric import evaluate_readiness_rubric
 
-#: Independent oracle: the eight mandatory ID-070 section names, encoded here
-#: WITHOUT consulting the implementation's ``_REQUIRED_SECTIONS`` tuple.
-SECTIONS: tuple[str, ...] = (
+#: Independent oracle: the six CORE ID-070 section names (always required).
+CORE_SECTIONS: tuple[str, ...] = (
     "context",
     "requirements",
     "files_to_create_modify",
     "implementation_notes",
     "references",
-    "context_outputs_required_inputs",
     "acceptance_criteria",
+)
+
+#: Independent oracle: the two BOUNDARY ID-070 section names (conditional).
+BOUNDARY_SECTIONS: tuple[str, ...] = (
+    "context_outputs_required_inputs",
     "dependencies",
 )
+
+#: All eight sections, core then boundary.
+SECTIONS: tuple[str, ...] = CORE_SECTIONS + BOUNDARY_SECTIONS
 SECTION_SET: set[str] = set(SECTIONS)
 
-_TICKET_ID = "sfp-67-readiness-rubric"
+_TICKET_ID = "sfp-232-readiness-rubric"
 
 
 def _full_ticket() -> ParsedTicket:
@@ -51,14 +60,31 @@ def _ticket_with(section: str, value: str | None) -> ParsedTicket:
     return ParsedTicket(**kwargs)
 
 
+def _core_only_ticket() -> ParsedTicket:
+    """A ticket with the 6 core sections non-empty and the 2 boundary ``None``.
+
+    The READY baseline off-frontier (boundary optional) and a FAIL off/on-frontier
+    only if a core section is missing.
+    """
+    kwargs: dict[str, str | None] = {name: f"<{name} content>" for name in CORE_SECTIONS}
+    return ParsedTicket(**kwargs)
+
+
 def test_section_oracle_covers_eight() -> None:
-    """Guard: the oracle table is exactly the eight ID-070 sections."""
+    """Guard: the oracle tables partition exactly the eight ID-070 sections."""
     assert len(SECTIONS) == 8
     assert len(SECTION_SET) == 8
+    assert set(CORE_SECTIONS).isdisjoint(BOUNDARY_SECTIONS)
+    assert SECTION_SET == set(CORE_SECTIONS) | set(BOUNDARY_SECTIONS)
 
 
-def test_all_present_yields_ready_all_true() -> None:
-    """(a) A fully-populated ticket is READY with every section True."""
+# ---------------------------------------------------------------------------
+# CORE sections: always required (present + non-empty)
+# ---------------------------------------------------------------------------
+
+
+def test_all_present_yields_ready_all_true_off_frontier() -> None:
+    """A fully-populated ticket is READY off-frontier with every section True."""
     result = evaluate_readiness_rubric(_full_ticket(), ticket_id=_TICKET_ID)
 
     assert result.verdict is ReadinessVerdict.READY
@@ -69,108 +95,236 @@ def test_all_present_yields_ready_all_true() -> None:
     assert result.ticket_id == _TICKET_ID
 
 
-@pytest.mark.parametrize("section", list(SECTIONS))
-def test_missing_none_section_is_false_and_blocks(section: str) -> None:
-    """(b) A ``None`` section is False, names itself in a reason, and blocks."""
-    result = evaluate_readiness_rubric(_ticket_with(section, None), ticket_id=_TICKET_ID)
+def test_all_present_yields_ready_on_frontier() -> None:
+    """A fully-populated ticket is READY on-frontier too."""
+    result = evaluate_readiness_rubric(_full_ticket(), ticket_id=_TICKET_ID, at_frontier=True)
 
-    assert isinstance(result, ReadinessOutput)
-    assert result.ticket_id == _TICKET_ID
-    assert result.verdict is ReadinessVerdict.NEEDS_CLARIFICATION
-    assert result.missing_inputs == []
-    # The failing section is the only False entry.
-    assert result.rubric_results[section] is False
-    assert [k for k, v in result.rubric_results.items() if not v] == [section]
-    # Exactly one reason, and it names the section.
-    assert len(result.blocking_ambiguities) == 1
-    assert result.blocking_ambiguities == [f"Missing required section: {section}"]
-    # All other sections remain True.
-    for other in SECTIONS:
-        if other != section:
-            assert result.rubric_results[other] is True
+    assert result.verdict is ReadinessVerdict.READY
+    assert all(result.rubric_results.values())
+    assert result.blocking_ambiguities == []
 
 
-@pytest.mark.parametrize("section", list(SECTIONS))
-def test_whitespace_only_section_treated_as_missing(section: str) -> None:
-    """(c) A whitespace-only section is missing, identical to ``None``."""
+@pytest.mark.parametrize("at_frontier", [False, True], ids=["off-frontier", "frontier"])
+def test_core_missing_none_is_false_and_blocks(at_frontier: bool) -> None:
+    """Each CORE section ``None`` -> False + 'Missing required section: X', both
+    off- and on-frontier (core sections are ALWAYS required)."""
+    for section in CORE_SECTIONS:
+        result = evaluate_readiness_rubric(
+            _ticket_with(section, None), ticket_id=_TICKET_ID, at_frontier=at_frontier
+        )
+
+        assert isinstance(result, ReadinessOutput)
+        assert result.ticket_id == _TICKET_ID
+        assert result.verdict is ReadinessVerdict.NEEDS_CLARIFICATION
+        assert result.missing_inputs == []
+        assert result.rubric_results[section] is False
+        assert [k for k, v in result.rubric_results.items() if not v] == [section]
+        assert len(result.blocking_ambiguities) == 1
+        assert result.blocking_ambiguities == [f"Missing required section: {section}"]
+        for other in SECTIONS:
+            if other != section:
+                assert result.rubric_results[other] is True
+
+
+@pytest.mark.parametrize("section", list(CORE_SECTIONS))
+def test_core_whitespace_only_treated_as_missing(section: str) -> None:
+    """A whitespace-only CORE section is missing (same as None)."""
     result = evaluate_readiness_rubric(_ticket_with(section, "   \n\t  "), ticket_id=_TICKET_ID)
 
     assert result.verdict is ReadinessVerdict.NEEDS_CLARIFICATION
     assert result.rubric_results[section] is False
-    assert [k for k, v in result.rubric_results.items() if not v] == [section]
     assert result.blocking_ambiguities == [f"Missing required section: {section}"]
 
 
-@pytest.mark.parametrize("section", list(SECTIONS))
-def test_punctuation_only_section_is_present(section: str) -> None:
-    """R4 — non-empty punctuation-only content is NOT missing (not stripped to empty)."""
-    result = evaluate_readiness_rubric(_ticket_with(section, "..."), ticket_id=_TICKET_ID)
+@pytest.mark.parametrize("section", list(CORE_SECTIONS))
+def test_core_present_empty_string_treated_as_missing(section: str) -> None:
+    """A present-but-empty (``""``) CORE section is still missing (core requires
+    a non-empty body, even at the frontier)."""
+    result = evaluate_readiness_rubric(
+        _ticket_with(section, ""), ticket_id=_TICKET_ID, at_frontier=True
+    )
+
+    assert result.rubric_results[section] is False
+    assert result.blocking_ambiguities == [f"Missing required section: {section}"]
+
+
+# ---------------------------------------------------------------------------
+# BOUNDARY sections: presence-only iff at_frontier; optional off-frontier
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("section", list(BOUNDARY_SECTIONS))
+def test_boundary_absent_passes_off_frontier(section: str) -> None:
+    """Off-frontier: an absent (None) boundary section PASSES."""
+    result = evaluate_readiness_rubric(
+        _ticket_with(section, None), ticket_id=_TICKET_ID, at_frontier=False
+    )
 
     assert result.verdict is ReadinessVerdict.READY
     assert result.rubric_results[section] is True
     assert result.blocking_ambiguities == []
 
 
-@pytest.mark.parametrize("section", list(SECTIONS))
-def test_ticket_id_echoed(section: str) -> None:
-    """(d) The ticket_id argument is echoed into ReadinessOutput.ticket_id."""
-    tid = f"SFP-67#{section}"
-    result = evaluate_readiness_rubric(_ticket_with(section, None), ticket_id=tid)
-    assert result.ticket_id == tid
+@pytest.mark.parametrize("section", list(BOUNDARY_SECTIONS))
+def test_boundary_present_empty_passes_off_frontier(section: str) -> None:
+    """Off-frontier: a present-but-empty (``""``) boundary section PASSES."""
+    result = evaluate_readiness_rubric(
+        _ticket_with(section, ""), ticket_id=_TICKET_ID, at_frontier=False
+    )
+
+    assert result.verdict is ReadinessVerdict.READY
+    assert result.rubric_results[section] is True
+
+
+@pytest.mark.parametrize("section", list(BOUNDARY_SECTIONS))
+def test_boundary_absent_fails_at_frontier(section: str) -> None:
+    """At the frontier: an absent (None) boundary section FAILS with a
+    '(frontier)' reason (presence is required)."""
+    result = evaluate_readiness_rubric(
+        _ticket_with(section, None), ticket_id=_TICKET_ID, at_frontier=True
+    )
+
+    assert result.verdict is ReadinessVerdict.NEEDS_CLARIFICATION
+    assert result.rubric_results[section] is False
+    assert [k for k, v in result.rubric_results.items() if not v] == [section]
+    assert result.blocking_ambiguities == [f"Missing required section (frontier): {section}"]
+
+
+@pytest.mark.parametrize("section", list(BOUNDARY_SECTIONS))
+def test_boundary_present_empty_passes_at_frontier(section: str) -> None:
+    """At the frontier: a present-but-empty (``""``) boundary section PASSES —
+    presence is the requirement, the body may be empty."""
+    result = evaluate_readiness_rubric(
+        _ticket_with(section, ""), ticket_id=_TICKET_ID, at_frontier=True
+    )
+
+    assert result.verdict is ReadinessVerdict.READY
+    assert result.rubric_results[section] is True
+    assert result.blocking_ambiguities == []
+
+
+@pytest.mark.parametrize("section", list(BOUNDARY_SECTIONS))
+def test_boundary_non_empty_passes_at_frontier(section: str) -> None:
+    """At the frontier: a non-empty boundary section PASSES."""
+    result = evaluate_readiness_rubric(
+        _ticket_with(section, "<boundary body>"), ticket_id=_TICKET_ID, at_frontier=True
+    )
+
+    assert result.verdict is ReadinessVerdict.READY
+    assert result.rubric_results[section] is True
+
+
+@pytest.mark.parametrize("section", list(BOUNDARY_SECTIONS))
+def test_boundary_whitespace_treated_as_present_at_frontier(section: str) -> None:
+    """At the frontier: a whitespace-only boundary body is present-but-empty
+    (the parser would yield ``""``); the rubric only checks presence -> PASS.
+
+    A direct whitespace value is NOT ``None`` so it counts as present; the
+    presence-only check passes.
+    """
+    result = evaluate_readiness_rubric(
+        _ticket_with(section, "   "), ticket_id=_TICKET_ID, at_frontier=True
+    )
+
+    assert result.rubric_results[section] is True
+    assert result.verdict is ReadinessVerdict.READY
+
+
+# ---------------------------------------------------------------------------
+# at_frontier default + contract stability
+# ---------------------------------------------------------------------------
+
+
+def test_at_frontier_defaults_to_false() -> None:
+    """The default frontier mode is off (boundary sections optional)."""
+    # A ticket with absent boundary sections is READY under the default.
+    result = evaluate_readiness_rubric(_core_only_ticket(), ticket_id=_TICKET_ID)
+
+    assert result.verdict is ReadinessVerdict.READY
+    assert all(result.rubric_results.values())  # boundary True (optional)
+
+
+def test_core_only_ticket_blocks_at_frontier() -> None:
+    """A core-only ticket (boundary absent) FAILS at the frontier."""
+    result = evaluate_readiness_rubric(_core_only_ticket(), ticket_id=_TICKET_ID, at_frontier=True)
+
+    assert result.verdict is ReadinessVerdict.NEEDS_CLARIFICATION
+    # Both boundary sections fail (absent at the frontier).
+    failed = [k for k, v in result.rubric_results.items() if not v]
+    assert set(failed) == set(BOUNDARY_SECTIONS)
+    assert all(
+        f"Missing required section (frontier): {s}" in result.blocking_ambiguities
+        for s in BOUNDARY_SECTIONS
+    )
 
 
 @pytest.mark.parametrize("section", list(SECTIONS))
-def test_verdict_never_manual_required(section: str) -> None:
-    """(e) The rubric never emits MANUAL_REQUIRED (reserved for SFP-52)."""
-    result = evaluate_readiness_rubric(_ticket_with(section, None), ticket_id=_TICKET_ID)
+@pytest.mark.parametrize("at_frontier", [False, True])
+def test_verdict_never_manual_required(section: str, at_frontier: bool) -> None:
+    """The rubric never emits MANUAL_REQUIRED (reserved for SFP-52)."""
+    result = evaluate_readiness_rubric(
+        _ticket_with(section, None), ticket_id=_TICKET_ID, at_frontier=at_frontier
+    )
     assert result.verdict in {ReadinessVerdict.READY, ReadinessVerdict.NEEDS_CLARIFICATION}
     assert result.verdict is not ReadinessVerdict.MANUAL_REQUIRED
 
 
-def test_all_missing_yields_all_false_needs_clarification() -> None:
-    """A bare (all-None) ticket fails every section with eight distinct reasons."""
-    result = evaluate_readiness_rubric(ParsedTicket(), ticket_id=_TICKET_ID)
-
-    assert result.verdict is ReadinessVerdict.NEEDS_CLARIFICATION
-    assert not any(result.rubric_results.values())
-    assert len(result.blocking_ambiguities) == 8
-    # Eight distinct reasons, each naming a different section.
-    assert len(set(result.blocking_ambiguities)) == 8
-    assert set(result.rubric_results) == SECTION_SET
-
-
-def test_rubric_results_keys_exactly_the_fixed_eight() -> None:
-    """(f) rubric_results keys are set-equal to the eight ID-070 names (READY)."""
+def test_rubric_results_keys_always_the_fixed_eight() -> None:
+    """rubric_results keys are set-equal to the eight ID-070 names (READY)."""
     result = evaluate_readiness_rubric(_full_ticket(), ticket_id=_TICKET_ID)
     assert set(result.rubric_results.keys()) == SECTION_SET
     assert len(result.rubric_results) == 8
 
 
-def test_rubric_results_keys_fixed_even_when_missing() -> None:
-    """(f) The fixed key set holds even when sections are missing."""
+def test_rubric_results_keys_fixed_even_when_core_missing() -> None:
+    """The fixed key set holds even when sections are missing."""
     result = evaluate_readiness_rubric(ParsedTicket(), ticket_id=_TICKET_ID)
     assert set(result.rubric_results.keys()) == SECTION_SET
 
 
-def test_determinism_same_inputs_equal_output() -> None:
-    """(g) Calling twice with the same inputs yields equal outputs (READY case)."""
-    a = evaluate_readiness_rubric(_full_ticket(), ticket_id=_TICKET_ID)
-    b = evaluate_readiness_rubric(_full_ticket(), ticket_id=_TICKET_ID)
+def test_ticket_id_echoed() -> None:
+    """The ticket_id argument is echoed into ReadinessOutput.ticket_id."""
+    tid = "SFP-232#echo"
+    result = evaluate_readiness_rubric(_full_ticket(), ticket_id=tid)
+    assert result.ticket_id == tid
+
+
+# ---------------------------------------------------------------------------
+# determinism
+# ---------------------------------------------------------------------------
+
+
+def test_determinism_same_inputs_equal_output_ready() -> None:
+    """Calling twice with the same inputs yields equal outputs (READY case)."""
+    a = evaluate_readiness_rubric(_full_ticket(), ticket_id=_TICKET_ID, at_frontier=True)
+    b = evaluate_readiness_rubric(_full_ticket(), ticket_id=_TICKET_ID, at_frontier=True)
     assert a == b
     assert a.to_json() == b.to_json()
 
 
 def test_determinism_same_inputs_equal_output_blocked() -> None:
-    """(g) Determinism for the NEEDS_CLARIFICATION case (ordering matters)."""
-    a = evaluate_readiness_rubric(ParsedTicket(), ticket_id=_TICKET_ID)
-    b = evaluate_readiness_rubric(ParsedTicket(), ticket_id=_TICKET_ID)
+    """Determinism for the NEEDS_CLARIFICATION case (ordering matters)."""
+    a = evaluate_readiness_rubric(ParsedTicket(), ticket_id=_TICKET_ID, at_frontier=True)
+    b = evaluate_readiness_rubric(ParsedTicket(), ticket_id=_TICKET_ID, at_frontier=True)
     assert a == b
     assert a.blocking_ambiguities == b.blocking_ambiguities
-    # The eight reasons appear in canonical section order (deterministic).
-    assert a.blocking_ambiguities == [f"Missing required section: {s}" for s in SECTIONS]
+    # 6 core (always fail) + 2 boundary (fail at frontier) = 8 reasons, in order.
+    expected = [f"Missing required section: {s}" for s in CORE_SECTIONS] + [
+        f"Missing required section (frontier): {s}" for s in BOUNDARY_SECTIONS
+    ]
+    assert a.blocking_ambiguities == expected
 
 
-def test_blocking_ambiguity_reason_format() -> None:
-    """The reason string format is exactly 'Missing required section: <name>'."""
-    result = evaluate_readiness_rubric(_ticket_with("requirements", None), ticket_id=_TICKET_ID)
-    assert result.blocking_ambiguities == ["Missing required section: requirements"]
+def test_blocking_ambiguity_reason_formats() -> None:
+    """Both reason string formats are exactly as specified."""
+    core_result = evaluate_readiness_rubric(
+        _ticket_with("requirements", None), ticket_id=_TICKET_ID
+    )
+    assert core_result.blocking_ambiguities == ["Missing required section: requirements"]
+
+    frontier_result = evaluate_readiness_rubric(
+        _ticket_with("dependencies", None), ticket_id=_TICKET_ID, at_frontier=True
+    )
+    assert frontier_result.blocking_ambiguities == [
+        "Missing required section (frontier): dependencies"
+    ]

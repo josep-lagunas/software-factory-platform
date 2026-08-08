@@ -45,6 +45,10 @@ SECTIONS: tuple[str, ...] = (
     "dependencies",
 )
 
+#: Independent oracle: the two BOUNDARY ID-070 sections (SFP-232) — required as
+#: presence only iff at_frontier.
+BOUNDARY_SECTIONS: tuple[str, ...] = ("context_outputs_required_inputs", "dependencies")
+
 _TICKET_ID = "SFP-68"
 _AGENT = "readiness"
 _TASK = "evaluate"
@@ -498,3 +502,62 @@ def test_determinism_equal_inputs_equal_outputs() -> None:
     assert a.missing_inputs == b.missing_inputs
     assert a.to_json() == b.to_json()
     assert isinstance(a, ReadinessOutput)
+
+
+# --- at_frontier plumbing (SFP-232) ----------------------------------------
+
+
+@pytest.mark.parametrize("boundary", list(BOUNDARY_SECTIONS))
+def test_at_frontier_boundary_absent_forces_needs_clarification(boundary: str) -> None:
+    """SFP-232: at the frontier, an absent boundary section fails the rubric
+    even when the model says READY -> NEEDS_CLARIFICATION."""
+    runtime = _FakeRuntime(result=_success(_model_dict(verdict=ReadinessVerdict.READY)))
+
+    result = evaluate_readiness(
+        _ticket_missing(boundary, None),  # boundary absent
+        _resolved(),
+        runtime=runtime,
+        ticket_id=_TICKET_ID,
+        at_frontier=True,
+    )
+
+    assert result.verdict is ReadinessVerdict.NEEDS_CLARIFICATION
+    assert f"Missing required section (frontier): {boundary}" in result.blocking_ambiguities
+    assert result.rubric_results[boundary] is False
+
+
+@pytest.mark.parametrize("boundary", list(BOUNDARY_SECTIONS))
+def test_off_frontier_boundary_absent_is_ready(boundary: str) -> None:
+    """SFP-232: off the frontier (the default), an absent boundary section does
+    NOT fail the rubric -> READY when the model agrees."""
+    runtime = _FakeRuntime(result=_success(_model_dict(verdict=ReadinessVerdict.READY)))
+
+    result = evaluate_readiness(
+        _ticket_missing(boundary, None),  # boundary absent, but off-frontier
+        _resolved(),
+        runtime=runtime,
+        ticket_id=_TICKET_ID,
+        # at_frontier defaults to False
+    )
+
+    assert result.verdict is ReadinessVerdict.READY
+    assert result.blocking_ambiguities == []
+    assert result.rubric_results[boundary] is True
+
+
+@pytest.mark.parametrize("boundary", list(BOUNDARY_SECTIONS))
+def test_at_frontier_boundary_present_empty_is_ready(boundary: str) -> None:
+    """SFP-232: at the frontier, a present-but-empty (``""``) boundary section
+    PASSES (presence is the requirement) -> READY when the model agrees."""
+    runtime = _FakeRuntime(result=_success(_model_dict(verdict=ReadinessVerdict.READY)))
+
+    result = evaluate_readiness(
+        _ticket_missing(boundary, ""),  # boundary present-but-empty
+        _resolved(),
+        runtime=runtime,
+        ticket_id=_TICKET_ID,
+        at_frontier=True,
+    )
+
+    assert result.verdict is ReadinessVerdict.READY
+    assert result.rubric_results[boundary] is True
