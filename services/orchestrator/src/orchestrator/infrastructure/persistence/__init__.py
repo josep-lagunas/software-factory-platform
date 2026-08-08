@@ -1,10 +1,16 @@
 """Orchestrator Service persistence layer (ID-058).
 
-Exposes the per-service ``Base``. ORM table models are downstream
-(SFP-83..88) and do not exist yet; this package will re-export them as they
-land. All Orchestrator ORM tables register against ``Base.metadata``.
+Exposes the per-service ``Base`` and the ``Ticket`` table model (+ the
+``WorkflowStatus`` enum). All Orchestrator ORM tables register against
+``Base.metadata``; importing ``Base`` from this package also imports the
+``models`` submodule, so every mapped table is registered and visible to the
+Alembic ``target_metadata`` (see ``migrations/env.py``).
 """
 
 from orchestrator.infrastructure.persistence.base import Base
+from orchestrator.infrastructure.persistence.models import (
+    Ticket,
+    WorkflowStatus,
+)
 
-__all__ = ["Base"]
+__all__ = ["Base", "Ticket", "WorkflowStatus"]

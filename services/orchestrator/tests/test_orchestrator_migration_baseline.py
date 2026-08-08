@@ -167,12 +167,14 @@ def test_base_is_a_declarative_base() -> None:
     assert issubclass(Base, DeclarativeBase)
 
 
-def test_persistence_package_exports_base_only() -> None:
-    """No models exist yet; the package exports Base only."""
+def test_persistence_package_exports_base_and_ticket_models() -> None:
+    """The package exports Base plus the landed Ticket model + WorkflowStatus."""
     import orchestrator.infrastructure.persistence as pkg
 
     assert hasattr(pkg, "Base")
-    assert pkg.__all__ == ["Base"]
+    assert hasattr(pkg, "Ticket")
+    assert hasattr(pkg, "WorkflowStatus")
+    assert pkg.__all__ == ["Base", "Ticket", "WorkflowStatus"]
 
 
 # --- alembic.ini ------------------------------------------------------------
