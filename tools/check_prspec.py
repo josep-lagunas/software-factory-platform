@@ -7,6 +7,12 @@ top-level key and that each `modify` file entry is *execution-pinned* — i.e.
 it carries exactly one anchor (`before` literal text OR `line_range`). This
 front-loads determinism: a spec that fails here never reaches the Coder.
 
+It also shape-validates the optional ``deferred_fk_obligations`` field (ID-058
+deferral protocol): when present, each entry must carry non-empty
+``column``/``target_aggregate``/``blocked_on``/``follow_up`` strings. Absent is
+fine (no deferrals declared); shape validation does NOT inspect Alembic
+migrations (SFP-235's concern).
+
 stdlib only (argparse, json, sys, pathlib). No external dependencies.
 
 Usage:
@@ -144,6 +150,14 @@ def validate(spec) -> list:
                 f"(got {type(acm).__name__}; list/scalar rejected)"
             )
 
+    # ---- deferred_fk_obligations (ID-058 deferral protocol) -------------
+    # Optional (absent == no deferrals declared). When present, each entry's
+    # required keys must be present AND non-empty. Collects violations; no
+    # short-circuit (mirrors the existing rule style). Shape only — this linter
+    # does NOT inspect Alembic migrations (that is SFP-235's concern).
+    if "deferred_fk_obligations" in spec:
+        violations.extend(_check_deferred_fk_obligations(spec["deferred_fk_obligations"]))
+
     # NOTE: unknown/extra top-level keys are NOT rejected (presence+shape
     # only). Duplicate file paths are NOT rejected either. See PRSpec SFP-193.
     return violations
@@ -218,6 +232,42 @@ def _check_anchor(anchor, i: int) -> list:
         out.append(f"files[{i}] anchor.line_range start must be >= 1 (got {start})")
     if end < start:
         out.append(f"files[{i}] anchor.line_range end ({end}) must be >= start ({start})")
+    return out
+
+
+# Each key a deferred_fk_obligations entry must carry, non-empty. Mirrors the
+# fields of sfp_contracts.agents.planner.DeferredForeignKeyObligation (ID-058
+# deferral protocol). Kept as plain strings so this linter stays stdlib-only
+# and does not import the contracts package.
+DEFERRED_FK_REQUIRED_KEYS = ("column", "target_aggregate", "blocked_on", "follow_up")
+
+
+def _check_deferred_fk_obligations(entries) -> list:
+    """Validate the shape of ``deferred_fk_obligations`` (ID-058 deferral protocol).
+
+    Each entry must be a dict carrying every key in
+    :data:`DEFERRED_FK_REQUIRED_KEYS` as a non-empty string. Violations are
+    collected per entry per key (no short-circuit), matching the style of
+    :func:`_check_files`/:func:`_check_anchor`. This is shape validation only;
+    it does NOT inspect Alembic migrations (that is SFP-235's concern).
+    """
+    out = []
+    if not isinstance(entries, list):
+        out.append(f"'deferred_fk_obligations' must be a list (got {type(entries).__name__})")
+        return out
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            out.append(
+                f"deferred_fk_obligations[{i}] must be a dict/object (got {type(entry).__name__})"
+            )
+            continue
+        for key in DEFERRED_FK_REQUIRED_KEYS:
+            val = entry.get(key)
+            if not isinstance(val, str) or not val.strip():
+                out.append(
+                    f"deferred_fk_obligations[{i}] missing or empty '{key}' "
+                    f"(non-empty string required)"
+                )
     return out
 
 

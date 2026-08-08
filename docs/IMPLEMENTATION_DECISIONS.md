@@ -2008,7 +2008,10 @@ Adopt a uniform per-service schema organization:
 - Naming conventions: plural snake_case table names matching aggregates; singular aggregate class names in code; snake_case columns; timestamps suffixed `_at`; immutable identifiers as `<entity>_id`.
 - ORM table classes live in `infrastructure/persistence/` per service, not in `domain/`, preserving the contract/domain/persistence separation (ID-007).
 - Alembic owns all schema changes per service database (ID-008); migrations are per-service.
-- No cross-service foreign keys (AP-001, MAS §7.9); references to other services' entities are stored as plain identifier columns.
+- **Foreign-key policy (normative):**
+  - *Cross-service* references are identifier-only: **no cross-service foreign keys** (AP-001, MAS §7.9); references to other services' entities are stored as plain identifier columns. This preserves service ownership boundaries.
+  - *Intra-service* cross-aggregate references are real SQL foreign keys: a reference between two aggregates **within the same service database** — in **either direction** (the new model references an existing same-service aggregate, OR a same-service aggregate is referenced by one) — is a real `FOREIGN KEY`, not a plain column. Precedent: `UserExternalIdentity.user_id → business.users(user_id)` (MAS §2854-2855). MAS §6.5 does **not** forbid such FKs — it requires that references go *by identifier* (e.g. `user_id`), which is fully compatible with, and satisfied by, a FK.
+  - **Bidirectional deferral protocol** (sequencing): when an intra-service reference cannot be created as a real FK because the target table does not yet exist (the target aggregate lands in a separate, later ticket), the column is created as a plain identifier *for now*, and the obligation to add the FK is **declared, not silently dropped**: the originating ticket records it in its PRSpec's `deferred_fk_obligations` (ID-021; `sfp_contracts.agents.planner.DeferredForeignKeyObligation`) and the *target* ticket carries a "close-on-landing" instruction — creating the target table **MUST** add the deferred FK. A deferral is never silent: a reference is either a real FK or a declared, tracked obligation.
 
 **Timestamp convention:** audit columns use the `_at` suffix. `created_at` is
 set on INSERT via `server_default = now()`. `updated_at` is declared with
@@ -2019,16 +2022,17 @@ is deferred to a platform-wide follow-up ticket covering all DB-bearing
 services. No Python-side `onupdate=` — auto-fill is a database concern.
 
 ### Rationale
-Named schemas cleanly separate authoritative business state from operational plumbing, are uniform across services, and keep the outbox and idempotency ledger distinct from business facts. Plural snake_case tables and the `infrastructure/persistence/` location match the uniform service layout and the contract/domain/persistence separation. No cross-service foreign keys preserve ownership boundaries.
+Named schemas cleanly separate authoritative business state from operational plumbing, are uniform across services, and keep the outbox and idempotency ledger distinct from business facts. Plural snake_case tables and the `infrastructure/persistence/` location match the uniform service layout and the contract/domain/persistence separation. No cross-service foreign keys preserve ownership boundaries. Real intra-service FKs preserve referential integrity within a single service database (the `user_id` precedent) while the deferral protocol keeps cross-ticket sequencing honest — a missing target table never silently becomes "no FK by policy."
 
 ### Alternatives Considered
 - Everything in the `public` schema: rejected; mixes business and operational state.
 - A separate `audit` schema for WorkflowDecision: rejected; WorkflowDecision is a business fact.
 - Cross-service foreign keys: rejected; violates AP-001 and MAS §7.9.
+- Intra-service references as plain columns with no FK (the pattern mis-applied in SFP-101's `Ticket.project_id`): rejected; it loses referential integrity within the service's own database and contradicts the `user_id` precedent (MAS §2854-2855). A plain column is permitted *only* as a declared deferral when the target table does not yet exist (deferral protocol above), never as a standing policy.
 
 ### Consequences
-Positive: uniform, ownership-respecting, clean separation of business and operational state.  
-Negative: per-service Alembic discipline and schema conventions must be maintained.
+Positive: uniform, ownership-respecting, clean separation of business and operational state; real referential integrity within each service database; cross-ticket sequencing deferrals are declared and tracked rather than silently dropped.
+Negative: per-service Alembic discipline and schema conventions must be maintained; the bidirectional deferral protocol requires discipline — originating tickets must record a `deferred_fk_obligations` entry and target tickets must close the deferral on landing (SFP-234 backfilled this for `Ticket.project_id → business.projects`, blocked on SFP-100).
 
 ### References
 ID-005, ID-006, ID-007, ID-008, ID-011, ID-053, ID-055. Implementation Notes §3. Master Architecture Specification §7.9, §10.14, AP-001, AP-005.

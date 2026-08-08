@@ -2852,7 +2852,9 @@ schema.
   the valid provider set is owned elsewhere, not by this model.
 - `provider_user_id` — the provider's identifier for the user.
 - `user_id` — UUID, foreign key to `business.users(user_id)` (intra-service;
-  ID-058 permits intra-service FKs, forbids cross-service FKs).
+  ID-058 permits intra-service FKs, forbids cross-service FKs — this is the
+  precedent promoted into the normative ID-058 intra-service FK rule and
+  bidirectional deferral protocol).
 - `created_at` / `updated_at` — audit timestamps.
 - `UNIQUE(provider, provider_user_id)` — enforces the "duplicated external
   identity" failure mode as a constraint (MAS §9.3 Failure Behaviour).
