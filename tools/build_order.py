@@ -2,8 +2,16 @@
 """
 SFP — Deterministic Build-Order Generator (SFP-195)
 
-Parses `docs/SFP_Ticket_Hierarchy.md` REUSING `create_jira_tickets.parse_hierarchy`
-(never reimplemented) and computes a wave-based build order via Kahn longest-path:
+Thin CLI wrapper over the build-order DAG logic in
+:mod:`sfp_contracts.planning.build_order` (promoted there — promo 2 of 3 of the
+``tools/`` -> ``sfp_contracts`` effort, PR #122 being promo 1). This wrapper
+owns only: parsing (reusing ``create_jira_tickets.parse_hierarchy`` — never
+reimplemented), the ``--done`` / ``--doc`` / ``--out-md`` / ``--out-json``
+interface, output emission, and the control-flow glue that turns the library's
+typed exceptions into ``sys.exit`` messages.
+
+Parses `docs/SFP_Ticket_Hierarchy.md` and computes a wave-based build order via
+Kahn longest-path:
     wave(t) = 0               if t has no deps
     wave(t) = 1 + max(wave(d)) otherwise
 Detects dangling deps (dep num not in hierarchy) and cycles (DFS recursion-stack),
@@ -29,6 +37,14 @@ import json
 import sys
 from pathlib import Path
 
+from sfp_contracts.planning.build_order import (
+    BuildOrderCycleError,
+    build_index,
+    check_dangling,
+    compute_ready,
+    compute_waves,
+)
+
 # Reuse the canonical parser — never reimplement. Importing is safe: the
 # module top only reads env vars with defaults and never calls jira_api.
 HERE = Path(__file__).resolve().parent
@@ -38,75 +54,6 @@ import create_jira_tickets as cjt  # noqa: E402
 DEFAULT_DOC = "docs/SFP_Ticket_Hierarchy.md"
 DEFAULT_OUT_MD = "docs/BUILD_ORDER.md"
 DEFAULT_OUT_JSON = "docs/build_order.json"
-
-
-# ============================================================
-# INDEX + VALIDATION
-# ============================================================
-
-
-def build_index(tickets):
-    """Build a {num: ticket} index from the parsed ticket list."""
-    return {t["num"]: t for t in tickets}
-
-
-def check_dangling(tickets, by_num):
-    """Return the first (offender_id, missing_dep) pair whose dep num is not in
-    the index, or None if all deps resolve. Iterates tickets ascending by num."""
-    for t in sorted(tickets, key=lambda x: x["num"]):
-        for dep in t["deps"]:
-            dep_num = int(dep.split("-")[1])
-            if dep_num not in by_num:
-                return (t["id"], dep)
-    return None
-
-
-def compute_waves(tickets, by_num):
-    """Compute {num: wave} via memoized longest-path with DFS recursion-stack
-    cycle detection. Exits non-zero naming cycle members if a cycle is found."""
-    memo = {}
-    stack = []  # current recursion path (nums)
-    on_stack = set()  # O(1) membership for the current path
-
-    def wave_of(num):
-        if num in memo:
-            return memo[num]
-        if num in on_stack:
-            # Cycle: the slice from the first occurrence to here is the cycle.
-            idx = stack.index(num)
-            cycle = stack[idx:]
-            chain = " -> ".join(f"SFP-{n}" for n in cycle) + f" -> SFP-{num}"
-            sys.exit(f"error: cycle detected: {chain}")
-        on_stack.add(num)
-        stack.append(num)
-        dep_nums = [int(d.split("-")[1]) for d in by_num[num]["deps"]]
-        w = 0 if not dep_nums else 1 + max(wave_of(d) for d in dep_nums)
-        on_stack.discard(num)
-        stack.pop()
-        memo[num] = w
-        return w
-
-    for t in sorted(tickets, key=lambda x: x["num"]):
-        wave_of(t["num"])
-    return memo
-
-
-# ============================================================
-# READY SET (--done mode)
-# ============================================================
-
-
-def compute_ready(tickets, done_set):
-    """Tickets NOT in done whose deps ⊆ done, lowest-num-first.
-    `done_set` is a set of ticket-id strings (e.g. {"SFP-5", "SFP-6"})."""
-    ready = []
-    for t in tickets:
-        if t["id"] in done_set:
-            continue
-        if set(t["deps"]) <= done_set:
-            ready.append(t["id"])
-    ready.sort(key=lambda tid: int(tid.split("-")[1]))
-    return ready
 
 
 # ============================================================
@@ -227,8 +174,12 @@ def main(argv=None):
         offender, missing = dangling
         sys.exit(f"error: {offender} depends on {missing} which is not in the hierarchy")
 
-    # 2) Cycle detection + waves.
-    waves = compute_waves(tickets, by_num)
+    # 2) Cycle detection + waves. The library raises BuildOrderCycleError; the
+    #    CLI reproduces the byte-identical exit message.
+    try:
+        waves = compute_waves(tickets, by_num)
+    except BuildOrderCycleError as e:
+        sys.exit(f"error: cycle detected: {e}")
 
     # 3) --done mode: print ready set, emit nothing.
     if args.done is not None:

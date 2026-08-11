@@ -1,8 +1,15 @@
-"""Tests for tools/build_order.py — the SFP-195 deterministic build-order generator.
+"""Thin-CLI smoke tests for tools/build_order.py — the SFP-195 deterministic
+build-order generator (now a wrapper over sfp_contracts.planning.build_order).
 
-Covers TC-001..016. The REAL cjt.parse_hierarchy is used as the oracle (never
-reimplemented). All file I/O is redirected to tmp_path; the real docs/ tree is
-never mutated. Synthetic fixtures are deterministic (no network, no env).
+The logic cases (wave invariant, ready sets, cycle-as-exception) live in
+``packages/sfp-contracts/tests/planning/test_build_order.py`` (promoted as promo
+2 of 3). This file keeps the CLI-surface smoke: parse via ``main()``, real-doc
+integration, emit + ordering + schema + determinism, the ``--done`` stdout mode,
+the cycle/dangling ``SystemExit`` paths (now the CLI catching
+``BuildOrderCycleError`` and reproducing the byte-identical message), and the
+public-API surface. The REAL ``cjt.parse_hierarchy`` is used as the oracle
+(never reimplemented). All file I/O is redirected to tmp_path; the real docs/
+tree is never mutated. Synthetic fixtures are deterministic (no network, no env).
 """
 
 import json
@@ -52,12 +59,6 @@ CYCLE = f"""# MANUAL CORE
 **Labels:** manual-core, ai-agent, area | **Deps:** SFP-3 | **Context out:** x
 ### SFP-3 [AREA] {BOT} — cycle b
 **Labels:** manual-core, ai-agent, area | **Deps:** SFP-2 | **Context out:** x
-"""
-
-SELF_CYCLE = f"""# MANUAL CORE
-## TEST Epic — self-cycle fixture
-### SFP-1 [AREA] {BOT} — self dep
-**Labels:** manual-core, ai-agent, area | **Deps:** SFP-1 | **Context out:** x
 """
 
 DANGLING = f"""# MANUAL CORE
@@ -146,27 +147,8 @@ def test_tc002_integration_smoke_real_doc(tmp_path):
 
 
 # ============================================================
-# TC-003 — wave == longest-path (universal invariant; SFP-6 == 3)
-# ============================================================
-
-
-def test_tc003_wave_is_longest_path(tmp_path):
-    doc = write_fixture(tmp_path, PRIMARY)
-    _, tickets = cjt.parse_hierarchy(str(doc))
-    by_num = build_order.build_index(tickets)
-    waves = build_order.compute_waves(tickets, by_num)
-    # universal: for every ticket with deps, wave(t) > max(wave(dep))
-    for t in tickets:
-        if t["deps"]:
-            dep_nums = [int(d.split("-")[1]) for d in t["deps"]]
-            assert waves[t["num"]] > max(waves[dn] for dn in dep_nums), t["id"]
-    # expected waves {1:0, 2:0, 3:1, 4:1, 5:2, 6:3, 7:1, 8:1}
-    assert waves == {1: 0, 2: 0, 3: 1, 4: 1, 5: 2, 6: 3, 7: 1, 8: 1}
-    assert waves[6] == 3
-
-
-# ============================================================
-# TC-004 — within-wave ascending (wave-1 == [3,4,7,8])
+# TC-004 — within-wave ascending (wave-1 == [3,4,7,8]); uses the CLI's
+# _group_by_wave helper (output-formatting glue that stays in the tool).
 # ============================================================
 
 
@@ -183,7 +165,9 @@ def test_tc004_within_wave_ascending(tmp_path):
 
 
 # ============================================================
-# TC-005 — cycle detection names the cycle members
+# TC-005 — cycle detection via main() → SystemExit with byte-identical message.
+# The CLI catches BuildOrderCycleError (raised by the library) and reproduces
+# the historical exit message text.
 # ============================================================
 
 
@@ -192,6 +176,7 @@ def test_tc005_cycle_names_members(tmp_path):
     with pytest.raises(SystemExit) as exc:
         run_main(tmp_path, doc)
     msg = str(exc.value)
+    assert msg.startswith("error: cycle detected: ")
     assert "SFP-2" in msg
     assert "SFP-3" in msg
 
@@ -208,43 +193,6 @@ def test_tc006_dangling_names_offender(tmp_path):
     msg = str(exc.value)
     assert "SFP-9999" in msg  # the missing dep
     assert "SFP-2" in msg  # the offender ticket
-
-
-# ============================================================
-# TC-007 — --done SFP-1 → ready [2,3] (both directions)
-# ============================================================
-
-
-def test_tc007_done_ready_set_single(tmp_path):
-    doc = write_fixture(tmp_path, PRIMARY)
-    _, tickets = cjt.parse_hierarchy(str(doc))
-    ready = build_order.compute_ready(tickets, {"SFP-1"})
-    # ready INCLUDED
-    assert ready == ["SFP-2", "SFP-3"]
-    # done EXCLUDED
-    assert "SFP-1" not in ready
-    # non-ready EXCLUDED
-    assert "SFP-4" not in ready
-    assert "SFP-6" not in ready
-
-
-# ============================================================
-# TC-008 — --done SFP-1,SFP-2 → ready [3,4,7,8] (both directions)
-# ============================================================
-
-
-def test_tc008_done_ready_set_multi(tmp_path):
-    doc = write_fixture(tmp_path, PRIMARY)
-    _, tickets = cjt.parse_hierarchy(str(doc))
-    ready = build_order.compute_ready(tickets, {"SFP-1", "SFP-2"})
-    # ready INCLUDED
-    assert ready == ["SFP-3", "SFP-4", "SFP-7", "SFP-8"]
-    # done EXCLUDED
-    assert "SFP-1" not in ready
-    assert "SFP-2" not in ready
-    # non-ready EXCLUDED
-    assert "SFP-5" not in ready
-    assert "SFP-6" not in ready
 
 
 # ============================================================
@@ -342,18 +290,6 @@ def test_tc013_single(tmp_path):
 
 
 # ============================================================
-# TC-014 — self-cycle (SFP-1 → SFP-1)
-# ============================================================
-
-
-def test_tc014_self_cycle(tmp_path):
-    doc = write_fixture(tmp_path, SELF_CYCLE)
-    with pytest.raises(SystemExit) as exc:
-        run_main(tmp_path, doc)
-    assert "SFP-1" in str(exc.value)
-
-
-# ============================================================
 # TC-015 — --done CLI stdout (ready set printed, no docs emitted)
 # ============================================================
 
@@ -382,14 +318,24 @@ def test_tc016_missing_doc_exits(tmp_path):
 
 
 def test_tc016_public_api_surface():
-    """Structural smoke — all documented functions are present and callable."""
+    """Structural smoke — the documented names are present on the CLI module.
+
+    The four DAG functions (build_index/check_dangling/compute_waves/compute_ready)
+    are now imported at the top level from ``sfp_contracts.planning.build_order``,
+    so they remain attributes of this module; emit_md/emit_json/_group_by_wave/main
+    are the CLI's own output-formatting glue. ``BuildOrderCycleError`` is imported
+    alongside the functions.
+    """
     for name in (
         "build_index",
         "check_dangling",
         "compute_waves",
         "compute_ready",
+        "BuildOrderCycleError",
         "emit_md",
         "emit_json",
+        "_group_by_wave",
         "main",
     ):
-        assert callable(getattr(build_order, name)), name
+        obj = getattr(build_order, name)
+        assert callable(obj) or isinstance(obj, type), name
