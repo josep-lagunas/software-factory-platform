@@ -781,7 +781,7 @@
       "area": "AGENT",
       "executor": "ai-agent",
       "phase": "Manual Core",
-      "title": "Validation profile logic: assignment + gate enforcement"
+      "title": "Validation profile logic: gate enforcement"
     },
     {
       "ticket": "SFP-58",
