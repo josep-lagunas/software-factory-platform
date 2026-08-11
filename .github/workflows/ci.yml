@@ -40,7 +40,11 @@ jobs:
       - name: Sync dependencies (frozen lockfile, all workspace packages)
         run: uv sync --all-packages --frozen
       - name: Mypy typecheck
-        run: uv run mypy packages services
+        # tools/fk_lint.py is the one load-bearing tool already strict-clean
+        # (SFP-235 / PR #121); scoped into the check so its type-bar is enforced
+        # in CI. Do NOT add `tools` broadly — the rest is argparse/HTTP glue
+        # with ~161 pre-existing errors (out of scope for this effort).
+        run: uv run mypy packages services tools/fk_lint.py
       - name: Intra-service FK lint (ID-058, SFP-235)
         # Introspects each service's ORM Base.metadata and fails on any plain
         # _id column that references a same-service table without a FK (or a
