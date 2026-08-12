@@ -349,7 +349,23 @@ def run_pipeline(
         at_frontier=at_frontier,
     )
     if readiness.verdict is not ReadinessVerdict.READY:
-        return _abort(trace, None, f"readiness gate not READY: {readiness.verdict.value}")
+        # Surface the WHY of a non-READY verdict (SFP-236): the verdict alone is
+        # not actionable — the owner needs the blocking ambiguities, unresolved
+        # inputs, and failed layer-1 rubric checks to enrich the ticket or judge
+        # a false-positive (ID-065 / ID-064). Empty lists are omitted so a bare
+        # verdict (e.g. MANUAL_REQUIRED with no detail) stays readable.
+        detail: list[str] = []
+        if readiness.blocking_ambiguities:
+            detail.append("blocking_ambiguities: " + " || ".join(readiness.blocking_ambiguities))
+        if readiness.missing_inputs:
+            detail.append("missing_inputs: " + " || ".join(readiness.missing_inputs))
+        failed_rubric = [name for name, passed in readiness.rubric_results.items() if not passed]
+        if failed_rubric:
+            detail.append("rubric_failed: " + ",".join(failed_rubric))
+        msg = f"readiness gate not READY: {readiness.verdict.value}"
+        if detail:
+            msg += " — " + " ;; ".join(detail)
+        return _abort(trace, None, msg)
 
     # 3. Plan — decompose the ticket into one or more PR-specs. On resume, a
     # valid ``plan`` checkpoint is loaded and the Planner run is SKIPPED (the
