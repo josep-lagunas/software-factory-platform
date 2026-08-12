@@ -117,6 +117,34 @@ def _readiness_not_ready() -> dict[str, Any]:
     }
 
 
+def _readiness_not_ready_rich() -> dict[str, Any]:
+    """A non-READY verdict with blocking ambiguities + a failed rubric check (SFP-236).
+
+    Used to assert the abort message surfaces the blocking ambiguities and the
+    failed rubric-check name. Per the ``evaluate_readiness`` combination rule,
+    the model's ``blocking_ambiguities`` are unioned into BOTH
+    ``blocking_ambiguities`` and ``missing_inputs`` of the combined output, so
+    these ambiguity strings appear under both labels in the abort message.
+    The model's own ``missing_inputs`` is NOT unioned, so none is set here.
+    """
+    return {
+        "ticket_id": TICKET,
+        "verdict": "NEEDS_CLARIFICATION",
+        "blocking_ambiguities": ["acceptance criteria are vague", "no files section"],
+        "missing_inputs": [],
+        "rubric_results": {
+            "context": True,
+            "requirements": True,
+            "files_to_create_modify": False,
+            "implementation_notes": True,
+            "references": True,
+            "context_outputs_required_inputs": True,
+            "acceptance_criteria": True,
+            "dependencies": True,
+        },
+    }
+
+
 def _planner_output(n_specs: int = 1) -> dict[str, Any]:
     spec = {
         "id": "PRSPEC-SFP-224",
@@ -541,6 +569,95 @@ def test_readiness_not_ready_aborts_before_plan(tmp_path: Path) -> None:
     assert len(handles["readiness"].calls) == 1
     assert handles["readiness"].calls[0]["agent"] == "readiness"
     assert handles["planner"].calls == []
+
+
+def test_readiness_not_ready_abort_surfaces_detail(tmp_path: Path) -> None:
+    """SFP-236: the abort message surfaces the WHY of a non-READY verdict.
+
+    Given a NEEDS_CLARIFICATION with populated blocking_ambiguities AND a
+    layer-1 rubric failure (a missing ticket section), the aborted
+    ``PipelineResult.error`` must contain the verdict, every blocking-ambiguity
+    string, and the failed rubric-check name — so the owner can act without
+    re-running the gate. Nothing downstream of the readiness gate runs.
+
+    The failed rubric check is produced by the layer-1 rubric (deterministic,
+    over the ParsedTicket), so the test passes a ticket missing one section;
+    the model output contributes the blocking ambiguities. Per the
+    ``evaluate_readiness`` combination rule the model's ``blocking_ambiguities``
+    flow into BOTH ``blocking_ambiguities`` and ``missing_inputs`` of the
+    combined output, so the ambiguity strings appear under both labels.
+    """
+    runtimes, handles = _make_runtimes(readiness=_readiness_not_ready_rich(), approved=True)
+    # A ticket missing the files_to_create_modify section -> the layer-1 rubric
+    # fails exactly that check (its result is passed through to the combined
+    # ReadinessOutput, surfacing in the abort message's rubric_failed list).
+    ticket_missing_files = ParsedTicket(
+        context="ctx",
+        requirements="req",
+        files_to_create_modify=None,
+        implementation_notes="notes",
+        references="refs",
+        context_outputs_required_inputs="io",
+        acceptance_criteria="ac",
+        dependencies="dep",
+    )
+    result, fakes = _run(tmp_path, runtimes, jira=FakeJiraClient(parsed=ticket_missing_files))
+
+    assert result.success is False
+    error = result.error or ""
+    # The verdict value is always present.
+    assert "NEEDS_CLARIFICATION" in error
+    # Every blocking-ambiguity string is surfaced (under blocking_ambiguities,
+    # and per the combination rule also under missing_inputs).
+    assert "acceptance criteria are vague" in error
+    assert "no files section" in error
+    # The single failed rubric-check name is surfaced, and a passing one is not.
+    assert "files_to_create_modify" in error
+    assert "dependencies" not in error
+    # Each non-empty surface is labelled (delimiters are not asserted verbatim,
+    # only that each surface's label marker is present).
+    assert "blocking_ambiguities:" in error
+    assert "missing_inputs:" in error
+    assert "rubric_failed:" in error
+    # Nothing downstream ran.
+    assert list(result.trace) == ["jira.fetch_issue", "evaluate_readiness"]
+    assert fakes["repo_manager"].calls == []
+    assert fakes["coder_adapter"].calls == []
+    assert fakes["jira"].transitions == []
+    assert handles["planner"].calls == []
+
+
+def test_readiness_not_ready_abort_omits_empty_lists(tmp_path: Path) -> None:
+    """SFP-236: empty detail lists are omitted so a bare verdict stays readable.
+
+    When the evaluator returns a non-READY verdict with NO blocking
+    ambiguities, NO missing inputs, and NO failed rubric checks (e.g. a bare
+    MANUAL_REQUIRED from the model), the abort message must carry ONLY the
+    verdict — none of the ``blocking_ambiguities:`` / ``missing_inputs:`` /
+    ``rubric_failed:`` labels should be emitted, so the message is not
+    cluttered with empty sections.
+    """
+    # MANUAL_REQUIRED with empty ambiguities and an all-passing rubric (the
+    # default ``_ready_ticket`` has all eight sections). The combination rule
+    # in evaluate_readiness then yields empty blocking + missing lists but a
+    # non-READY verdict, exercising the "all detail empty" branch.
+    bare_manual = {
+        "ticket_id": TICKET,
+        "verdict": "MANUAL_REQUIRED",
+        "blocking_ambiguities": [],
+        "missing_inputs": [],
+        "rubric_results": _readiness_ready()["rubric_results"],
+    }
+    runtimes, _ = _make_runtimes(readiness=bare_manual, approved=True)
+    result, _ = _run(tmp_path, runtimes)
+
+    assert result.success is False
+    error = result.error or ""
+    assert "MANUAL_REQUIRED" in error
+    # No detail surface is emitted when all three lists are empty.
+    assert "blocking_ambiguities:" not in error
+    assert "missing_inputs:" not in error
+    assert "rubric_failed:" not in error
 
 
 def test_build_failure_aborts_before_push_and_pr(tmp_path: Path) -> None:
