@@ -54,13 +54,17 @@ set +a
 # falls back to the human's stored auth (mis-attributing PRs/reviews/merges —
 # the SFP-237 finding). The skill's `GH_TOKEN="$GITHUB_TOKEN_CODER" gh ...`
 # prefix masks this; the bridge makes plain `gh` work too, as the docstring
-# claims. Each alias is set ONLY if the role token is non-empty, so an unset
-# role token does not clobber a value already in the environment.
-if [ -n "${GITHUB_TOKEN_CODER:-}" ]; then
+# claims.
+#
+# A caller-provided GH_TOKEN / GITHUB_TOKEN is PRESERVED — the bridge only
+# fills it in when UNSET (caller override wins). This mirrors the
+# `GH_TOKEN="$GITHUB_TOKEN_CODER" gh ...` prefix semantics and avoids the
+# silent mis-attribution class SFP-198/SFP-237 warn against.
+if [ -z "${GH_TOKEN:-}" ] && [ -n "${GITHUB_TOKEN_CODER:-}" ]; then
   GH_TOKEN="${GITHUB_TOKEN_CODER}"
   export GH_TOKEN
 fi
-if [ -n "${GITHUB_TOKEN_REVIEWER:-}" ]; then
+if [ -z "${GITHUB_TOKEN:-}" ] && [ -n "${GITHUB_TOKEN_REVIEWER:-}" ]; then
   GITHUB_TOKEN="${GITHUB_TOKEN_REVIEWER}"
   export GITHUB_TOKEN
 fi

@@ -70,19 +70,26 @@ def test_reviewer_token_bridged_to_github_token(tmp_path: Path) -> None:
     assert _source_and_report(env_file, "$GITHUB_TOKEN") == "fake-reviewer-tok-0987654321"
 
 
-def test_bridge_does_not_clobber_existing_gh_token(tmp_path: Path) -> None:
-    """A pre-existing GH_TOKEN in the env is NOT overwritten by the bridge.
+def test_bridge_preserves_caller_provided_gh_token(tmp_path: Path) -> None:
+    """A caller-provided GH_TOKEN is PRESERVED — the bridge does not clobber it.
 
-    The bridge fires only when the role token is non-empty; a caller who set
-    GH_TOKEN explicitly before sourcing keeps their value. (Defensive — guards
-    against the bridge silently overriding an intentional override.)
+    SFP-238 reviewer finding: the bridge previously assigned GH_TOKEN
+    unconditionally whenever GITHUB_TOKEN_CODER was set, overwriting any
+    pre-existing GH_TOKEN the caller provided — contradicting the documented
+    "caller override wins" semantic and the silent mis-attribution class
+    SFP-198/SFP-237 warn against. The fix gates the bridge on GH_TOKEN being
+    UNSET (in addition to the source token being non-empty).
+
+    Here GH_TOKEN is set BEFORE sourcing AND GITHUB_TOKEN_CODER is populated
+    in the fixture .env; after sourcing, GH_TOKEN must equal the caller value
+    (NOT the coder role token).
     """
     env_file = _write_env(tmp_path)
     proc = subprocess.run(
         [
             "/bin/sh",
             "-c",
-            'GH_TOKEN=already-set-here . "./source-env.sh" >/dev/null 2>&1; printf %s "$GH_TOKEN"',
+            'GH_TOKEN=caller-provided . "./source-env.sh" >/dev/null 2>&1; printf %s "$GH_TOKEN"',
         ],
         cwd=str(ROOT),
         env={"PATH": "/usr/bin:/bin", "SFP_ENV_FILE": str(env_file)},
@@ -90,7 +97,43 @@ def test_bridge_does_not_clobber_existing_gh_token(tmp_path: Path) -> None:
         text=True,
         check=True,
     )
-    assert proc.stdout == "fake-coder-tok-1234567890"  # coder token wins per bridge
+    assert proc.stdout == "caller-provided"  # preserved, NOT clobbered
+
+
+def test_bridge_preserves_caller_provided_github_token(tmp_path: Path) -> None:
+    """A caller-provided GITHUB_TOKEN is PRESERVED (reviewer bridge).
+
+    Same semantic as the GH_TOKEN test, for the reviewer-bridge alias
+    (GITHUB_TOKEN_REVIEWER -> GITHUB_TOKEN).
+    """
+    env_file = _write_env(tmp_path)
+    proc = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            'GITHUB_TOKEN=caller-provided . "./source-env.sh" >/dev/null 2>&1; '
+            'printf %s "$GITHUB_TOKEN"',
+        ],
+        cwd=str(ROOT),
+        env={"PATH": "/usr/bin:/bin", "SFP_ENV_FILE": str(env_file)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert proc.stdout == "caller-provided"  # preserved, NOT clobbered
+
+
+def test_bridge_populates_gh_token_when_unset(tmp_path: Path) -> None:
+    """When GH_TOKEN is UNSET, the bridge fills it from GITHUB_TOKEN_CODER.
+
+    Companion to the preservation test: the bridge fires only when the
+    caller did NOT provide a value, so plain `source ./source-env.sh && gh`
+    authenticates as sfp-coder-bot (the SFP-237 fix). Together the two tests
+    pin the full semantic: unset -> bridged; set -> preserved.
+    """
+    env_file = _write_env(tmp_path)
+    # No GH_TOKEN passed in the env -> the bridge must populate it.
+    assert _source_and_report(env_file, "$GH_TOKEN") == "fake-coder-tok-1234567890"
 
 
 def test_missing_env_file_returns_nonzero(tmp_path: Path) -> None:
