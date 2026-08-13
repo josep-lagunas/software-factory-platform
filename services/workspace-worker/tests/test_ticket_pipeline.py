@@ -31,13 +31,14 @@ import pytest
 from sfp_agent_runtime.interfaces import AgentRunRequest, AgentRunResult
 from sfp_config import LocalSecretProvider, SecretRef
 from sfp_contracts.agents.coder import CoderOutput
-from sfp_contracts.agents.planner import PlannerOutput
+from sfp_contracts.agents.planner import PlannerOutput, PrSpec
 from sfp_contracts.agents.readiness import ParsedTicket
 from sfp_contracts.agents.test_designer import TestDesignerOutput
 from workspace_worker.entrypoints import ticket_pipeline as pipeline_mod
 from workspace_worker.entrypoints.ticket_pipeline import (
     PipelineDeps,
     PipelineResult,
+    _build_pr_body,
     _checkpoint_dir,
     build,
     run_pipeline,
@@ -1071,3 +1072,179 @@ def test_checkpoint_dir_is_sibling_of_worktree_path_not_parent() -> None:
     assert ckpt.parent.parent == worktree_base  # <base>/checkpoints/<ticket>
     assert ckpt.name == ticket
     assert ckpt.parent.name == "checkpoints"
+
+
+# --------------------------------------------------------------------------- #
+# Structured PR body from PRSpec + CoderOutput (SFP-238)
+# --------------------------------------------------------------------------- #
+
+
+def _pr_spec_and_coder(
+    *,
+    goal: str = "Wire the slice.",
+    files: list[str] | None = None,
+    validation_evidence: list[str] | None = None,
+    known_limitations: list[str] | None = None,
+    title: str = "Composition root",
+) -> tuple[PrSpec, CoderOutput]:
+    """Build a validated (PrSpec, CoderOutput) pair for PR-body tests."""
+    spec = PrSpec.model_validate(_planner_output(1)["pr_specs"][0])
+    spec = spec.model_copy(update={"goal": goal, "title": title})
+    if files is not None:
+        spec = spec.model_copy(update={"likely_files_or_modules": files})
+    coder = CoderOutput.model_validate(_coder_output())
+    updates: dict[str, Any] = {}
+    if validation_evidence is not None:
+        updates["validation_evidence"] = validation_evidence
+    if known_limitations is not None:
+        updates["known_limitations"] = known_limitations
+    if updates:
+        coder = coder.model_copy(update=updates)
+    return spec, coder
+
+
+def test_pr_body_has_summary_changes_evidence_and_jira_line() -> None:
+    """SFP-238: the default PR body is assembled from PRSpec + CoderOutput.
+
+    The bare ``JIRA: <url>`` default is replaced by a structured markdown body.
+    With all source fields populated, every section appears: Summary (title +
+    goal), Changes (the files), Validation evidence, and the JIRA convention
+    line (required by the PR format — ID-025).
+    """
+    spec, coder = _pr_spec_and_coder(
+        files=["slice.py", "wiring.py"],
+        validation_evidence=["build green", "pytest 1579 passed"],
+    )
+    body = _build_pr_body(TICKET, spec, coder)
+
+    # Summary section with the PRSpec title + goal.
+    assert "## Summary" in body
+    assert spec.title in body
+    assert spec.goal in body
+    # Changes section lists each file as a fenced bullet.
+    assert "## Changes" in body
+    assert "- `slice.py`" in body
+    assert "- `wiring.py`" in body
+    # Validation evidence section.
+    assert "## Validation evidence" in body
+    assert "- build green" in body
+    assert "- pytest 1579 passed" in body
+    # JIRA convention line preserved.
+    assert f"JIRA: https://arconta.atlassian.net/browse/{TICKET}" in body
+
+
+def test_pr_body_omits_known_limitations_when_empty() -> None:
+    """SFP-238: an empty known_limitations omits the section (no empty headings)."""
+    spec, coder = _pr_spec_and_coder(known_limitations=[])
+    body = _build_pr_body(TICKET, spec, coder)
+
+    assert "## Known limitations" not in body
+
+
+def test_pr_body_includes_known_limitations_when_non_empty() -> None:
+    """SFP-238: non-empty known_limitations renders the section."""
+    spec, coder = _pr_spec_and_coder(known_limitations=["flaky on macOS"])
+    body = _build_pr_body(TICKET, spec, coder)
+
+    assert "## Known limitations" in body
+    assert "- flaky on macOS" in body
+
+
+def test_pr_body_omits_changes_section_when_no_files() -> None:
+    """SFP-238: an empty likely_files_or_modules omits the Changes section."""
+    spec, coder = _pr_spec_and_coder(files=[])
+    body = _build_pr_body(TICKET, spec, coder)
+
+    assert "## Changes" not in body
+
+
+def test_pr_body_omits_validation_evidence_when_empty() -> None:
+    """SFP-238: empty validation_evidence omits the section."""
+    spec, coder = _pr_spec_and_coder(validation_evidence=[])
+    body = _build_pr_body(TICKET, spec, coder)
+
+    assert "## Validation evidence" not in body
+
+
+def test_pr_body_omits_goal_when_empty() -> None:
+    """SFP-238: an empty/whitespace goal is omitted from the Summary."""
+    spec, coder = _pr_spec_and_coder(goal="   ")
+    body = _build_pr_body(TICKET, spec, coder)
+
+    assert "## Summary" in body
+    assert spec.title in body
+    assert "   " not in body.strip()
+
+
+def test_pr_body_caller_override_wins() -> None:
+    """SFP-238: an explicit pr_body kwarg to run_pipeline wins over the template.
+
+    Drives the full pipeline: when pr_body is passed, create_pr receives that
+    exact body (not the structured template).
+    """
+    runtimes, _ = _make_runtimes(approved=True)
+    jira = FakeJiraClient()
+    coder_adapter = FakeGitAdapter()
+    reviewer_adapter = FakeGitAdapter()
+    worktree_manager = FakeWorktreeManager()
+    branch_manager = FakeBranchManager()
+    clone_dest = Path("/tmp/sfp-fake-clone")
+    worktree_base = Path("/tmp/sfp-fake-wt")
+
+    run_pipeline(
+        TICKET,
+        jira=jira,
+        repo_manager=FakeRepoManager(),
+        coder_adapter=coder_adapter,
+        reviewer_adapter=reviewer_adapter,
+        runtimes=runtimes,
+        exec_runners=_exec_runners(),
+        prompt_provider=FakePromptProvider(),
+        worktree_manager=worktree_manager,
+        branch_manager=branch_manager,
+        owner=OWNER,
+        repo_name=REPO,
+        repo_url=REPO_URL,
+        clone_dest=clone_dest,
+        worktree_base=worktree_base,
+        branch_name=BRANCH,
+        pr_body="MY CUSTOM BODY",
+    )
+
+    create_pr_call = next(c for c in coder_adapter.calls if c[0] == "create_pr")
+    # create_pr tuple: (op, owner, repo, title, head, base, body)
+    assert create_pr_call[6] == "MY CUSTOM BODY"
+
+
+def test_pr_body_default_uses_structured_template_in_pipeline() -> None:
+    """SFP-238: without pr_body, create_pr receives the structured template body.
+
+    Drives the full pipeline with NO pr_body override: create_pr's body is the
+    _build_pr_body output (contains Summary + JIRA line), not the bare JIRA
+    string.
+    """
+    runtimes, _ = _make_runtimes(approved=True)
+    coder_adapter = FakeGitAdapter()
+    run_pipeline(
+        TICKET,
+        jira=FakeJiraClient(),
+        repo_manager=FakeRepoManager(),
+        coder_adapter=coder_adapter,
+        reviewer_adapter=FakeGitAdapter(),
+        runtimes=runtimes,
+        exec_runners=_exec_runners(),
+        prompt_provider=FakePromptProvider(),
+        worktree_manager=FakeWorktreeManager(),
+        branch_manager=FakeBranchManager(),
+        owner=OWNER,
+        repo_name=REPO,
+        repo_url=REPO_URL,
+        clone_dest=Path("/tmp/sfp-fake-clone"),
+        worktree_base=Path("/tmp/sfp-fake-wt"),
+        branch_name=BRANCH,
+    )
+
+    create_pr_call = next(c for c in coder_adapter.calls if c[0] == "create_pr")
+    body = create_pr_call[6]
+    assert "## Summary" in body
+    assert f"JIRA: https://arconta.atlassian.net/browse/{TICKET}" in body
