@@ -47,4 +47,22 @@ set -a
 . "$ENV_FILE"
 set +a
 
+# Bridge the SFP per-role token names to the names the CLIs actually read.
+# The .env keys are role-scoped (GITHUB_TOKEN_CODER / GITHUB_TOKEN_REVIEWER);
+# gh reads GH_TOKEN (preferred) or GITHUB_TOKEN. Without this bridge a plain
+# `source ./source-env.sh && gh ...` leaves GH_TOKEN empty and gh silently
+# falls back to the human's stored auth (mis-attributing PRs/reviews/merges —
+# the SFP-237 finding). The skill's `GH_TOKEN="$GITHUB_TOKEN_CODER" gh ...`
+# prefix masks this; the bridge makes plain `gh` work too, as the docstring
+# claims. Each alias is set ONLY if the role token is non-empty, so an unset
+# role token does not clobber a value already in the environment.
+if [ -n "${GITHUB_TOKEN_CODER:-}" ]; then
+  GH_TOKEN="${GITHUB_TOKEN_CODER}"
+  export GH_TOKEN
+fi
+if [ -n "${GITHUB_TOKEN_REVIEWER:-}" ]; then
+  GITHUB_TOKEN="${GITHUB_TOKEN_REVIEWER}"
+  export GITHUB_TOKEN
+fi
+
 echo "source-env.sh: loaded $ENV_FILE"

@@ -236,6 +236,49 @@ def _abort(trace: list[str], pr_number: int | None, error: str) -> PipelineResul
     return PipelineResult(success=False, pr_number=pr_number, error=error, trace=tuple(trace))
 
 
+def _build_pr_body(ticket_key: str, pr_spec: PrSpec, coder_output: CoderOutput) -> str:
+    """Assemble a deterministic PR body from the contracts (SFP-238).
+
+    Replaces the bare ``JIRA: <url>`` default with a structured markdown body
+    assembled from the PRSpec + CoderOutput fields. Deterministic — no model
+    prose. Empty source fields omit their section (no empty headings). The
+    closing ``JIRA:`` line preserves the PR format convention (ID-025).
+
+    Args:
+        ticket_key: The Jira issue key (e.g. ``SFP-238``).
+        pr_spec: The PR-spec the Coder implemented (SFP-14).
+        coder_output: The Coder's implementation evidence (SFP-15).
+
+    Returns:
+        The assembled markdown body string.
+    """
+    sections: list[str] = []
+    # Summary — PRSpec title; the goal carries a one-line description.
+    summary_lines = ["## Summary", "", f"**{pr_spec.title}**"]
+    if pr_spec.goal.strip():
+        summary_lines.append("")
+        summary_lines.append(pr_spec.goal.strip())
+    sections.append("\n".join(summary_lines))
+    # Changes — the files the PRSpec said the Coder would touch.
+    if pr_spec.likely_files_or_modules:
+        changes_lines = ["## Changes", ""]
+        changes_lines.extend(f"- `{f}`" for f in pr_spec.likely_files_or_modules)
+        sections.append("\n".join(changes_lines))
+    # Validation evidence — the Coder's recorded evidence lines.
+    if coder_output.validation_evidence:
+        ve_lines = ["## Validation evidence", ""]
+        ve_lines.extend(f"- {line}" for line in coder_output.validation_evidence)
+        sections.append("\n".join(ve_lines))
+    # Known limitations — omit if the Coder reported none.
+    if coder_output.known_limitations:
+        kl_lines = ["## Known limitations", ""]
+        kl_lines.extend(f"- {line}" for line in coder_output.known_limitations)
+        sections.append("\n".join(kl_lines))
+    # JIRA convention line (required by the PR format — ID-025).
+    sections.append(f"JIRA: https://arconta.atlassian.net/browse/{ticket_key}")
+    return "\n\n".join(sections)
+
+
 def run_pipeline(
     ticket_key: str,
     *,
@@ -505,11 +548,7 @@ def run_pipeline(
     # 13. Open the pull request via the CODER adapter (sfp-coder-bot identity).
     trace.append("coder_adapter.create_pr")
     title = pr_title if pr_title is not None else f"{ticket_key}: {pr_spec.title}"
-    body = (
-        pr_body
-        if pr_body is not None
-        else f"JIRA: https://arconta.atlassian.net/browse/{ticket_key}"
-    )
+    body = pr_body if pr_body is not None else _build_pr_body(ticket_key, pr_spec, coder_output)
     pr = coder_adapter.create_pr(
         owner,
         repo_name,
