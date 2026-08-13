@@ -69,18 +69,19 @@ fi
 # reads. Each is overridable from the caller's environment.
 # ---------------------------------------------------------------------------
 : "${SFP_ANTHROPIC_BASE_URL:="$ANTHROPIC_BASE_URL"}"
-: "${SFP_DEFAULT_MODEL:="glm-4.6"}"                       # floor for emit-JSON agents
-: "${SFP_AGENT_MODEL_CODER:="${MODEL_CODER:-glm-5.2}"}"   # Coder on the capable tier
-# Planner/Reviewer overrides are OPTIONAL: AgentModelConfig rejects empty/
-# whitespace strings (model_config.py _check_non_empty), so only set them when a
-# value is actually provided (an existing SFP_AGENT_MODEL_* or the convenience
-# MODEL_PLANNER/MODEL_REVIEWER). Unset => os.environ.get returns None => optional.
-if [[ -z "${SFP_AGENT_MODEL_PLANNER:-}" && -n "${MODEL_PLANNER:-}" ]]; then
-  SFP_AGENT_MODEL_PLANNER="$MODEL_PLANNER"
-fi
-if [[ -z "${SFP_AGENT_MODEL_REVIEWER:-}" && -n "${MODEL_REVIEWER:-}" ]]; then
-  SFP_AGENT_MODEL_REVIEWER="$MODEL_REVIEWER"
-fi
+# Model tiers aligned with the orchestrator harness (.claude/agents/sfp-*.md
+# frontmatter, SFP-237). Only planner/coder/reviewer carry per-role overrides
+# (ROLES_WITH_OVERRIDE in model_config.py); test_designer/readiness/other roles
+# resolve to default_model — the floor. So:
+#   - default_model = glm-5.1  -> floor for test_designer + readiness (and coder).
+#   - planner + reviewer need EXPLICIT overrides to glm-5.2 (else they fall to
+#     the 5.1 floor); coder=glm-5.1 (explicit override, equals floor, for clarity).
+# Each var is overridable from the caller's environment (SFP_AGENT_MODEL_* or the
+# convenience MODEL_*); the ${VAR:-default} nesting makes caller env always win.
+: "${SFP_DEFAULT_MODEL:="glm-5.1"}"                          # floor for test_designer/readiness + coder
+: "${SFP_AGENT_MODEL_CODER:="${MODEL_CODER:-glm-5.1}"}"      # Coder on the operational tier
+: "${SFP_AGENT_MODEL_PLANNER:="${MODEL_PLANNER:-glm-5.2}"}"  # Planner on the capable tier
+: "${SFP_AGENT_MODEL_REVIEWER:="${MODEL_REVIEWER:-glm-5.2}"}" # Reviewer on the capable tier
 # SecretRef is a pydantic model (extra="forbid", field `name`) -> the env value
 # is parsed as JSON; a bare name raises SettingsError. MUST be JSON. The literal
 # is held in single quotes (so its inner double-quotes are data, not delimiters)
@@ -100,7 +101,8 @@ SECRET_REF_JSON='{"name":"ANTHROPIC_AUTH_TOKEN"}'
 export SFP_ANTHROPIC_BASE_URL SFP_DEFAULT_MODEL SFP_AGENT_MODEL_CODER \
        SFP_LLM_PROVIDER_SECRET_REF SFP_JIRA_EMAIL SFP_JIRA_SITE \
        SFP_GIT_OWNER SFP_GIT_REPO SFP_WORKTREE_BASE
-# Optional per-role overrides: export only when set (empty would crash the gate).
+# Per-role overrides (always set via the ${VAR:-default} defaults above; guard
+# kept defensive — empty would crash the model_config gate).
 [[ -n "${SFP_AGENT_MODEL_PLANNER:-}" ]] && export SFP_AGENT_MODEL_PLANNER
 [[ -n "${SFP_AGENT_MODEL_REVIEWER:-}" ]] && export SFP_AGENT_MODEL_REVIEWER
 # Secrets the LocalSecretProvider resolves by name (kept unprefixed, as in .env):
