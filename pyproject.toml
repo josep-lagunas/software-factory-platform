@@ -59,8 +59,17 @@ source = [
     "services/workspace-worker/src",
     "services/orchestrator/src",
     "services/external-events/src",
+    # Local init container helper modules (SFP-79). The one-shot setup/
+    # provisioning scripts are omitted below (same precedent as the per-service
+    # migrations/env.py) — only the library helpers are coverage-gated.
+    "infrastructure/local/init",
 ]
-omit = ['*/migrations/env.py']
+omit = [
+    '*/migrations/env.py',
+    # One-shot provisioning scripts (SFP-79): not library code.
+    "infrastructure/local/init/run_pulumi.py",
+    "infrastructure/local/init/run_alembic.py",
+]
 
 [tool.coverage.report]
 fail_under = 90

@@ -1,0 +1,22 @@
+# Python dependencies for the local init container (SFP-79).
+#
+# Pinned loosely at major-compatible versions; the container is a local-dev
+# one-shot provisioner, not a production artifact. Pinned via the workspace in
+# dev (uv.lock); here the container installs its own isolated copy because the
+# init image is built standalone from this directory.
+#
+# The service alembic env.py modules import the service persistence packages
+# (e.g. ``identity.infrastructure.persistence``); those resolve from the
+# mounted workspace ``src/`` trees (added to sys.path by run_alembic.py /
+# service_registry.py), not from this requirements list. This list only pins
+# the third-party libraries those modules transitively need at migrate time.
+
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+psycopg[binary]>=3.2.0
+asyncpg>=0.29.0
+# Pulumi CLI is installed in the image (see Dockerfile); these are the Python
+# SDK wheels the SFP-66 program may import. Present so a pulumi program that
+# uses the Python SDK works without a separate install step.
+pulumi>=3.100.0
+pulumi-aws>=6.0.0
