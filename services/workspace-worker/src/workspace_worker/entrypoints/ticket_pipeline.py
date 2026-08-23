@@ -81,7 +81,7 @@ from workspace_worker.infrastructure.settings import WorkspaceWorkerSettings
 from workspace_worker.repo.branch import BranchManager
 from workspace_worker.repo.git.adapter import GitProviderAdapter
 from workspace_worker.repo.jira.client import JiraClient
-from workspace_worker.repo.manager import RepoManager
+from workspace_worker.repo.manager import BaseSyncConflictError, RepoManager, RepoManagerError
 from workspace_worker.repo.worktree import WorktreeManager, _sanitize_job_id
 from workspace_worker.workflow.context_resolver import resolve_context
 from workspace_worker.workflow.frontier import compute_at_frontier
@@ -510,8 +510,35 @@ def run_pipeline(
     else:
         _log.info("resume: skipping code stage (checkpoint present) for %s", ticket_key)
 
-    # 9-11. Local Execution Engine gates — build, tests, lint. Each is fail-fast:
-    # a non-success aborts BEFORE push (no PR is opened against a red tree).
+    # 9. Pre-push base sync (SFP-240) — merge origin/<base_branch> into the
+    #    ticket branch IN THE WORKTREE before any gate runs, so the gates below
+    #    verify the POST-merge tree (the exact tree that will be pushed). Merge,
+    #    never rebase — rebase would rewrite the Coder's commits. A conflict
+    #    aborts fail-closed with the conflicted file names (the worktree is left
+    #    pre-merge via `git merge --abort` inside sync_base); the operator
+    #    resolves in the worktree and re-runs with --resume. The LOCAL-merge
+    #    route (not GitProviderAdapter.sync_branch, SFP-59) is chosen because it
+    #    surfaces named-file conflicts locally at push time and pushes a
+    #    byte-identical verified tree; upload stays RepoManager.push (RESOLUTION 4).
+    trace.append("repo_manager.sync_base")
+    try:
+        repo_manager.sync_base(worktree_path, base_branch)
+    except BaseSyncConflictError as exc:
+        # Fail-closed: no gates, no push, no PR against a conflicted tree. The
+        # message carries the named files + the operator's recovery recipe.
+        files = ", ".join(exc.conflicted_files) if exc.conflicted_files else "(none)"
+        return _abort(
+            trace,
+            None,
+            f"base stale: merge conflicts in {files}; "
+            f"resolve in {worktree_path} and re-run with --resume",
+        )
+    except RepoManagerError as exc:
+        return _abort(trace, None, f"base sync failed: {exc}")
+
+    # 10-12. Local Execution Engine gates — build, tests, lint, run AFTER the
+    #     base merge so they verify the merged tree. Each is fail-fast:
+    #     a non-success aborts BEFORE push (no PR is opened against a red tree).
     trace.append("build")
     build_result = _run_build(worktree_path, runner=exec_runners["build"])
     if not build_result.success:
@@ -539,13 +566,14 @@ def run_pipeline(
             f"lint failed:\n{lint_result}",
         )
 
-    # 12. Push the branch — RESOLUTION 4: object upload via RepoManager.push,
+    # 13. Push the branch — RESOLUTION 4: object upload via RepoManager.push,
     #     NEVER GitProviderAdapter.push_branch (the Git Data refs API cannot
-    #     upload locally-committed objects). Token is in-memory only.
+    #     upload locally-committed objects). Token is in-memory only. The tree
+    #     pushed is the one the gates just verified (post base-sync, SFP-240).
     trace.append("repo_manager.push")
     repo_manager.push(worktree_path, branch_name)
 
-    # 13. Open the pull request via the CODER adapter (sfp-coder-bot identity).
+    # 14. Open the pull request via the CODER adapter (sfp-coder-bot identity).
     trace.append("coder_adapter.create_pr")
     title = pr_title if pr_title is not None else f"{ticket_key}: {pr_spec.title}"
     body = pr_body if pr_body is not None else _build_pr_body(ticket_key, pr_spec, coder_output)
@@ -558,7 +586,7 @@ def run_pipeline(
         body=body,
     )
 
-    # 14. Reviewer judges the PR.
+    # 15. Reviewer judges the PR.
     trace.append("review")
     review_output: ReviewerOutput = review(
         pr_spec,
@@ -586,7 +614,7 @@ def run_pipeline(
         # Review did not approve — fail fast: NO merge, NO Done transition.
         return _abort(trace, pr.number, f"review not approved: {review_output.review_status.value}")
 
-    # 15. Merge (squash) via the CODER adapter + transition the ticket to Done.
+    # 16. Merge (squash) via the CODER adapter + transition the ticket to Done.
     trace.append("coder_adapter.merge_pr")
     coder_adapter.merge_pr(owner, repo_name, pr.number, merge_method="squash")
     trace.append("jira.transition")
