@@ -11,11 +11,14 @@ Two layers:
 
 from __future__ import annotations
 
+import shutil as _shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 from workspace_worker.repo.manager import (
+    BaseSyncConflictError,
+    BaseSyncResult,
     CloneResult,
     PushResult,
     RepoManager,
@@ -375,8 +378,6 @@ def test_integration_push_uploads_commit_and_keeps_config_token_free(
 ) -> None:
     """Real git: clone, commit a file, push() — the commit arrives on the remote
     and ``.git/config`` stays token-free (no set-url ever wrote the token)."""
-    import shutil as _shutil  # noqa: PLC0415
-
     remote = _seed_bare_remote(tmp_path / "remote.git")
     _shutil.rmtree(tmp_path / "seed-work")
     file_url = f"file://{remote}"
@@ -439,8 +440,6 @@ def test_integration_push_uploads_commit_and_keeps_config_token_free(
 
 
 def test_integration_clone_is_idempotent_real_git(tmp_path: Path) -> None:
-    import shutil as _shutil  # noqa: PLC0415
-
     remote = _seed_bare_remote(tmp_path / "remote.git")
     _shutil.rmtree(tmp_path / "seed-work")
     dest = tmp_path / "checkout"
@@ -452,3 +451,438 @@ def test_integration_clone_is_idempotent_real_git(tmp_path: Path) -> None:
     assert first.cloned is True
     assert second.cloned is False
     assert second.path == dest
+
+
+# ---------------------------------------------------------------------------
+# sync_base — pre-push base sync (SFP-240). Unit layer: fake runners assert the
+# exact git argv (one-shot authed fetch, bot-identity merge, abort ordering,
+# conflicted-name listing) and error redaction — no real git.
+# ---------------------------------------------------------------------------
+
+
+class FakeMergeRunner:
+    """check=False-shaped fake for the ONE command whose non-zero exit is data.
+
+    Returns a canned :class:`subprocess.CompletedProcess` (default exit 0) and
+    records each argv. Tests set ``returncode`` to simulate a conflict.
+    """
+
+    def __init__(self, *, returncode: int = 0, stdout: str = "") -> None:
+        self.calls: list[list[str]] = []
+        self._returncode = returncode
+        self._stdout = stdout
+
+    def __call__(self, cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        self.calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, self._returncode, stdout=self._stdout, stderr="")
+
+
+def _cp(stdout: str = "") -> subprocess.CompletedProcess[str]:
+    """A successful check=True-shaped result carrying ``stdout``."""
+    return subprocess.CompletedProcess([], returncode=0, stdout=stdout, stderr="")
+
+
+def _args(cmd: list[str]) -> list[str]:
+    """Strip the fixed ``git -C <path>`` prefix from a scripted-runner argv.
+
+    Production always invokes the runner as ``["git", "-C", <path>, <sub>, ...]``
+    (spaced ``-C`` — git rejects the attached ``-C<path>`` form with exit 129),
+    so the subcommand starts at index 3. Matching on the stripped argv keeps the
+    fakes independent of the worktree path.
+    """
+    return cmd[3:] if cmd[:2] == ["git", "-C"] else cmd[1:]
+
+
+def test_sync_base_fetches_authed_and_merges_with_bot_identity(tmp_path: Path) -> None:
+    """Clean merge: authed fetch of the base, then a MERGE (never rebase)
+    committed as the bot identity via one-shot ``-c`` argv config."""
+    calls: list[list[str]] = []
+    heads = iter(["aaaa1111", "bbbb2222"])  # rev-parse HEAD before/after -> differ
+
+    def scripted(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        if _args(cmd)[:2] == ["rev-parse", "HEAD"]:
+            return _cp(next(heads))
+        return _cp()
+
+    merge_runner = FakeMergeRunner(returncode=0, stdout="Merge made by the 'ort' strategy.")
+    mgr = RepoManager(TOKEN, runner=scripted, merge_runner=merge_runner)
+
+    result = mgr.sync_base(tmp_path / "wt", "main", remote_url=HTTPS_URL)
+
+    assert result == BaseSyncResult(path=tmp_path / "wt", base_branch="main", merged=True)
+    # Command 1: the one-shot authed fetch (token on the argv, refspec base).
+    fetch_cmd = calls[0]
+    assert fetch_cmd[:3] == ["git", "-C", str(tmp_path / "wt")]
+    assert fetch_cmd[3] == "fetch"
+    assert fetch_cmd[4] == f"https://x-access-token:{TOKEN}@github.com/arconta/some-repo.git"
+    assert fetch_cmd[5] == "main"
+    # The merge: MERGE (no rebase), --no-edit, FETCH_HEAD, bot identity via
+    # one-shot -c (spaced form — git rejects "-cuser.name=..." with exit 129).
+    merge_cmd = merge_runner.calls[0]
+    assert "merge" in merge_cmd
+    assert "rebase" not in merge_cmd
+    assert merge_cmd[merge_cmd.index("merge") + 1 :][:2] == ["--no-edit", "FETCH_HEAD"]
+    assert "user.name=sfp-coder-bot" in merge_cmd
+    assert "user.email=299957016+sfp-coder-bot@users.noreply.github.com" in merge_cmd
+    assert merge_cmd[:2] == ["git", "-C"]  # spaced -C, not the invalid -C<path>
+    # No push happened here — sync_base never pushes.
+    assert all("push" not in " ".join(c) for c in calls)
+
+
+def test_sync_base_reads_on_disk_origin_when_remote_url_none(tmp_path: Path) -> None:
+    """remote_url=None: the token-free on-disk origin is read via get-url, then
+    the token is injected into the throwaway fetch URL only."""
+    calls: list[list[str]] = []
+    shas = iter(["aaaa1111"])
+
+    def scripted(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        if _args(cmd)[:3] == ["remote", "get-url", "origin"]:
+            return _cp(HTTPS_URL)
+        if _args(cmd)[:2] == ["rev-parse", "HEAD"]:
+            return _cp(next(shas, "aaaa1111"))
+        return _cp()
+
+    mgr = RepoManager(TOKEN, runner=scripted, merge_runner=FakeMergeRunner())
+
+    mgr.sync_base(tmp_path / "wt", "main", remote_url=None)
+
+    # First command: read the token-free origin. Second: the AUTHED fetch URL
+    # built FROM that origin (token injected for this one invocation only).
+    assert calls[0][3:6] == ["remote", "get-url", "origin"]
+    assert calls[1][3] == "fetch"
+    assert calls[1][4] == f"https://x-access-token:{TOKEN}@github.com/arconta/some-repo.git"
+    # The on-disk origin was never rewritten (no set-url anywhere).
+    assert all("set-url" not in " ".join(c) for c in calls)
+
+
+def test_sync_base_conflict_aborts_and_names_files(tmp_path: Path) -> None:
+    """Conflict path: conflicted names are listed FIRST, then ``git merge
+    --abort`` runs, then BaseSyncConflictError raises with the names."""
+    merge_runner = FakeMergeRunner(returncode=1, stdout="CONFLICT (content): merge conflict")
+    order: list[str] = []
+
+    def scripted(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        joined = " ".join(cmd)
+        if _args(cmd)[:2] == ["rev-parse", "HEAD"]:
+            order.append("rev-parse")
+            return _cp("aaaa1111")
+        if "--diff-filter=U" in joined:
+            order.append("list-conflicted")
+            return _cp("src/a.py\nsrc/b.py\n")
+        if _args(cmd)[:2] == ["merge", "--abort"]:
+            order.append("merge-abort")
+            return _cp()
+        return _cp()
+
+    mgr = RepoManager(TOKEN, runner=scripted, merge_runner=merge_runner)
+
+    with pytest.raises(BaseSyncConflictError) as exc_info:
+        mgr.sync_base(tmp_path / "wt", "main", remote_url=HTTPS_URL)
+
+    err = exc_info.value
+    assert err.conflicted_files == ("src/a.py", "src/b.py")
+    assert "src/a.py" in str(err)
+    assert "src/b.py" in str(err)
+    assert "base stale" in str(err)
+    # Ordering: conflicted listing BEFORE the abort (the index still holds the
+    # conflicted state when --diff-filter=U runs).
+    assert order.index("list-conflicted") < order.index("merge-abort")
+    # No half-merge reported: the abort ran exactly once.
+    assert order.count("merge-abort") == 1
+
+
+def test_sync_base_conflict_redacts_token_from_message(tmp_path: Path) -> None:
+    """A conflict whose git stderr carries the token must not leak it — neither
+    in the message nor in the traceback (chain suppressed where relevant)."""
+    merge_runner = FakeMergeRunner(returncode=1)
+    err_listing = subprocess.CalledProcessError(
+        returncode=1, cmd=["git", "diff", "--name-only", "--diff-filter=U"], stderr=f"boom {TOKEN}"
+    )
+
+    def scripted(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        if _args(cmd)[:2] == ["rev-parse", "HEAD"]:
+            return _cp("aaaa1111")
+        if "--diff-filter=U" in " ".join(cmd):
+            raise err_listing
+        return _cp()
+
+    mgr = RepoManager(TOKEN, runner=scripted, merge_runner=merge_runner)
+
+    # The listing itself failing surfaces as RepoManagerError (fail-closed), not
+    # a half-aborted state.
+    with pytest.raises(RepoManagerError, match="failed to list conflicted files"):
+        mgr.sync_base(tmp_path / "wt", "main", remote_url=HTTPS_URL)
+
+
+def test_sync_base_fetch_failure_redacts_token(tmp_path: Path) -> None:
+    """A failed fetch surfaces a redacted RepoManagerError with no chain."""
+    err = subprocess.CalledProcessError(
+        returncode=128,
+        cmd=["git", "fetch", f"https://x-access-token:{TOKEN}@github.com/o/r.git", "main"],
+        stderr=f"fatal: Authentication failed for {TOKEN}",
+    )
+    runner = FakeRunner(side_effect=err, failing_cmd_prefix=("git", "-C"))
+    mgr = RepoManager(TOKEN, runner=runner, merge_runner=FakeMergeRunner())
+
+    with pytest.raises(RepoManagerError, match="git fetch failed") as exc_info:
+        mgr.sync_base(tmp_path / "wt", "main", remote_url=HTTPS_URL)
+
+    assert TOKEN not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+def test_sync_base_origin_read_failure_fails_closed(tmp_path: Path) -> None:
+    """remote_url=None and the on-disk origin cannot be read (no remote
+    configured): a redacted RepoManagerError, before any fetch/merge runs."""
+    err = subprocess.CalledProcessError(
+        returncode=2, cmd=["git", "remote", "get-url", "origin"], stderr=f"no such remote {TOKEN}"
+    )
+
+    # Production invokes the runner as ["git", "-C", <path>, "remote", ...], so
+    # the subcommand lives at argv index 3 (see _args) — a prefix of
+    # ("git", "-C", "remote") would never match because <path> sits between.
+    def failing_remote_read(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        if _args(cmd)[:2] == ["remote", "get-url"]:
+            raise err
+        return _cp()
+
+    merge_runner = FakeMergeRunner()
+
+    mgr = RepoManager(TOKEN, runner=failing_remote_read, merge_runner=merge_runner)
+
+    with pytest.raises(RepoManagerError, match="failed to read origin") as exc_info:
+        mgr.sync_base(tmp_path / "wt", "main", remote_url=None)
+
+    assert TOKEN not in str(exc_info.value)
+    # Fail-closed before the merge: the merge runner was never invoked.
+    assert merge_runner.calls == []
+
+
+def test_sync_base_rev_parse_failure_degrades_to_empty_sha(tmp_path: Path) -> None:
+    """A rev-parse that fails on a synced worktree (should not happen) degrades
+    to '' — the no-op detection under-reports ``merged`` rather than raising."""
+    merge_runner = FakeMergeRunner(returncode=0)
+
+    def scripted(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        if _args(cmd)[:2] == ["rev-parse", "HEAD"]:
+            raise subprocess.CalledProcessError(returncode=128, cmd=list(cmd), stderr="not a repo")
+        return _cp()
+
+    mgr = RepoManager(TOKEN, runner=scripted, merge_runner=merge_runner)
+
+    result = mgr.sync_base(tmp_path / "wt", "main", remote_url=HTTPS_URL)
+
+    # Both rev-parses failed -> '' != '' is False -> under-reported as a no-op.
+    assert result.merged is False
+
+
+def test_sync_base_failed_abort_reports_dirty_state_not_conflict(tmp_path: Path) -> None:
+    """If ``git merge --abort`` itself fails, the error raised is the ABORT
+    failure (worktree possibly half-merged) — never a clean conflict error."""
+    merge_runner = FakeMergeRunner(returncode=1)
+    abort_err = subprocess.CalledProcessError(
+        returncode=128, cmd=["git", "merge", "--abort"], stderr="cannot abort"
+    )
+
+    def scripted(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        if _args(cmd)[:2] == ["rev-parse", "HEAD"]:
+            return _cp("aaaa1111")
+        if "--diff-filter=U" in " ".join(cmd):
+            return _cp("src/a.py\n")
+        if _args(cmd)[:2] == ["merge", "--abort"]:
+            raise abort_err
+        return _cp()
+
+    mgr = RepoManager(TOKEN, runner=scripted, merge_runner=merge_runner)
+
+    with pytest.raises(RepoManagerError, match="merge --abort.*failed") as exc_info:
+        mgr.sync_base(tmp_path / "wt", "main", remote_url=HTTPS_URL)
+
+    assert not isinstance(exc_info.value, BaseSyncConflictError)
+
+
+def test_sync_base_noop_when_head_did_not_move(tmp_path: Path) -> None:
+    """Base already current: git exits 0 and HEAD is UNCHANGED -> merged=False,
+    with no locale-dependent stdout parsing."""
+    merge_runner = FakeMergeRunner(returncode=0, stdout="Already up to date.")
+    same = iter(["aaaa1111", "aaaa1111"])
+
+    def scripted(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        if _args(cmd)[:2] == ["rev-parse", "HEAD"]:
+            return _cp(next(same))
+        return _cp()
+
+    mgr = RepoManager(TOKEN, runner=scripted, merge_runner=merge_runner)
+
+    result = mgr.sync_base(tmp_path / "wt", "main", remote_url=HTTPS_URL)
+
+    assert result.merged is False
+
+
+def test_sync_base_never_writes_token_to_config(tmp_path: Path) -> None:
+    """No ``git config`` / ``remote set-url`` is issued — the on-disk origin is
+    never touched by the sync (token lives only on the one fetch argv)."""
+    runner = FakeRunner()
+    shas = iter(["aaaa1111", "bbbb2222"])
+
+    def scripted(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        if _args(cmd)[:2] == ["rev-parse", "HEAD"]:
+            return _cp(next(shas))
+        return FakeRunner.__call__(runner, cmd)
+
+    mgr = RepoManager(TOKEN, runner=scripted, merge_runner=FakeMergeRunner())
+
+    mgr.sync_base(tmp_path / "wt", "main", remote_url=HTTPS_URL)
+
+    joined = [" ".join(c) for c in runner.calls]
+    assert all("set-url" not in j for j in joined)
+    assert all("git config" not in j for j in joined)
+
+
+# ---------------------------------------------------------------------------
+# sync_base — integration (real git against a local bare remote, file://)
+# ---------------------------------------------------------------------------
+
+
+def _git(*args: str, cwd: Path | None = None) -> str:
+    """Run git, returning stdout (check=True — the test asserts on success).
+
+    Spaced ``-C <path>`` only: git rejects the attached ``-C<path>`` spelling
+    with exit 129 ("unknown option"), verified against git 2.54.
+    """
+    cmd = ["git"] + (["-C", str(cwd)] if cwd else []) + list(args)
+    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return (proc.stdout or "").strip()
+
+
+def _seed_remote_and_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a bare remote (main @ 'seed') and a ticket-branch worktree.
+
+    The worktree is a real ``git worktree`` off a clone, exactly as the
+    pipeline creates them — sync_base merges INTO the checked-out branch.
+    """
+    remote = _seed_bare_remote(tmp_path / "remote.git")
+    _shutil.rmtree(tmp_path / "seed-work")
+    clone = tmp_path / "clone"
+    mgr = RepoManager("")
+    mgr.clone(f"file://{remote}", clone)
+    branch = "sfp-240-integration"
+    subprocess.run(
+        ["git", "-C", str(clone), "worktree", "add", "-b", branch, str(tmp_path / "wt")],
+        check=True,
+        capture_output=True,
+    )
+    return remote, tmp_path / "wt"
+
+
+def _commit_all(repo: Path, filename: str, content: str, message: str) -> None:
+    (repo / filename).write_text(content)
+    _git("add", ".", cwd=repo)
+    _git("commit", "-m", message, cwd=repo)
+
+
+def test_integration_sync_base_merges_stale_base_and_pushes_conflict_free(
+    tmp_path: Path,
+) -> None:
+    """Stale base: main advances on the remote AFTER the branch diverges; the
+    sync merges it in and the branch then pushes clean (PR would open
+    conflict-free against current main)."""
+    remote, wt = _seed_remote_and_worktree(tmp_path)
+    clone = tmp_path / "clone"
+
+    # Diverge: ticket commit on the branch (worktree), base commit on main.
+    _commit_all(wt, "ticket.txt", "ticket\n", "ticket work")
+    _commit_all(clone, "base.txt", "base\n", "base advance")
+    _git("push", "origin", "main", cwd=clone)
+
+    mgr = RepoManager("")
+    result = mgr.sync_base(wt, "main")
+
+    assert result.merged is True
+    # Both files are present post-merge — the merged tree carries the base.
+    assert (wt / "base.txt").read_text() == "base\n"
+    assert (wt / "ticket.txt").read_text() == "ticket\n"
+    # The merge commit is authored as the bot identity.
+    log = _git("log", "-1", "--format=%an <%ae>", cwd=wt)
+    assert log == "sfp-coder-bot <299957016+sfp-coder-bot@users.noreply.github.com>"
+    # No conflicted state remains.
+    assert _git("diff", "--name-only", "--diff-filter=U", cwd=wt) == ""
+    # And the branch pushes clean against current main (no 405-style surprise).
+    subprocess.run(
+        ["git", "-C", str(wt), "push", f"file://{remote}", "HEAD:refs/heads/sfp-240-integration"],
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_integration_sync_base_conflict_aborts_fail_closed(tmp_path: Path) -> None:
+    """Conflicting base: both sides touch the SAME file; the sync aborts with
+    the named file and the worktree is left PRE-merge (no conflict markers, no
+    unresolved index, original content intact)."""
+    _remote, wt = _seed_remote_and_worktree(tmp_path)
+    clone = tmp_path / "clone"
+
+    # Both sides modify the seeded README -> content conflict.
+    _commit_all(wt, "README", "ticket side\n", "ticket edit")
+    _commit_all(clone, "README", "base side\n", "base edit")
+    _git("push", "origin", "main", cwd=clone)
+
+    mgr = RepoManager("")
+    with pytest.raises(BaseSyncConflictError) as exc_info:
+        mgr.sync_base(wt, "main")
+
+    assert exc_info.value.conflicted_files == ("README",)
+    assert "README" in str(exc_info.value)
+    # `git merge --abort` ran: NO unresolved index entries remain...
+    assert _git("diff", "--name-only", "--diff-filter=U", cwd=wt) == ""
+    # ...no MERGE_HEAD (not mid-merge)...
+    assert (
+        subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+            capture_output=True,
+        ).returncode
+        != 0
+    )
+    # ...no conflict markers in the working file...
+    assert "<<<" not in (wt / "README").read_text()
+    # ...and the ticket side's content is intact (pre-merge state restored).
+    assert (wt / "README").read_text() == "ticket side\n"
+    # Nothing was committed by the aborted merge attempt.
+    assert _git("log", "-1", "--format=%s", cwd=wt) == "ticket edit"
+
+
+def test_integration_sync_base_noop_when_base_current(tmp_path: Path) -> None:
+    """Base current: the sync is a cheap no-op — merged=False, HEAD unchanged,
+    and the working tree is untouched."""
+    _remote, wt = _seed_remote_and_worktree(tmp_path)
+    # Ticket commit only; main has NOT advanced since the branch was created.
+    _commit_all(wt, "ticket.txt", "ticket\n", "ticket work")
+
+    head_before = _git("rev-parse", "HEAD", cwd=wt)
+    mgr = RepoManager("")
+    result = mgr.sync_base(wt, "main")
+
+    assert result.merged is False
+    assert _git("rev-parse", "HEAD", cwd=wt) == head_before
+    assert (wt / "ticket.txt").read_text() == "ticket\n"
+    assert _git("status", "--porcelain", cwd=wt) == ""
+
+
+def test_integration_sync_base_repeated_call_is_idempotent(tmp_path: Path) -> None:
+    """Determinism: running the sync twice yields the same outcome — the second
+    call is the no-op (the first already merged the base)."""
+    remote, wt = _seed_remote_and_worktree(tmp_path)
+    clone = tmp_path / "clone"
+    _commit_all(wt, "ticket.txt", "ticket\n", "ticket work")
+    _commit_all(clone, "base.txt", "base\n", "base advance")
+    _git("push", "origin", "main", cwd=clone)
+
+    mgr = RepoManager("")
+    first = mgr.sync_base(wt, "main")
+    second = mgr.sync_base(wt, "main")
+
+    assert first.merged is True
+    assert second.merged is False
+    assert _git("status", "--porcelain", cwd=wt) == ""
