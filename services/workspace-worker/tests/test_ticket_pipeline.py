@@ -50,7 +50,13 @@ from workspace_worker.repo.git.adapter import (
     PullRequestResult,
     ReviewResult,
 )
-from workspace_worker.repo.manager import CloneResult, PushResult
+from workspace_worker.repo.manager import (
+    BaseSyncConflictError,
+    BaseSyncResult,
+    CloneResult,
+    PushResult,
+    RepoManagerError,
+)
 from workspace_worker.repo.worktree import WorktreeResult
 
 TICKET = "SFP-224"
@@ -305,12 +311,37 @@ def _make_runtimes(
 
 
 class FakeRepoManager:
-    def __init__(self) -> None:
+    """Records clone / sync_base / push (SFP-240 adds the base-sync stage).
+
+    ``sync_base`` behavior is injectable per-instance so a test can simulate
+    the clean-merge, no-op, conflict, and generic-failure outcomes without
+    real git: set ``sync_base_result`` / ``sync_base_exc`` before ``_run``.
+    """
+
+    def __init__(
+        self,
+        *,
+        sync_base_result: BaseSyncResult | None = None,
+        sync_base_exc: Exception | None = None,
+    ) -> None:
         self.calls: list[tuple[str, ...]] = []
+        self._sync_base_result = sync_base_result
+        self._sync_base_exc = sync_base_exc
 
     def clone(self, repo_url: str, dest: Path) -> CloneResult:
         self.calls.append(("clone", repo_url, str(dest)))
         return CloneResult(path=dest, cloned=True)
+
+    def sync_base(
+        self, worktree_path: str | Path, base_branch: str, *, remote_url: str | None = None
+    ) -> BaseSyncResult:
+        self.calls.append(("sync_base", str(worktree_path), base_branch))
+        if self._sync_base_exc is not None:
+            raise self._sync_base_exc
+        if self._sync_base_result is not None:
+            return self._sync_base_result
+        # Default: the no-op case — the branch base already contains the base.
+        return BaseSyncResult(path=Path(worktree_path), base_branch=base_branch, merged=False)
 
     def push(
         self, repo_path: str | Path, branch: str, *, remote_url: str | None = None
@@ -514,6 +545,7 @@ def test_happy_path_trace_is_the_exact_linear_order(tmp_path: Path) -> None:
         "repo_manager.clone",
         "worktree.add",
         "code",
+        "repo_manager.sync_base",
         "build",
         "run_tests",
         "lint",
@@ -547,6 +579,97 @@ def test_push_branch_is_never_called_object_upload_uses_repo_manager(
     # and the test would error out rather than return success.
     result, _ = _run(tmp_path, runtimes)
     assert result.success is True
+
+
+# --------------------------------------------------------------------------- #
+# Pre-push base sync (SFP-240)
+# --------------------------------------------------------------------------- #
+
+
+def test_base_sync_conflict_aborts_fail_closed_before_gates_and_push(
+    tmp_path: Path,
+) -> None:
+    """AP-CONFLICT: a conflicting base aborts BEFORE any gate/push/PR with the
+    conflicted file names and the operator's recovery recipe (--resume)."""
+    runtimes, _ = _make_runtimes(approved=True)
+    conflict = BaseSyncConflictError(
+        "base stale: merge conflicts in src/a.py, src/b.py", ("src/a.py", "src/b.py")
+    )
+    result, fakes = _run(tmp_path, runtimes, repo_manager=FakeRepoManager(sync_base_exc=conflict))
+
+    assert result.success is False
+    assert result.pr_number is None
+    # Named files + actionable guidance in the error.
+    assert "src/a.py" in (result.error or "")
+    assert "src/b.py" in (result.error or "")
+    assert "base stale" in (result.error or "")
+    assert "--resume" in (result.error or "")
+    assert str(tmp_path / "wt" / TICKET) in (result.error or "")
+    # Fail-closed: sync_base ran, but NOTHING downstream — no gates on a
+    # conflicted tree, no push, no PR, no merge, no Jira transition.
+    assert ("sync_base", str(tmp_path / "wt" / TICKET), "main") in fakes["repo_manager"].calls
+    assert not any(c[0] == "push" for c in fakes["repo_manager"].calls)
+    assert fakes["coder_adapter"].calls == []
+    assert fakes["jira"].transitions == []
+    assert list(result.trace) == [
+        "jira.fetch_issue",
+        "evaluate_readiness",
+        "plan",
+        "design_tests",
+        "repo_manager.clone",
+        "worktree.add",
+        "code",
+        "repo_manager.sync_base",
+    ]
+
+
+def test_base_sync_conflict_with_no_named_files_still_names_the_case(
+    tmp_path: Path,
+) -> None:
+    """Degenerate conflict (git reported no U-paths): the message degrades to
+    '(none)' rather than an empty file list."""
+    runtimes, _ = _make_runtimes(approved=True)
+    result, _ = _run(
+        tmp_path,
+        runtimes,
+        repo_manager=FakeRepoManager(sync_base_exc=BaseSyncConflictError("base stale", ())),
+    )
+    assert result.success is False
+    assert "merge conflicts in (none)" in (result.error or "")
+
+
+def test_base_sync_generic_failure_aborts_before_push(tmp_path: Path) -> None:
+    """A non-conflict sync failure (e.g. fetch error) also aborts fail-closed,
+    without the conflict phrasing."""
+    runtimes, _ = _make_runtimes(approved=True)
+    result, _ = _run(
+        tmp_path,
+        runtimes,
+        repo_manager=FakeRepoManager(
+            sync_base_exc=RepoManagerError("git fetch failed for https://…")
+        ),
+    )
+    assert result.success is False
+    assert "base sync failed" in (result.error or "")
+    assert "base stale" not in (result.error or "")
+
+
+def test_base_sync_runs_before_all_gates_and_push(tmp_path: Path) -> None:
+    """AP-ORDER: sync_base precedes build/tests/lint and push — the gates verify
+    the POST-merge tree, and the pushed tree is that verified tree."""
+    runtimes, _ = _make_runtimes(approved=True)
+    result, fakes = _run(tmp_path, runtimes)
+    assert result.success is True
+
+    calls = fakes["repo_manager"].calls
+    stages = [c[0] for c in calls]
+    assert stages.index("sync_base") < stages.index("push")
+    # In the trace the sync sits between code and the first gate (build).
+    trace = list(result.trace)
+    assert trace.index("repo_manager.sync_base") == trace.index("code") + 1
+    assert trace.index("build") == trace.index("repo_manager.sync_base") + 1
+    # Happy path still pushes + opens the PR when the base is current (no-op).
+    assert "push" in stages
 
 
 # --------------------------------------------------------------------------- #
@@ -906,6 +1029,7 @@ _FULL_TRACE: tuple[str, ...] = (
     "repo_manager.clone",
     "worktree.add",
     "code",
+    "repo_manager.sync_base",
     "build",
     "run_tests",
     "lint",
