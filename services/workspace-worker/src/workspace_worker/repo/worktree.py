@@ -12,7 +12,9 @@ Lifecycle — one worktree per job, removed on completion:
   ``<base_dir>/<job_id>`` by checking out the caller-supplied ``ref`` (opaque —
   a branch, tag, or commit), and returns a :class:`WorktreeResult` describing
   it. A distinct path per ``job_id`` is what guarantees one-worktree-per-job
-  isolation (ID-033).
+  isolation (ID-033). An existing-but-invalid path at that slot (stale debris
+  from a torn-down run) self-heals — remove + recreate — instead of failing
+  the run (SFP-239); an existing *valid* worktree is still never clobbered.
 * :meth:`WorktreeManager.remove` tears that worktree down again
   (``git worktree remove --force`` + ``shutil.rmtree`` + ``git worktree
   prune``) and is idempotent on an already-removed worktree.
@@ -32,13 +34,19 @@ end-to-end against a local repo.
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 
+from workspace_worker.repo._validation import is_valid_git_repo, remove_path
+
 __all__ = ["WorktreeError", "WorktreeManager", "WorktreeResult"]
+
+#: Module logger — stale-worktree recovery events land here for ops observability.
+_log = logging.getLogger(__name__)
 
 #: Signature of the injectable git runner (defaults to :func:`subprocess.run`).
 Runner = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
@@ -167,20 +175,38 @@ class WorktreeManager:
             The :class:`WorktreeResult` (its ``path`` is the worktree directory).
 
         Raises:
-            WorktreeError: if ``<base_dir>/<job_id>`` already exists (refuses to
-                clobber — no git call is made), if ``job_id`` reduces to no path
-                component, or if ``git worktree add`` fails (e.g. the main repo
-                is not a git repository, or ``ref`` is unknown). The git stderr
-                is surfaced.
+            WorktreeError: if ``<base_dir>/<job_id>`` already exists AND is a
+                valid worktree (refuses to clobber — no ``git worktree`` call is
+                made; a path that exists but is not a valid worktree
+                self-heals: remove + recreate, SFP-239); if the stale path
+                cannot be removed for re-creation; if ``job_id`` reduces to no
+                path component; or if ``git worktree add`` fails (e.g. the main
+                repo is not a git repository, or ``ref`` is unknown). The git
+                stderr is surfaced.
         """
         worktree_path = base_dir / _sanitize_job_id(job_id)
 
-        # Refuse to clobber an existing per-job path — mirror manager.py's
-        # refuse-to-clobber discipline: surface the state explicitly rather than
-        # letting `git worktree add` produce a confusing nested error. No git
-        # call is made in this branch.
-        if worktree_path.exists():
-            raise WorktreeError(f"worktree path already exists: {worktree_path}")
+        # Refuse to clobber an existing *valid* per-job worktree — that would
+        # destroy another run's in-progress checkout (one-worktree-per-job,
+        # ID-033). But a path that exists yet is NOT a valid worktree is stale
+        # debris (a torn-down run, a hollowed directory); leaving it in place
+        # makes `git worktree add` fail with a raw nested error. So: validate
+        # precisely with git's repository probe (SFP-239) — valid → refuse
+        # (no git worktree call), invalid → self-heal (remove + recreate).
+        if worktree_path.exists() or worktree_path.is_symlink():
+            if is_valid_git_repo(worktree_path, self._runner):
+                raise WorktreeError(f"worktree path already exists: {worktree_path}")
+            _log.warning(
+                "stale worktree path %s is not a valid git worktree; recreating",
+                worktree_path,
+            )
+            try:
+                remove_path(worktree_path)
+            except OSError as exc:
+                raise WorktreeError(
+                    f"corrupt worktree path {worktree_path} could not be removed "
+                    f"for re-creation (remove it manually): {exc}"
+                ) from exc
 
         # `git worktree add <path> <ref>` checks out `ref` into the worktree and
         # creates any missing parent directories (base_dir need not pre-exist).

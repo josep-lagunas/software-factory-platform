@@ -11,7 +11,7 @@ Two layers:
 
 from __future__ import annotations
 
-import shutil as _shutil
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -88,6 +88,13 @@ def test_strip_userinfo_on_already_clean_url_is_noop() -> None:
     assert _strip_userinfo(HTTPS_URL) == HTTPS_URL
 
 
+#: Skip real-git integration tests when ``git`` is unavailable. Unit tests use
+#: the FakeRunner and never spawn git, so they always run.
+requires_git = pytest.mark.skipif(
+    shutil.which("git") is None, reason="git binary required for integration tests"
+)
+
+
 # ---------------------------------------------------------------------------
 # clone — command shape (token injected, then stripped)
 # ---------------------------------------------------------------------------
@@ -133,7 +140,7 @@ def test_clone_for_non_https_url_skips_token_injection(tmp_path: Path) -> None:
 
 
 def test_clone_is_idempotent_when_dest_is_a_repo(tmp_path: Path) -> None:
-    runner = FakeRunner()
+    runner = FakeRunner()  # probe succeeds → the cache entry is a valid repo
     dest = tmp_path / "repo"
     (dest / ".git").mkdir(parents=True)  # existing clone
     mgr = RepoManager(TOKEN, runner=runner)
@@ -141,18 +148,33 @@ def test_clone_is_idempotent_when_dest_is_a_repo(tmp_path: Path) -> None:
     result = mgr.clone(HTTPS_URL, dest)
 
     assert result == CloneResult(path=dest, cloned=False)
-    assert runner.calls == []  # no git invocation at all
+    # Reuse only: the single git invocation is the validity probe — no clone,
+    # no set-url, no removal of the healthy cache entry.
+    assert runner.calls == [["git", "-C", str(dest), "rev-parse", "--git-dir"]]
+    assert dest.exists()  # healthy cache left untouched
 
 
-def test_clone_raises_when_dest_exists_but_not_a_repo(tmp_path: Path) -> None:
-    runner = FakeRunner()
+def test_clone_rebuilds_when_dest_exists_but_is_not_a_repo(tmp_path: Path) -> None:
+    """SFP-239: a stray non-repo dir in the worker-owned cache is a miss, not a refusal.
+
+    The landed behavior refused ("destination exists and is not a git
+    repository"); the cache under SFP_WORKTREE_BASE is worker-owned, so the
+    entry is now removed and re-cloned instead.
+    """
+    runner = FakeRunner(
+        failing_cmd_prefix=("git", "-C", str(tmp_path / "repo"), "rev-parse", "--git-dir"),
+        side_effect=subprocess.CalledProcessError(
+            returncode=128, cmd=[], stderr="fatal: not a git repository"
+        ),
+    )
     dest = tmp_path / "repo"
     dest.mkdir()  # exists, but no .git
     mgr = RepoManager(TOKEN, runner=runner)
 
-    with pytest.raises(RepoManagerError, match="not a git repository"):
-        mgr.clone(HTTPS_URL, dest)
-    assert runner.calls == []  # bailed before any git call
+    result = mgr.clone(HTTPS_URL, dest)
+
+    assert result == CloneResult(path=dest, cloned=True)  # rebuilt
+    assert dest.exists() is False  # stray dir removed before the re-clone
 
 
 # ---------------------------------------------------------------------------
@@ -250,10 +272,9 @@ def _seed_bare_remote(remote_dir: Path) -> Path:
 def test_integration_clone_creates_repo_with_clean_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import shutil as _shutil  # noqa: PLC0415 — local import keeps top clean
 
     remote = _seed_bare_remote(tmp_path / "remote.git")
-    _shutil.rmtree(tmp_path / "seed-work")  # tidy the seeding scaffold
+    shutil.rmtree(tmp_path / "seed-work")  # tidy the seeding scaffold
     file_url = f"file://{remote}"
     dest = tmp_path / "checkout"
 
@@ -379,7 +400,7 @@ def test_integration_push_uploads_commit_and_keeps_config_token_free(
     """Real git: clone, commit a file, push() — the commit arrives on the remote
     and ``.git/config`` stays token-free (no set-url ever wrote the token)."""
     remote = _seed_bare_remote(tmp_path / "remote.git")
-    _shutil.rmtree(tmp_path / "seed-work")
+    shutil.rmtree(tmp_path / "seed-work")
     file_url = f"file://{remote}"
     clone_dest = tmp_path / "checkout"
 
@@ -441,7 +462,7 @@ def test_integration_push_uploads_commit_and_keeps_config_token_free(
 
 def test_integration_clone_is_idempotent_real_git(tmp_path: Path) -> None:
     remote = _seed_bare_remote(tmp_path / "remote.git")
-    _shutil.rmtree(tmp_path / "seed-work")
+    shutil.rmtree(tmp_path / "seed-work")
     dest = tmp_path / "checkout"
 
     mgr = RepoManager("")
@@ -764,7 +785,7 @@ def _seed_remote_and_worktree(tmp_path: Path) -> tuple[Path, Path]:
     pipeline creates them — sync_base merges INTO the checked-out branch.
     """
     remote = _seed_bare_remote(tmp_path / "remote.git")
-    _shutil.rmtree(tmp_path / "seed-work")
+    shutil.rmtree(tmp_path / "seed-work")
     clone = tmp_path / "clone"
     mgr = RepoManager("")
     mgr.clone(f"file://{remote}", clone)
@@ -886,3 +907,164 @@ def test_integration_sync_base_repeated_call_is_idempotent(tmp_path: Path) -> No
     assert first.merged is True
     assert second.merged is False
     assert _git("status", "--porcelain", cwd=wt) == ""
+
+
+# clone — cache validation (SFP-239)
+# ---------------------------------------------------------------------------
+
+
+def test_clone_hollow_cache_is_recloned_unit(tmp_path: Path) -> None:
+    """Hollow clone (.git present but unusable) → cache miss: probe, remove, re-clone.
+
+    The reuse branch must NOT return ``cloned=False`` for an entry git rejects.
+    """
+    runner = FakeRunner(
+        failing_cmd_prefix=("git", "-C", str(tmp_path / "repo"), "rev-parse", "--git-dir"),
+        side_effect=subprocess.CalledProcessError(
+            returncode=128, cmd=[], stderr="fatal: not a git repository"
+        ),
+    )
+    dest = tmp_path / "repo"
+    (dest / ".git").mkdir(parents=True)  # directory exists, .git exists (hollow)
+    mgr = RepoManager(TOKEN, runner=runner)
+
+    result = mgr.clone(HTTPS_URL, dest)
+
+    assert result == CloneResult(path=dest, cloned=True)  # re-cloned
+    assert dest.exists() is False  # the hollow tree was removed before re-clone
+    # Probe → (hollow tree removed) → clone → set-url. Exactly three git
+    # invocations, in order; the clone argv carries the token (in-memory only).
+    assert len(runner.calls) == 3
+    assert runner.calls[0] == ["git", "-C", str(dest), "rev-parse", "--git-dir"]
+    assert runner.calls[1] == [
+        "git",
+        "clone",
+        f"https://x-access-token:{TOKEN}@github.com/arconta/some-repo.git",
+        str(dest),
+    ]
+    assert runner.calls[2][:6] == [
+        "git",
+        "-C",
+        str(dest),
+        "remote",
+        "set-url",
+        "origin",
+    ]
+
+
+def test_clone_healthy_cache_is_reused_no_reclone_unit(tmp_path: Path) -> None:
+    """Healthy cache → reuse only: the probe runs, the clone command never does."""
+    runner = FakeRunner()  # every probe succeeds
+    dest = tmp_path / "repo"
+    (dest / ".git").mkdir(parents=True)
+    mgr = RepoManager(TOKEN, runner=runner)
+
+    result = mgr.clone(HTTPS_URL, dest)
+
+    assert result == CloneResult(path=dest, cloned=False)
+    # The ONE allowed invocation is the validity probe — no clone, no set-url.
+    assert runner.calls == [["git", "-C", str(dest), "rev-parse", "--git-dir"]]
+
+
+def test_clone_missing_dest_skips_probe_unit(tmp_path: Path) -> None:
+    """Cold cache (nothing exists) → no probe at all, straight to clone."""
+    runner = FakeRunner()
+    mgr = RepoManager(TOKEN, runner=runner)
+
+    mgr.clone(HTTPS_URL, tmp_path / "fresh")
+
+    assert [c[1] for c in runner.calls] == ["clone", "-C"]  # clone then set-url
+
+
+def test_clone_unremovable_corrupt_cache_surfaces_actionable_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removal failure (permissions/partial state) must not crash mid-recovery."""
+    dest = tmp_path / "repo"
+    (dest / ".git").mkdir(parents=True)
+    runner = FakeRunner(
+        failing_cmd_prefix=("git", "-C", str(dest), "rev-parse", "--git-dir"),
+        side_effect=subprocess.CalledProcessError(
+            returncode=128, cmd=[], stderr="fatal: not a git repository"
+        ),
+    )
+    mgr = RepoManager(TOKEN, runner=runner)
+
+    def _boom(path: object) -> None:
+        raise PermissionError("EACCES")
+
+    monkeypatch.setattr("workspace_worker.repo.manager.remove_path", _boom)
+
+    with pytest.raises(RepoManagerError, match=r"could not be removed.*remove it manually"):
+        mgr.clone(HTTPS_URL, dest)
+    # Failed before any network-bearing git command.
+    assert [c[1] for c in runner.calls] == ["-C"]
+
+
+@requires_git
+def test_integration_hollow_cache_recovers_and_run_proceeds(tmp_path: Path) -> None:
+    """End-to-end: a purged .git under the cache path no longer kills the run.
+
+    Reproduces the SFP-137 dogfood failure mode (hollow cached clone) against a
+    real file:// remote, then asserts the second run recovers and yields a
+    working repository.
+    """
+
+    remote = _seed_bare_remote(tmp_path / "remote.git")
+    shutil.rmtree(tmp_path / "seed-work")
+    dest = tmp_path / "clone"
+    mgr = RepoManager("")
+
+    first = mgr.clone(f"file://{remote}", dest)
+    assert first.cloned is True
+
+    # Hollow the cache exactly as /tmp cleanup did: contents of .git purged,
+    # directory shells left behind.
+    for child in (dest / ".git").iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+    second = mgr.clone(f"file://{remote}", dest)  # previously: WorktreeError downstream
+
+    assert second.cloned is True  # treated as a miss, rebuilt
+    assert second.path == dest
+    # The recovered clone is a real, usable repository.
+    probe = subprocess.run(
+        ["git", "-C", str(dest), "rev-parse", "--git-dir"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0
+    assert (dest / ".git").is_dir()
+
+
+@requires_git
+def test_integration_healthy_cache_is_reused_no_forced_reclone(tmp_path: Path) -> None:
+    """Healthy cache stays reused: no re-clone, and HEAD is left untouched."""
+
+    remote = _seed_bare_remote(tmp_path / "remote.git")
+    shutil.rmtree(tmp_path / "seed-work")
+    dest = tmp_path / "clone"
+    mgr = RepoManager("")
+
+    mgr.clone(f"file://{remote}", dest)
+    head_before = subprocess.run(
+        ["git", "-C", str(dest), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    second = mgr.clone(f"file://{remote}", dest)
+
+    assert second.cloned is False
+    head_after = subprocess.run(
+        ["git", "-C", str(dest), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert head_before == head_after  # nothing was torn down or rebuilt
