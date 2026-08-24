@@ -50,7 +50,7 @@ import json
 import logging
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -79,15 +79,22 @@ from workspace_worker.exec.lint import lint as _run_lint
 from workspace_worker.exec.tests import run_tests as _run_tests
 from workspace_worker.infrastructure.settings import WorkspaceWorkerSettings
 from workspace_worker.repo.branch import BranchManager
-from workspace_worker.repo.git.adapter import GitProviderAdapter
+from workspace_worker.repo.git.adapter import GitProviderAdapter, PullRequestReview
 from workspace_worker.repo.jira.client import JiraClient
-from workspace_worker.repo.manager import RepoManager
+from workspace_worker.repo.manager import BaseSyncConflictError, RepoManager, RepoManagerError
 from workspace_worker.repo.worktree import WorktreeManager, _sanitize_job_id
 from workspace_worker.workflow.context_resolver import resolve_context
 from workspace_worker.workflow.frontier import compute_at_frontier
 from workspace_worker.workflow.readiness_gate import evaluate_readiness
 
-__all__ = ["PipelineDeps", "PipelineResult", "build", "main", "run_pipeline"]
+__all__ = [
+    "PipelineDeps",
+    "PipelineResult",
+    "build",
+    "effective_review_state",
+    "main",
+    "run_pipeline",
+]
 
 #: Jira transition id for "Done" (the only status transition the loop emits;
 #: 31/41/51 are the workflow's ids — PRSpec risk). Applied AFTER a confirmed
@@ -277,6 +284,54 @@ def _build_pr_body(ticket_key: str, pr_spec: PrSpec, coder_output: CoderOutput) 
     # JIRA convention line (required by the PR format — ID-025).
     sections.append(f"JIRA: https://arconta.atlassian.net/browse/{ticket_key}")
     return "\n\n".join(sections)
+
+
+def effective_review_state(reviews: Sequence[PullRequestReview], head_sha: str) -> str:
+    """Compute the PR's effective review state for ``head_sha`` (SFP-241).
+
+    Mirrors GitHub's branch-protection semantics as observable from the reviews
+    list: a review counts for the current head only when its ``commit_id``
+    matches ``head_sha``; among those, the LATEST non-``PENDING`` review by list
+    position decides — GitHub returns reviews oldest-first, so the last
+    matching non-``PENDING`` entry is the most recent one.
+
+    Decision table (``commit_id == head_sha``, non-``PENDING``, latest match):
+
+    * ``APPROVED`` → ``"APPROVED"`` (a valid approval — do NOT re-review).
+    * ``DISMISSED`` → ``"DISMISSED"`` (stale-dismissed approval; re-review).
+    * ``CHANGES_REQUESTED`` / ``COMMENTED`` → that state (re-review).
+    * No matching review at all → ``""`` (absent; re-review).
+
+    ``COMMENTED`` is deliberately *not* treated as an approval — GitHub counts
+    only ``APPROVED`` as satisfying a reviews-required rule, so a latest
+    matching ``COMMENTED`` review means "not approved". ``PENDING`` reviews are
+    skipped (they are not yet submitted and carry no verdict); a mismatched
+    ``commit_id`` means the review predates the current head (stale). Fail
+    closed: anything that is not a matching ``APPROVED`` yields a non-``APPROVED``
+    value, so the caller's not-approve branch decides.
+
+    Deterministic: a pure function of its arguments (no network, no clock).
+
+    Args:
+        reviews: The PR review records in GitHub list order (oldest first), as
+            returned by :meth:`GitProviderAdapter.list_pr_reviews`.
+        head_sha: The current head commit SHA of the PR.
+
+    Returns:
+        The effective review state string — ``"APPROVED"`` only when a review
+        whose ``commit_id`` equals ``head_sha`` with state ``APPROVED`` is the
+        latest non-``PENDING`` match; otherwise the latest matching state
+        (``DISMISSED`` / ``CHANGES_REQUESTED`` / ``COMMENTED``) or ``""`` when
+        no review matches the head.
+    """
+    effective = ""
+    for entry in reviews:
+        if entry.state == "PENDING":
+            continue
+        if entry.commit_id != head_sha:
+            continue
+        effective = entry.state
+    return effective
 
 
 def run_pipeline(
@@ -510,8 +565,35 @@ def run_pipeline(
     else:
         _log.info("resume: skipping code stage (checkpoint present) for %s", ticket_key)
 
-    # 9-11. Local Execution Engine gates — build, tests, lint. Each is fail-fast:
-    # a non-success aborts BEFORE push (no PR is opened against a red tree).
+    # 9. Pre-push base sync (SFP-240) — merge origin/<base_branch> into the
+    #    ticket branch IN THE WORKTREE before any gate runs, so the gates below
+    #    verify the POST-merge tree (the exact tree that will be pushed). Merge,
+    #    never rebase — rebase would rewrite the Coder's commits. A conflict
+    #    aborts fail-closed with the conflicted file names (the worktree is left
+    #    pre-merge via `git merge --abort` inside sync_base); the operator
+    #    resolves in the worktree and re-runs with --resume. The LOCAL-merge
+    #    route (not GitProviderAdapter.sync_branch, SFP-59) is chosen because it
+    #    surfaces named-file conflicts locally at push time and pushes a
+    #    byte-identical verified tree; upload stays RepoManager.push (RESOLUTION 4).
+    trace.append("repo_manager.sync_base")
+    try:
+        repo_manager.sync_base(worktree_path, base_branch)
+    except BaseSyncConflictError as exc:
+        # Fail-closed: no gates, no push, no PR against a conflicted tree. The
+        # message carries the named files + the operator's recovery recipe.
+        files = ", ".join(exc.conflicted_files) if exc.conflicted_files else "(none)"
+        return _abort(
+            trace,
+            None,
+            f"base stale: merge conflicts in {files}; "
+            f"resolve in {worktree_path} and re-run with --resume",
+        )
+    except RepoManagerError as exc:
+        return _abort(trace, None, f"base sync failed: {exc}")
+
+    # 10-12. Local Execution Engine gates — build, tests, lint, run AFTER the
+    #     base merge so they verify the merged tree. Each is fail-fast:
+    #     a non-success aborts BEFORE push (no PR is opened against a red tree).
     trace.append("build")
     build_result = _run_build(worktree_path, runner=exec_runners["build"])
     if not build_result.success:
@@ -539,13 +621,14 @@ def run_pipeline(
             f"lint failed:\n{lint_result}",
         )
 
-    # 12. Push the branch — RESOLUTION 4: object upload via RepoManager.push,
+    # 13. Push the branch — RESOLUTION 4: object upload via RepoManager.push,
     #     NEVER GitProviderAdapter.push_branch (the Git Data refs API cannot
-    #     upload locally-committed objects). Token is in-memory only.
+    #     upload locally-committed objects). Token is in-memory only. The tree
+    #     pushed is the one the gates just verified (post base-sync, SFP-240).
     trace.append("repo_manager.push")
     repo_manager.push(worktree_path, branch_name)
 
-    # 13. Open the pull request via the CODER adapter (sfp-coder-bot identity).
+    # 14. Open the pull request via the CODER adapter (sfp-coder-bot identity).
     trace.append("coder_adapter.create_pr")
     title = pr_title if pr_title is not None else f"{ticket_key}: {pr_spec.title}"
     body = pr_body if pr_body is not None else _build_pr_body(ticket_key, pr_spec, coder_output)
@@ -558,7 +641,7 @@ def run_pipeline(
         body=body,
     )
 
-    # 14. Reviewer judges the PR.
+    # 15. Reviewer judges the PR.
     trace.append("review")
     review_output: ReviewerOutput = review(
         pr_spec,
@@ -586,7 +669,61 @@ def run_pipeline(
         # Review did not approve — fail fast: NO merge, NO Done transition.
         return _abort(trace, pr.number, f"review not approved: {review_output.review_status.value}")
 
-    # 15. Merge (squash) via the CODER adapter + transition the ticket to Done.
+    # 15. PRE-MERGE REVIEW-STATE GATE (SFP-241). The same-run review above is
+    #     necessary but not sufficient: a dismissal or a subsequent push can
+    #     have invalidated it on GitHub's side. The API is the source of truth
+    #     — read the PR's actual review state for the CURRENT head and only
+    #     merge when it is APPROVED. This EXTENDS the non-APPROVED guard; it
+    #     never bypasses it. Scope guard: this is NOT the SFP-122 rework loop —
+    #     a non-APPROVED re-review aborts fail-closed, it does not loop.
+    trace.append("coder_adapter.list_pr_reviews")
+    pr_reviews = coder_adapter.list_pr_reviews(owner, repo_name, pr.number)
+    state = effective_review_state(pr_reviews, pr.head_sha)
+
+    if state != "APPROVED":
+        # DISMISSED / stale (commit mismatch) / absent / CHANGES_REQUESTED —
+        # the effective review for the current head is not an approval.
+        # Self-heal: re-run the reviewer agent on the current head under the
+        # REVIEWER identity (the reviewer runtime + reviewer_adapter are the
+        # sfp-reviewer-bot seam, ID-073) and submit its verdict via the same
+        # review + submit_review path as the run's normal review stage.
+        _log.info(
+            "pre-merge review state for PR %s is %r (head %s) — re-running reviewer",
+            pr.number,
+            state or "ABSENT",
+            pr.head_sha,
+        )
+        trace.append("review")
+        review_output = review(
+            pr_spec,
+            coder_output,
+            resolved,
+            runtime=runtimes["reviewer"],
+            prompt_provider=prompt_provider,
+            ticket_id=ticket_key,
+        )
+        event = (
+            "APPROVE" if review_output.review_status is ReviewStatus.APPROVED else "REQUEST_CHANGES"
+        )
+        trace.append("reviewer_adapter.submit_review")
+        reviewer_adapter.submit_review(
+            owner,
+            repo_name,
+            pr.number,
+            event=event,
+            body=review_output.review_status.value,
+        )
+
+        if review_output.review_status is not ReviewStatus.APPROVED:
+            # Re-review did not approve — the existing fail-closed abort: NO
+            # merge, NO Done transition.
+            return _abort(
+                trace,
+                pr.number,
+                f"review not approved: {review_output.review_status.value}",
+            )
+
+    # 16. Merge (squash) via the CODER adapter + transition the ticket to Done.
     trace.append("coder_adapter.merge_pr")
     coder_adapter.merge_pr(owner, repo_name, pr.number, merge_method="squash")
     trace.append("jira.transition")

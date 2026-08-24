@@ -47,6 +47,7 @@ __all__ = [
     "GitPushResult",
     "GitSyncResult",
     "PullRequestResult",
+    "PullRequestReview",
     "ReviewResult",
 ]
 
@@ -119,6 +120,12 @@ class PullRequestResult:
         url: The pull request's human-readable URL, sourced from the GitHub
             response ``html_url`` field.
         state: The pull request state string (e.g. ``open`` / ``closed``).
+        head_sha: The head branch's current commit SHA, sourced from the
+            GitHub response ``head.sha`` field (SFP-241). Empty string when
+            the field is absent or not a string — defensive, never raises. The
+            pre-merge review-state gate matches review ``commit_id`` values
+            against this SHA, so it is carried from the PR payload the adapter
+            already fetched rather than re-derived locally.
     """
 
     owner: str
@@ -126,6 +133,7 @@ class PullRequestResult:
     number: int
     url: str
     state: str
+    head_sha: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +200,40 @@ class ReviewResult:
     state: str
 
 
+@dataclass(frozen=True, slots=True)
+class PullRequestReview:
+    """One entry of the PR reviews list read by
+    :meth:`GitProviderAdapter.list_pr_reviews` (SFP-241).
+
+    A deliberately narrow projection of GitHub's review object — only the
+    fields needed to compute the *effective* review state for a head SHA
+    (latest review for the commit, ``state`` semantics, and the reviewing
+    identity). The adapter is read-only and format-agnostic here: it parses and
+    returns raw values, and any approval semantics live with the caller.
+
+    Attributes:
+        review_id: The review id (GitHub ``id``).
+        state: The review state string exactly as GitHub reports it
+            (``APPROVED`` / ``CHANGES_REQUESTED`` / ``DISMISSED`` /
+            ``COMMENTED`` / ``PENDING``). Empty string when the field is absent
+            or not a string (defensive; never raises).
+        commit_id: The commit SHA the review was submitted against (GitHub
+            ``commit_id``). Empty string when the field is absent or not a
+            string — a review without a resolvable ``commit_id`` can never
+            match a head SHA, so the caller treats it as not-for-this-head.
+        user_login: The reviewing user's login (GitHub ``user.login``). Empty
+            string when absent (defensive).
+        submitted_at: The review submission timestamp (GitHub
+            ``submitted_at``). Empty string when absent (defensive).
+    """
+
+    review_id: int
+    state: str
+    commit_id: str
+    user_login: str
+    submitted_at: str
+
+
 class _TransientHTTPError(Exception):
     """Internal signal: a retryable HTTP status was observed.
 
@@ -212,6 +254,29 @@ def _redact(text: str, token: str) -> str:
     ``RepoManager._redact`` (ID-035).
     """
     return text.replace(token, _REDACTED) if token else text
+
+
+def _head_sha_from_pr_payload(data: dict[str, object]) -> str:
+    """Extract ``head.sha`` from a pull-request response payload (SFP-241).
+
+    Returns the SHA string, or ``""`` whenever the field is absent or not a
+    string — defensive parsing consistent with the adapter's other projections
+    (:meth:`GitProviderAdapter.list_pr_reviews` etc.): never raises on an
+    unexpected shape. An empty result simply means the caller cannot match
+    review ``commit_id`` values against a head SHA, which the pre-merge gate
+    treats as a non-approvable (re-review) state.
+
+    Args:
+        data: The parsed JSON body of a pull-request response.
+
+    Returns:
+        The ``head.sha`` string, or ``""``.
+    """
+    head = data.get("head")
+    if not isinstance(head, dict):
+        return ""
+    sha = head.get("sha")
+    return sha if isinstance(sha, str) else ""
 
 
 def _last_url_path_segment(url: str) -> str:
@@ -493,6 +558,7 @@ class GitProviderAdapter:
             number=data["number"],
             url=data["html_url"],
             state=data["state"],
+            head_sha=_head_sha_from_pr_payload(data),
         )
 
     def update_pr(
@@ -567,6 +633,7 @@ class GitProviderAdapter:
             number=data["number"],
             url=data["html_url"],
             state=data["state"],
+            head_sha=_head_sha_from_pr_payload(data),
         )
 
     def submit_review(
@@ -629,6 +696,93 @@ class GitProviderAdapter:
             review_id=data["id"],
             state=data["state"],
         )
+
+    def list_pr_reviews(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        per_page: int = 100,
+    ) -> list[PullRequestReview]:
+        """List a pull request's reviews via ``GET /repos/{...}/pulls/{n}/reviews``.
+
+        The *read* side of the review API (SFP-241): the merge gate re-derives
+        the PR's effective review state from the API rather than assuming the
+        same-run review submission is still the state GitHub holds. Issues the
+        reviews-list GET with ``per_page=100`` via :meth:`_request` (bearer auth
+        + tenacity retry on ``{429,500,502,503,504}`` and the network errors,
+        no retry on other ``4xx``) and :meth:`_raise_for_status` (a redacted
+        :class:`GitProviderAdapterError` on any non-success).
+
+        Read-only, one page, no pagination walk: the slice's PRs carry well
+        under 100 reviews (one per pipeline run + human review), and a PR whose
+        reviews overflow one page is an operator-visible anomaly rather than a
+        silent-truncation risk the gate must absorb. The caller computes any
+        approval semantics from the returned records; this method imports no
+        review-status enum and performs no filtering (parse-not-decide).
+
+        Args:
+            owner: Repository owner (account or organization).
+            repo: Repository name.
+            number: The pull request number. Must be ``>= 1``.
+            per_page: Page size carried to GitHub verbatim (clamped to
+                ``[1, 100]``, GitHub's documented range for this endpoint).
+
+        Returns:
+            The :class:`PullRequestReview` list parsed from the response JSON,
+            in GitHub's order (oldest first). Malformed entries — a non-dict
+            item, or a missing/non-int ``id`` — are skipped defensively rather
+            than raising; a well-formed GitHub response yields every review.
+
+        Raises:
+            ValueError: if ``owner`` / ``repo`` is empty or ``number < 1``
+                (before any network call).
+            GitProviderAdapterError: if the request ultimately fails after
+                retries, or a non-retryable error (e.g. ``404``) is returned.
+                The token is redacted from the message.
+        """
+        if not owner:
+            raise ValueError("owner must not be empty")
+        if not repo:
+            raise ValueError("repo must not be empty")
+        if number < 1:
+            raise ValueError("number must be >= 1")
+        bounded_per_page = max(1, min(per_page, 100))
+        url = f"{self._base}/repos/{owner}/{repo}/pulls/{number}/reviews"
+        response = self._request("GET", f"{url}?per_page={bounded_per_page}")
+        self._raise_for_status("list reviews", response, url)
+        data = response.json()
+        if not isinstance(data, list):
+            raise GitProviderAdapterError(
+                _redact(
+                    f"GitHub list reviews returned non-list payload for {url}: "
+                    f"{type(data).__name__}",
+                    self._token,
+                )
+            )
+        reviews: list[PullRequestReview] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            review_id = item.get("id")
+            if not isinstance(review_id, int):
+                continue
+            state = item.get("state")
+            commit_id = item.get("commit_id")
+            user = item.get("user")
+            user_login = user.get("login") if isinstance(user, dict) else None
+            submitted_at = item.get("submitted_at")
+            reviews.append(
+                PullRequestReview(
+                    review_id=review_id,
+                    state=state if isinstance(state, str) else "",
+                    commit_id=commit_id if isinstance(commit_id, str) else "",
+                    user_login=user_login if isinstance(user_login, str) else "",
+                    submitted_at=submitted_at if isinstance(submitted_at, str) else "",
+                )
+            )
+        return reviews
 
     def sync_branch(self, owner: str, repo: str, pull_number: int) -> GitSyncResult:
         """Sync (update) a pull request's head branch with its base via ``update-branch``.
