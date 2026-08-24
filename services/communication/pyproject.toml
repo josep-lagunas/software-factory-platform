@@ -5,11 +5,21 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "sqlalchemy>=2.0.0",
     "alembic>=1.13.0",
+    "httpx",
+    "sfp-config",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# sfp-config is a workspace member (packages/sfp-config); resolve it from the
+# local workspace rather than a registry (SFP-75 precedent). The Slack
+# outbound adapter (SFP-133) resolves SecretRef(name="SLACK_BOT_TOKEN")
+# through the injected SecretProvider (ID-016) and drives chat.postMessage
+# with httpx (ID-051).
+[tool.uv.sources]
+sfp-config = { workspace = true }
 
 [tool.coverage.run]
 source = ["src/communication"]
