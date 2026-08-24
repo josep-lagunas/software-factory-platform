@@ -182,12 +182,16 @@ version = "0.1.0"
 source = { editable = "services/communication" }
 dependencies = [
     { name = "alembic" },
+    { name = "httpx" },
+    { name = "sfp-config" },
     { name = "sqlalchemy" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = ">=1.13.0" },
+    { name = "httpx" },
+    { name = "sfp-config", editable = "packages/sfp-config" },
     { name = "sqlalchemy", specifier = ">=2.0.0" },
 ]
 
