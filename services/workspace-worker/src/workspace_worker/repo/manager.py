@@ -17,8 +17,12 @@ Security model — the token never lands on disk:
   token to disk" on every code path.
 * The token is redacted from any error message surfaced by this module.
 
-Idempotent: a second call against an existing clone (``dest/.git`` present) is
-a no-op and returns ``cloned=False``.
+Idempotent: a second call against an existing, *valid* clone is a no-op and
+returns ``cloned=False``. The reuse path validates the cache entry with
+``git rev-parse --git-dir`` (SFP-239): a hollow/corrupt cached clone (directory
+present, ``.git`` purged or unusable) is treated as a cache miss — removed and
+re-cloned — instead of failing downstream with git's raw ``fatal: not a git
+repository``.
 
 This is the *clone* slice only. Worktree lifecycle (SFP-39), fetch/sync, and
 cleanup land in follow-on tickets. The token reaches this module already
@@ -28,6 +32,7 @@ secrets directly.
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -35,7 +40,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from workspace_worker.repo._validation import is_valid_git_repo, remove_path
+
 __all__ = ["CloneResult", "PushResult", "RepoManager", "RepoManagerError"]
+
+#: Module logger — cache-recovery events land here for ops observability.
+_log = logging.getLogger(__name__)
 
 #: GitHub's conventional username for PAT authentication over HTTPS.
 _TOKEN_USER = "x-access-token"
@@ -151,10 +161,13 @@ class RepoManager:
     def clone(self, repo_url: str, dest: Path) -> CloneResult:
         """Clone ``repo_url`` into ``dest``, authenticating via the token.
 
-        Idempotent: if ``dest/.git`` already exists, returns immediately with
-        ``cloned=False``. If ``dest`` exists without a ``.git`` directory,
-        raises :class:`RepoManagerError` (refuses to clobber a non-repo
-        directory).
+        Idempotent: if ``dest`` already holds a valid clone, returns
+        immediately with ``cloned=False``. A ``dest`` that exists but fails the
+        validity probe (``git rev-parse --git-dir``) — a hollow clone whose
+        ``.git`` was purged — is treated as a cache miss: it is removed and
+        re-cloned (SFP-239). This no longer refuses on "exists but is not a
+        repo"; the cache location is worker-owned and the entry is rebuilt
+        rather than treated as untouchable caller data.
 
         Args:
             repo_url: Remote URL (HTTPS for token auth; file:// for local).
@@ -164,17 +177,32 @@ class RepoManager:
             The :class:`CloneResult` describing the outcome.
 
         Raises:
-            RepoManagerError: if the clone or credential-strip fails, or if
-                ``dest`` exists but is not a git repository. The token is
+            RepoManagerError: if the clone or credential-strip fails, if the
+                corrupt cache entry cannot be removed for re-clone, or if the
+                token-bearing URL would otherwise surface. The token is
                 redacted from the message.
         """
-        # Idempotent fast-path: an existing clone is a no-op.
-        if (dest / ".git").exists():
-            return CloneResult(path=dest, cloned=False)
-        # Refuse to clobber a non-repo directory — surface the state explicitly
-        # rather than letting `git clone` produce a confusing nested error.
-        if dest.exists():
-            raise RepoManagerError(f"destination exists and is not a git repository: {dest}")
+        # Idempotent fast-path: an existing VALID clone is a no-op (SFP-239).
+        # Existence alone is not enough — the cache under SFP_WORKTREE_BASE can
+        # be hollowed out (/tmp cleanup, partial disk, crashed run), and a
+        # hollow entry must not poison the run with a raw
+        # "fatal: not a git repository" from some downstream git call. Probe
+        # with git's cheapest repository check; a miss means remove + re-clone.
+        if (dest / ".git").exists() or dest.exists():
+            if is_valid_git_repo(dest, self._runner):
+                return CloneResult(path=dest, cloned=False)
+            # Corrupt cache entry → treat as a cache miss: remove the hollow
+            # tree and fall through to the existing clone logic below. Removal
+            # failure (permissions/partial state) must surface as a clear,
+            # actionable error naming the path, not a crash mid-recovery.
+            _log.warning("clone cache entry %s is not a valid git repo; re-cloning", dest)
+            try:
+                remove_path(dest)
+            except OSError as exc:
+                raise RepoManagerError(
+                    f"corrupt clone cache entry at {dest} could not be removed "
+                    f"for re-clone (remove it manually): {exc}"
+                ) from exc
 
         authed_url = _inject_token(repo_url, self._token)
         clean_url = _strip_userinfo(repo_url)

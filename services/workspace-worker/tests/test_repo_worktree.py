@@ -140,8 +140,8 @@ def test_add_distinct_paths_per_job(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_add_refuses_to_clobber_existing_path(tmp_path: Path) -> None:
-    runner = FakeRunner()
+def test_add_refuses_to_clobber_existing_valid_worktree(tmp_path: Path) -> None:
+    runner = FakeRunner()  # probe succeeds → the path IS a valid worktree
     base = tmp_path / "wt"
     (base / "job-1").mkdir(parents=True)  # the per-job path already exists
     mgr = WorktreeManager(tmp_path / "repo", runner=runner)
@@ -149,7 +149,9 @@ def test_add_refuses_to_clobber_existing_path(tmp_path: Path) -> None:
     with pytest.raises(WorktreeError, match="already exists"):
         mgr.add("job-1", "deadbeef", base)
 
-    assert runner.calls == []  # bailed before any git call
+    # Bailed after the validity probe — no `git worktree add`, no removal.
+    assert [c[2:5] for c in runner.calls] == [[str(base / "job-1"), "rev-parse", "--git-dir"]]
+    assert (base / "job-1").exists()  # a healthy worktree is never clobbered
 
 
 def test_add_sanitizes_job_id_path_escape(tmp_path: Path) -> None:
@@ -373,3 +375,213 @@ def test_integration_add_surfaces_error_for_unknown_ref(tmp_path: Path) -> None:
 
     with pytest.raises(WorktreeError, match="failed to create worktree"):
         mgr.add("job-1", "no-such-ref-xyz", tmp_path / "wt")
+
+
+# ---------------------------------------------------------------------------
+# Unit — add: stale-worktree validation & self-heal (SFP-239)
+# ---------------------------------------------------------------------------
+
+
+class ValidatingFakeRunner(FakeRunner):
+    """FakeRunner plus a real-ish validity probe.
+
+    Paths in ``valid`` exit zero on ``rev-parse --git-dir``; every other probed
+    path fails like real git does against a hollow directory.
+    """
+
+    def __init__(self, *, valid: frozenset[str] = frozenset()) -> None:
+        super().__init__()
+        self._valid = valid
+
+    def __call__(self, cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        if cmd[1:2] == ["-C"] and cmd[3:5] == ["rev-parse", "--git-dir"]:
+            self.calls.append(cmd)
+            target = cmd[2]
+            if target in self._valid:
+                return subprocess.CompletedProcess(cmd, returncode=0, stdout=".git", stderr="")
+            raise subprocess.CalledProcessError(
+                returncode=128, cmd=cmd, stderr="fatal: not a git repository"
+            )
+        return super().__call__(cmd)
+
+
+def test_add_self_heals_stale_corrupt_worktree_path(tmp_path: Path) -> None:
+    """Stale debris at the per-job slot → remove + recreate, run proceeds.
+
+    This is the SFP-239 fix: previously any existing path hard-refused, and a
+    torn-down/hollowed slot surfaced as git's raw error downstream.
+    """
+    runner = ValidatingFakeRunner(valid=frozenset())  # nothing on disk is valid
+    repo = tmp_path / "repo"
+    base = tmp_path / "wt"
+    (base / "job-1" / ".git").mkdir(parents=True)  # hollow worktree shell
+    mgr = WorktreeManager(repo, runner=runner)
+
+    result = mgr.add("job-1", "deadbeef", base)
+
+    assert result == WorktreeResult(path=base / "job-1", job_id="job-1")
+    # The hollow shell was removed, then `git worktree add` recreated the slot.
+    assert runner.calls[-1][:6] == ["git", "-C", str(repo), "worktree", "add", str(base / "job-1")]
+
+
+def test_add_stale_plain_directory_self_heals(tmp_path: Path) -> None:
+    """A non-worktree directory at the slot also self-heals (not just hollow .git)."""
+    runner = ValidatingFakeRunner(valid=frozenset())
+    repo = tmp_path / "repo"
+    base = tmp_path / "wt"
+    (base / "job-1").mkdir(parents=True)
+    (base / "job-1" / "stray.txt").write_text("debris")
+    mgr = WorktreeManager(repo, runner=runner)
+
+    mgr.add("job-1", "deadbeef", base)
+
+    assert ["worktree" in " ".join(c) for c in runner.calls[-1:]] == [True]
+
+
+def test_add_stale_symlink_slot_self_heals_without_following(tmp_path: Path) -> None:
+    """A symlinked slot is unlinked, not recursed into (unrelated trees survive)."""
+    runner = ValidatingFakeRunner(valid=frozenset())
+    repo = tmp_path / "repo"
+    base = tmp_path / "wt"
+    base.mkdir(parents=True)
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    (target / "precious").write_text("keep")
+    (base / "job-1").symlink_to(target)
+    mgr = WorktreeManager(repo, runner=runner)
+
+    mgr.add("job-1", "deadbeef", base)
+
+    assert (base / "job-1").is_symlink() is False  # link removed...
+    assert (target / "precious").read_text() == "keep"  # ...target untouched
+    assert "worktree" in " ".join(runner.calls[-1])
+
+
+def test_add_unremovable_stale_path_surfaces_actionable_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removal failure must surface a clear error naming the path, not crash."""
+    runner = ValidatingFakeRunner(valid=frozenset())
+    repo = tmp_path / "repo"
+    base = tmp_path / "wt"
+    (base / "job-1").mkdir(parents=True)
+    mgr = WorktreeManager(repo, runner=runner)
+
+    def _boom(path: object) -> None:
+        raise PermissionError("EACCES")
+
+    monkeypatch.setattr("workspace_worker.repo.worktree.remove_path", _boom)
+
+    with pytest.raises(WorktreeError, match=r"corrupt worktree path.*could not be removed"):
+        mgr.add("job-1", "deadbeef", base)
+
+
+def test_add_probe_oserror_propagates(tmp_path: Path) -> None:
+    """An OSError from the runner itself (e.g. git missing) is not swallowed."""
+
+    def _no_git(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError("git binary missing")
+
+    base = tmp_path / "wt"
+    (base / "job-1").mkdir(parents=True)
+    mgr = WorktreeManager(tmp_path / "repo", runner=_no_git)
+
+    with pytest.raises(FileNotFoundError):
+        mgr.add("job-1", "deadbeef", base)
+
+
+def test_add_healthy_missing_slot_issues_no_probe(tmp_path: Path) -> None:
+    """Cold slot (nothing exists) → no probe, straight to `git worktree add`."""
+    runner = FakeRunner()
+    mgr = WorktreeManager(tmp_path / "repo", runner=runner)
+
+    mgr.add("job-1", "deadbeef", tmp_path / "wt")
+
+    assert len(runner.calls) == 1
+    assert "worktree" in " ".join(runner.calls[0])
+
+
+@requires_git
+def test_integration_add_self_heals_stale_worktree_dir(tmp_path: Path) -> None:
+    """Stale dir at the per-job slot (torn-down run) → self-heal, run proceeds.
+
+    Previously this either hard-refused or died with git's raw
+    "not a git repository"; SFP-239 makes it a remove + recreate.
+    """
+    clone = _clone_remote(tmp_path)
+    mgr = WorktreeManager(clone)
+    base = tmp_path / "wt"
+    ref = _head_sha(clone)
+
+    stale = base / "job-1"
+    stale.mkdir(parents=True)
+    (stale / ".git").mkdir()  # hollow: .git present, unusable
+    (stale / "debris.txt").write_text("leftover")
+
+    result = mgr.add("job-1", ref, base)
+
+    assert result.path == stale
+    assert (stale / "README").read_text() == "seed\n"  # real checkout materialised
+    assert not (stale / "debris.txt").exists()  # debris gone
+
+
+@requires_git
+def test_integration_add_refuses_to_clobber_live_worktree(tmp_path: Path) -> None:
+    """Precision guard: a LIVE worktree at the slot still refuses (ID-033).
+
+    This is what keeps self-heal from destroying another run's checkout: the
+    validity probe succeeds, so add() refuses rather than removes.
+    """
+    clone = _clone_remote(tmp_path)
+    mgr = WorktreeManager(clone)
+    base = tmp_path / "wt"
+    ref = _head_sha(clone)
+
+    live = mgr.add("job-1", ref, base)
+    (live.path / "in-progress.txt").write_text("another run's work")
+
+    with pytest.raises(WorktreeError, match="already exists"):
+        mgr.add("job-1", ref, base)
+
+    assert (live.path / "in-progress.txt").read_text() == "another run's work"
+
+
+@requires_git
+def test_integration_hollow_clone_then_worktree_pipeline_recovers(tmp_path: Path) -> None:
+    """The full dogfood failure mode end-to-end: hollow cache + stale worktree.
+
+    Reproduces the SFP-137 run shape — cached clone hollowed, stale worktree dir
+    left behind — and asserts both stages recover so the "run" proceeds.
+    """
+    import shutil as _shutil  # noqa: PLC0415
+
+    remote = _seed_bare_remote(tmp_path / "remote.git")
+    _shutil.rmtree(tmp_path / "seed-work")
+    base = tmp_path / "cache"
+    clone_dest = base / "clone"
+    mgr = RepoManager("")
+
+    # First run: healthy cache + worktree.
+    mgr.clone(f"file://{remote}", clone_dest)
+    wt_mgr = WorktreeManager(clone_dest)
+    wt_mgr.add("SFP-239", _head_sha(clone_dest), base)
+
+    # Between-run damage: hollow the cache, leave a stale worktree shell.
+    for child in (clone_dest / ".git").iterdir():
+        if child.is_dir():
+            _shutil.rmtree(child)
+        else:
+            child.unlink()
+    stale_wt = base / "SFP-239"
+    for child in stale_wt.iterdir():
+        if child.is_dir():
+            _shutil.rmtree(child)
+        else:
+            child.unlink()
+
+    # Second run recovers at BOTH stages and completes.
+    clone_result = mgr.clone(f"file://{remote}", clone_dest)
+    assert clone_result.cloned is True  # cache miss detected, re-cloned
+
+    wt = wt_mgr.add("SFP-239", _head_sha(clone_dest), base)
+    assert (wt.path / "README").read_text() == "seed\n"  # run proceeds
