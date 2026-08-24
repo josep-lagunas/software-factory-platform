@@ -41,13 +41,16 @@ from workspace_worker.entrypoints.ticket_pipeline import (
     _build_pr_body,
     _checkpoint_dir,
     build,
+    effective_review_state,
     run_pipeline,
 )
 from workspace_worker.infrastructure.settings import WorkspaceWorkerSettings
 from workspace_worker.repo.branch import BranchResult
 from workspace_worker.repo.git.adapter import (
     GitMergeResult,
+    GitProviderAdapterError,
     PullRequestResult,
+    PullRequestReview,
     ReviewResult,
 )
 from workspace_worker.repo.manager import CloneResult, PushResult
@@ -59,6 +62,8 @@ REPO = "sfp"
 REPO_URL = f"https://github.com/{OWNER}/{REPO}.git"
 BRANCH = "sfp-224-slice"
 PR_NUMBER = 42
+HEAD_SHA = "a" * 40  # current PR head — what a matching review's commit_id carries
+STALE_SHA = "b" * 40  # a pre-push head — reviews against it are stale
 
 
 # --------------------------------------------------------------------------- #
@@ -320,11 +325,29 @@ class FakeRepoManager:
 
 
 class FakeGitAdapter:
-    """Records create_pr/submit_review/merge_pr; push_branch RAISES (RESOLUTION 4)."""
+    """Records create_pr/submit_review/merge_pr/list_pr_reviews; push_branch RAISES (RESOLUTION 4).
+
+    SFP-241: ``list_pr_reviews`` returns a canned review list (default: one
+    APPROVED review for :data:`HEAD_SHA` — the clean-resume short-circuit) so
+    the pre-merge review-state gate is driveable per scenario.
+    """
 
     def __init__(self, pr_number: int = PR_NUMBER) -> None:
         self.pr_number = pr_number
         self.calls: list[tuple[str, ...]] = []
+        self.reviews: list[PullRequestReview] = [
+            PullRequestReview(
+                review_id=1,
+                state="APPROVED",
+                commit_id=HEAD_SHA,
+                user_login="sfp-reviewer-bot",
+                submitted_at="2026-01-01T00:00:00Z",
+            )
+        ]
+
+    def list_pr_reviews(self, owner: str, repo: str, number: int) -> list[PullRequestReview]:
+        self.calls.append(("list_pr_reviews", owner, repo, number))
+        return list(self.reviews)
 
     def create_pr(
         self, owner: str, repo: str, *, title: str, head: str, base: str, body: str
@@ -336,6 +359,7 @@ class FakeGitAdapter:
             number=self.pr_number,
             url=f"https://github.com/{owner}/{repo}/pull/{self.pr_number}",
             state="open",
+            head_sha=HEAD_SHA,
         )
 
     def submit_review(
@@ -521,6 +545,7 @@ def test_happy_path_trace_is_the_exact_linear_order(tmp_path: Path) -> None:
         "coder_adapter.create_pr",
         "review",
         "reviewer_adapter.submit_review",
+        "coder_adapter.list_pr_reviews",
         "coder_adapter.merge_pr",
         "jira.transition",
     ]
@@ -913,6 +938,9 @@ _FULL_TRACE: tuple[str, ...] = (
     "coder_adapter.create_pr",
     "review",
     "reviewer_adapter.submit_review",
+    # SFP-241: the pre-merge review-state gate always reads the PR's review
+    # state via the API before merge (here: clean approval → straight to merge).
+    "coder_adapter.list_pr_reviews",
     "coder_adapter.merge_pr",
     "jira.transition",
 )
@@ -1248,3 +1276,296 @@ def test_pr_body_default_uses_structured_template_in_pipeline() -> None:
     body = create_pr_call[6]
     assert "## Summary" in body
     assert f"JIRA: https://arconta.atlassian.net/browse/{TICKET}" in body
+
+
+# --------------------------------------------------------------------------- #
+# SFP-241 — pre-merge review-state gate
+# --------------------------------------------------------------------------- #
+
+
+def _review(state: str, commit_id: str, review_id: int = 1) -> PullRequestReview:
+    return PullRequestReview(
+        review_id=review_id,
+        state=state,
+        commit_id=commit_id,
+        user_login="sfp-reviewer-bot",
+        submitted_at="2026-01-01T00:00:00Z",
+    )
+
+
+# --- effective_review_state (pure computation, explicit unit tests) --------- #
+
+
+def test_effective_review_state_approved_for_head() -> None:
+    reviews = [_review("APPROVED", HEAD_SHA)]
+    assert effective_review_state(reviews, HEAD_SHA) == "APPROVED"
+
+
+def test_effective_review_state_latest_matching_review_wins() -> None:
+    # DISMISSED then re-APPROVED on the same head -> the LATEST match decides.
+    reviews = [
+        _review("DISMISSED", HEAD_SHA, review_id=1),
+        _review("APPROVED", HEAD_SHA, review_id=2),
+    ]
+    assert effective_review_state(reviews, HEAD_SHA) == "APPROVED"
+
+
+def test_effective_review_state_dismissed_approval_is_not_approved() -> None:
+    reviews = [
+        _review("APPROVED", STALE_SHA, review_id=1),
+        _review("DISMISSED", HEAD_SHA, review_id=2),
+    ]
+    assert effective_review_state(reviews, HEAD_SHA) == "DISMISSED"
+
+
+def test_effective_review_state_stale_review_for_older_commit_ignored() -> None:
+    # The only APPROVED review is against the pre-push head (STALE_SHA) — for
+    # the current head it does not count: the latest matching review is the
+    # DISMISSED one (a dismissal record carries the head commit_id).
+    reviews = [
+        _review("APPROVED", STALE_SHA, review_id=1),
+        _review("DISMISSED", HEAD_SHA, review_id=2),
+    ]
+    assert effective_review_state(reviews, HEAD_SHA) == "DISMISSED"
+
+
+def test_effective_review_state_absent_when_no_review_matches_head() -> None:
+    # Reviews exist but only against older commits -> no matching review at all.
+    reviews = [_review("APPROVED", STALE_SHA)]
+    assert effective_review_state(reviews, HEAD_SHA) == ""
+
+
+def test_effective_review_state_empty_review_list_is_absent() -> None:
+    assert effective_review_state([], HEAD_SHA) == ""
+
+
+def test_effective_review_state_changes_requested_wins_over_earlier_approval() -> None:
+    # A later CHANGES_REQUESTED on the same head supersedes an earlier APPROVED.
+    reviews = [
+        _review("APPROVED", HEAD_SHA, review_id=1),
+        _review("CHANGES_REQUESTED", HEAD_SHA, review_id=2),
+    ]
+    assert effective_review_state(reviews, HEAD_SHA) == "CHANGES_REQUESTED"
+
+
+def test_effective_review_state_latest_commented_is_not_an_approval() -> None:
+    # GitHub counts only APPROVED as satisfying a reviews-required rule — a
+    # latest matching COMMENTED review means "not approved" (fail closed).
+    reviews = [
+        _review("APPROVED", HEAD_SHA, review_id=1),
+        _review("COMMENTED", HEAD_SHA, review_id=2),
+    ]
+    assert effective_review_state(reviews, HEAD_SHA) == "COMMENTED"
+
+
+def test_effective_review_state_pending_reviews_are_skipped() -> None:
+    # A PENDING review carries no verdict; the earlier APPROVED match decides.
+    reviews = [
+        _review("APPROVED", HEAD_SHA, review_id=1),
+        _review("PENDING", HEAD_SHA, review_id=2),
+    ]
+    assert effective_review_state(reviews, HEAD_SHA) == "APPROVED"
+
+
+def test_effective_review_state_only_pending_matches_means_absent() -> None:
+    # The only head-matching review is PENDING -> no verdict -> absent.
+    reviews = [
+        _review("APPROVED", STALE_SHA, review_id=1),
+        _review("PENDING", HEAD_SHA, review_id=2),
+    ]
+    assert effective_review_state(reviews, HEAD_SHA) == ""
+
+
+# --- the gate in the loop --------------------------------------------------- #
+
+
+def test_premerge_gate_clean_approval_skips_rereview_and_merges(tmp_path: Path) -> None:
+    """A matching APPROVED review on the current head short-circuits: the gate
+    reads the state, does NOT re-run the reviewer, and proceeds to merge."""
+    runtimes, handles = _make_runtimes(approved=True)
+    coder_adapter = FakeGitAdapter()
+    coder_adapter.reviews = [_review("APPROVED", HEAD_SHA, review_id=7)]
+
+    result, fakes = _run(tmp_path, runtimes, coder_adapter=coder_adapter)
+
+    assert result.success is True
+    assert result.pr_number == PR_NUMBER
+    # The review-state read happened on the coder adapter (a read, coder-side).
+    assert ("list_pr_reviews", OWNER, REPO, PR_NUMBER) in coder_adapter.calls
+    # NO redundant re-review: the reviewer runtime ran exactly ONCE (the run's
+    # normal review stage), and submit_review was called exactly once.
+    assert len(handles["reviewer"].calls) == 1
+    submit_calls = [c for c in fakes["reviewer_adapter"].calls if c[0] == "submit_review"]
+    assert len(submit_calls) == 1
+    # Merge + Done still happened.
+    assert ("merge_pr", OWNER, REPO, PR_NUMBER, "squash") in coder_adapter.calls
+    assert fakes["jira"].transitions == [(TICKET, "51")]
+    # Trace: exactly one review + one submit_review, then the read then merge.
+    assert list(result.trace)[-4:] == [
+        "reviewer_adapter.submit_review",
+        "coder_adapter.list_pr_reviews",
+        "coder_adapter.merge_pr",
+        "jira.transition",
+    ]
+
+
+def test_premerge_gate_dismissed_review_triggers_rereview_then_merges(
+    tmp_path: Path,
+) -> None:
+    """A DISMISSED approval for the current head triggers a reviewer re-run on
+    the same head; its APPROVED verdict is submitted via the existing
+    submit_review path and the pipeline then merges + transitions Done."""
+    runtimes, handles = _make_runtimes(approved=True)
+    coder_adapter = FakeGitAdapter()
+    coder_adapter.reviews = [
+        _review("DISMISSED", HEAD_SHA, review_id=1),
+    ]
+
+    result, fakes = _run(tmp_path, runtimes, coder_adapter=coder_adapter)
+
+    assert result.success is True
+    # The reviewer agent ran TWICE: the run's normal review stage + the
+    # pre-merge re-run, both under the reviewer runtime (sfp-reviewer-bot seam).
+    assert len(handles["reviewer"].calls) == 2
+    assert all(c["agent"] == "reviewer" for c in handles["reviewer"].calls)
+    # The re-run's APPROVE was submitted via the REVIEWER adapter.
+    submit_calls = [c for c in fakes["reviewer_adapter"].calls if c[0] == "submit_review"]
+    assert submit_calls == [
+        ("submit_review", OWNER, REPO, PR_NUMBER, "APPROVE", "APPROVED"),
+        ("submit_review", OWNER, REPO, PR_NUMBER, "APPROVE", "APPROVED"),
+    ]
+    # Then the merge proceeded.
+    assert ("merge_pr", OWNER, REPO, PR_NUMBER, "squash") in coder_adapter.calls
+    assert fakes["jira"].transitions == [(TICKET, "51")]
+
+
+def test_premerge_gate_stale_review_triggers_rereview(tmp_path: Path) -> None:
+    """The only APPROVED review is against the pre-push head (a subsequent
+    push invalidated it) — the gate sees a non-APPROVED effective state for the
+    current head and re-runs the reviewer."""
+    runtimes, handles = _make_runtimes(approved=True)
+    coder_adapter = FakeGitAdapter()
+    coder_adapter.reviews = [_review("APPROVED", STALE_SHA, review_id=1)]
+
+    result, _ = _run(tmp_path, runtimes, coder_adapter=coder_adapter)
+
+    assert result.success is True
+    assert len(handles["reviewer"].calls) == 2
+
+
+def test_premerge_gate_absent_reviews_triggers_rereview(tmp_path: Path) -> None:
+    """No reviews at all on the PR (e.g. an earlier submit_review was lost) —
+    the gate re-runs the reviewer rather than assuming the run's approval."""
+    runtimes, handles = _make_runtimes(approved=True)
+    coder_adapter = FakeGitAdapter()
+    coder_adapter.reviews = []
+
+    result, _ = _run(tmp_path, runtimes, coder_adapter=coder_adapter)
+
+    assert result.success is True
+    assert len(handles["reviewer"].calls) == 2
+
+
+def test_premerge_gate_rereview_changes_requested_aborts_without_merge(
+    tmp_path: Path,
+) -> None:
+    """The re-run reviewer returns CHANGES_REQUESTED — the existing fail-closed
+    abort: NO merge, NO Done transition, and the REQUEST_CHANGES verdict was
+    submitted to GitHub via the reviewer adapter.
+
+    The run's NORMAL review stage must approve (otherwise the pipeline aborts
+    at step 14 and the gate is never reached); only the pre-merge re-run
+    rejects, so the reviewer runtime serves APPROVED then CHANGES_REQUESTED.
+    """
+
+    class _ApproveThenReject(FakeRuntime):
+        """Reviewer runtime: first call APPROVED, every later call rejected."""
+
+        def run(self, request: AgentRunRequest) -> AgentRunResult:
+            out = _reviewer_output(len(self.calls) == 0)
+            self._outputs = {"reviewer": out}
+            return super().run(request)
+
+    runtimes, handles = _make_runtimes(approved=True)
+    seq = _ApproveThenReject({"reviewer": _reviewer_output(True)})
+    runtimes["reviewer"] = seq
+    handles["reviewer"] = seq
+    coder_adapter = FakeGitAdapter()
+    coder_adapter.reviews = [_review("DISMISSED", HEAD_SHA, review_id=1)]
+
+    result, fakes = _run(tmp_path, runtimes, coder_adapter=coder_adapter)
+
+    assert result.success is False
+    assert result.pr_number == PR_NUMBER
+    assert "review not approved: CHANGES_REQUESTED" in (result.error or "")
+    # Both verdicts were submitted, in order: the normal stage APPROVE, then
+    # the pre-merge re-run's REQUEST_CHANGES (the one that fails the merge).
+    submit_calls = [c for c in fakes["reviewer_adapter"].calls if c[0] == "submit_review"]
+    assert submit_calls == [
+        ("submit_review", OWNER, REPO, PR_NUMBER, "APPROVE", "APPROVED"),
+        ("submit_review", OWNER, REPO, PR_NUMBER, "REQUEST_CHANGES", "CHANGES_REQUESTED"),
+    ]
+    # NO merge, NO Done transition.
+    assert all(c[0] != "merge_pr" for c in fakes["coder_adapter"].calls)
+    assert fakes["jira"].transitions == []
+    # Trace stops after the re-run's submit_review.
+    assert list(result.trace)[-2:] == ["review", "reviewer_adapter.submit_review"]
+    # The reviewer agent ran twice (normal + re-run).
+    assert len(handles["reviewer"].calls) == 2
+
+
+def test_premerge_gate_read_failure_fails_closed_without_merge(tmp_path: Path) -> None:
+    """The review-state read itself failing surfaces as an exception (fail
+    closed) — the merge is NEVER attempted on an unknown review state."""
+
+    class _ExplodingAdapter(FakeGitAdapter):
+        def list_pr_reviews(self, owner: str, repo: str, number: int) -> list[PullRequestReview]:
+            raise GitProviderAdapterError("GitHub list reviews failed: HTTP 403 for /reviews")
+
+    runtimes, _ = _make_runtimes(approved=True)
+    exploding = _ExplodingAdapter()
+
+    with pytest.raises(GitProviderAdapterError):
+        _run(tmp_path, runtimes, coder_adapter=exploding)
+
+    # No merge, no PR-creating divergence: create_pr happened, merge did not.
+    assert any(c[0] == "create_pr" for c in exploding.calls)
+    assert all(c[0] != "merge_pr" for c in exploding.calls)
+
+
+def test_premerge_gate_resumed_pr_with_preexisting_approval_no_rereview(
+    tmp_path: Path,
+) -> None:
+    """AC: a resumed PR whose pre-existing APPROVED review matches the current
+    head (no subsequent push) does NOT trigger a redundant re-review — the gate
+    verifies the state via the API and proceeds straight to merge."""
+    ckpts = tmp_path / "ckpts"
+    _write_ckpt(ckpts, "plan", PlannerOutput.model_validate(_planner_output()).model_dump_json())
+    _write_ckpt(
+        ckpts,
+        "design",
+        TestDesignerOutput.model_validate(_test_designer_output()).model_dump_json(),
+    )
+    _write_ckpt(ckpts, "code", CoderOutput.model_validate(_coder_output()).model_dump_json())
+    (tmp_path / "wt" / TICKET).mkdir(parents=True)
+
+    runtimes, handles = _make_runtimes(approved=True)
+    coder_adapter = FakeGitAdapter()
+    # A pre-existing APPROVED review for the CURRENT head, recorded before the
+    # resume (e.g. the earlier run's submission, still valid — no push since).
+    coder_adapter.reviews = [_review("APPROVED", HEAD_SHA, review_id=99)]
+
+    result, fakes = _run(
+        tmp_path, runtimes, resume=True, checkpoints_dir=ckpts, coder_adapter=coder_adapter
+    )
+
+    assert result.success is True
+    # The gate verified the state via the API...
+    assert ("list_pr_reviews", OWNER, REPO, PR_NUMBER) in coder_adapter.calls
+    # ...but did NOT re-review: exactly one reviewer run for the whole resume.
+    assert len(handles["reviewer"].calls) == 1
+    submit_calls = [c for c in fakes["reviewer_adapter"].calls if c[0] == "submit_review"]
+    assert len(submit_calls) == 1
+    # And the merge + Done transition happened.
+    assert ("merge_pr", OWNER, REPO, PR_NUMBER, "squash") in coder_adapter.calls
+    assert fakes["jira"].transitions == [(TICKET, "51")]

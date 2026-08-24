@@ -22,6 +22,7 @@ from workspace_worker.repo.git.adapter import (
     GitPushResult,
     GitSyncResult,
     PullRequestResult,
+    PullRequestReview,
     ReviewResult,
     _redact,
 )
@@ -543,9 +544,11 @@ def test_pull_request_result_reexported() -> None:
 
 def test_pull_request_result_frozen_slots() -> None:
     # AC7: @dataclass(frozen=True, slots=True) with (owner, repo, number, url, state).
-    result = PullRequestResult(owner=OWNER, repo=REPO, number=PR_NUMBER, url=PR_URL, state="open")
+    result = PullRequestResult(
+        owner=OWNER, repo=REPO, number=PR_NUMBER, url=PR_URL, state="open", head_sha=""
+    )
     fields = {f.name for f in dataclasses.fields(result)}
-    assert fields == {"owner", "repo", "number", "url", "state"}
+    assert fields == {"owner", "repo", "number", "url", "state", "head_sha"}
     # frozen — assignment raises FrozenInstanceError
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.number = 99  # type: ignore[misc]
@@ -559,9 +562,16 @@ def test_pull_request_result_frozen_slots() -> None:
 
 
 def _pr_response(
-    *, number: int = PR_NUMBER, url: str = PR_URL, state: str = "open"
+    *,
+    number: int = PR_NUMBER,
+    url: str = PR_URL,
+    state: str = "open",
+    head_sha: str | None = None,
 ) -> dict[str, object]:
-    return {"number": number, "html_url": url, "state": state}
+    payload: dict[str, object] = {"number": number, "html_url": url, "state": state}
+    if head_sha is not None:
+        payload["head"] = {"sha": head_sha}
+    return payload
 
 
 def test_create_pr_issues_post_with_bearer_header() -> None:
@@ -585,7 +595,7 @@ def test_create_pr_issues_post_with_bearer_header() -> None:
     result = adapter.create_pr(OWNER, REPO, title=TITLE, head=HEAD, base=BASE, body=BODY)
 
     assert result == PullRequestResult(
-        owner=OWNER, repo=REPO, number=PR_NUMBER, url=PR_URL, state="open"
+        owner=OWNER, repo=REPO, number=PR_NUMBER, url=PR_URL, state="open", head_sha=""
     )
     assert len(seen) == 1
 
@@ -604,6 +614,49 @@ def test_create_pr_result_fields_come_from_response() -> None:
     assert result.number == 77
     assert result.url == "https://github.com/different/repo/pull/77"
     assert result.state == "closed"
+
+
+def test_create_pr_parses_head_sha_from_response() -> None:
+    # SFP-241: head_sha comes from the response's head.sha — the value the
+    # pre-merge review-state gate matches review commit_ids against. The
+    # response SHA deliberately differs from anything derived from the inputs.
+    resp = _pr_response(head_sha="c" * 40)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=resp)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.create_pr(OWNER, REPO, title=TITLE, head=HEAD, base=BASE, body=BODY)
+
+    assert result.head_sha == "c" * 40
+
+
+def test_create_pr_head_sha_degrades_to_empty_when_absent_or_malformed() -> None:
+    # SFP-241: no head, a non-dict head, or a non-string sha never raises —
+    # each degrades to "" (a head SHA the gate can never match → re-review).
+    payloads: list[object] = [
+        _pr_response(),  # head absent
+        {"number": PR_NUMBER, "html_url": PR_URL, "state": "open", "head": "not-a-dict"},
+        {
+            "number": PR_NUMBER,
+            "html_url": PR_URL,
+            "state": "open",
+            "head": {"sha": 12345},  # non-string sha
+        },
+    ]
+    results: list[str] = []
+
+    for payload in payloads:
+
+        def handler(request: httpx.Request, payload: object = payload) -> httpx.Response:
+            return httpx.Response(201, json=payload)  # type: ignore[arg-type]
+
+        adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+        results.append(
+            adapter.create_pr(OWNER, REPO, title=TITLE, head=HEAD, base=BASE, body=BODY).head_sha
+        )
+
+    assert results == ["", "", ""]
 
 
 # ---------------------------------------------------------------------------
@@ -805,7 +858,7 @@ def test_update_pr_issues_patch_with_only_non_none_fields() -> None:
     result = adapter.update_pr(OWNER, REPO, PR_NUMBER, title=TITLE)
 
     assert result == PullRequestResult(
-        owner=OWNER, repo=REPO, number=PR_NUMBER, url=PR_URL, state="open"
+        owner=OWNER, repo=REPO, number=PR_NUMBER, url=PR_URL, state="open", head_sha=""
     )
     assert len(seen) == 1
 
@@ -1650,3 +1703,258 @@ def test_merge_pr_409_conflict_raises() -> None:
     adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
     with pytest.raises(GitProviderAdapterError):
         adapter.merge_pr(OWNER, REPO, PR_NUMBER)
+
+
+# ---------------------------------------------------------------------------
+# list_pr_reviews — the PR review-state read (SFP-241)
+# ---------------------------------------------------------------------------
+
+
+def _review_payload(
+    *,
+    review_id: int = 1001,
+    state: str = "APPROVED",
+    commit_id: str = SHA,
+    user_login: str = "sfp-reviewer-bot",
+    submitted_at: str = "2026-01-02T03:04:05Z",
+) -> dict[str, object]:
+    return {
+        "id": review_id,
+        "state": state,
+        "commit_id": commit_id,
+        "user": {"login": user_login},
+        "submitted_at": submitted_at,
+    }
+
+
+def test_pull_request_review_reexported() -> None:
+    from workspace_worker.repo import git
+    from workspace_worker.repo.git.adapter import PullRequestReview as Direct
+
+    assert git.PullRequestReview is Direct
+    assert "PullRequestReview" in git.__all__
+
+
+def test_pull_request_review_frozen_slots() -> None:
+    review = PullRequestReview(
+        review_id=7,
+        state="APPROVED",
+        commit_id=SHA,
+        user_login="sfp-reviewer-bot",
+        submitted_at="2026-01-02T03:04:05Z",
+    )
+    fields = {f.name for f in dataclasses.fields(review)}
+    assert fields == {
+        "review_id",
+        "state",
+        "commit_id",
+        "user_login",
+        "submitted_at",
+    }
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        review.state = "x"  # type: ignore[misc]
+    assert not hasattr(review, "__dict__")
+
+
+def test_list_pr_reviews_issues_get_with_bearer_header() -> None:
+    # GET /repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100 + bearer.
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.method == "GET"
+        assert request.url.path == f"/repos/{OWNER}/{REPO}/pulls/{PR_NUMBER}/reviews"
+        assert dict(request.url.params) == {"per_page": "100"}
+        assert request.headers.get("authorization") == f"Bearer {TOKEN}"
+        return httpx.Response(200, json=[_review_payload()])
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    reviews = adapter.list_pr_reviews(OWNER, REPO, PR_NUMBER)
+
+    assert reviews == [
+        PullRequestReview(
+            review_id=1001,
+            state="APPROVED",
+            commit_id=SHA,
+            user_login="sfp-reviewer-bot",
+            submitted_at="2026-01-02T03:04:05Z",
+        )
+    ]
+    assert len(seen) == 1
+
+
+def test_list_pr_reviews_parses_fields_from_response() -> None:
+    # The parsed values come from the response, not from any input echo, and
+    # GitHub's order (oldest first) is preserved.
+    payload = [
+        _review_payload(review_id=1, state="DISMISSED", commit_id="old"),
+        _review_payload(review_id=2, state="APPROVED", commit_id=SHA),
+        _review_payload(review_id=3, state="CHANGES_REQUESTED", commit_id=SHA),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    reviews = adapter.list_pr_reviews(OWNER, REPO, PR_NUMBER)
+
+    assert [r.review_id for r in reviews] == [1, 2, 3]
+    assert [r.state for r in reviews] == ["DISMISSED", "APPROVED", "CHANGES_REQUESTED"]
+    assert [r.commit_id for r in reviews] == ["old", SHA, SHA]
+
+
+def test_list_pr_reviews_empty_list_is_valid() -> None:
+    # A PR with no reviews at all — the merge gate's "absent" input.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    assert adapter.list_pr_reviews(OWNER, REPO, PR_NUMBER) == []
+
+
+def test_list_pr_reviews_skips_malformed_entries_defensively() -> None:
+    # Non-dict items, a missing id, and a non-int id are skipped; well-formed
+    # entries around them survive; a missing user / non-string fields degrade
+    # to empty strings rather than raising.
+    payload = [
+        "garbage",
+        {"state": "APPROVED", "commit_id": SHA},  # no id -> skipped
+        {"id": "not-an-int", "state": "APPROVED"},  # non-int id -> skipped
+        _review_payload(review_id=5, user_login="someone"),
+        {"id": 6, "state": 123, "commit_id": None, "user": "not-a-dict"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    reviews = adapter.list_pr_reviews(OWNER, REPO, PR_NUMBER)
+
+    assert [r.review_id for r in reviews] == [5, 6]
+    assert reviews[0] == PullRequestReview(
+        review_id=5,
+        state="APPROVED",
+        commit_id=SHA,
+        user_login="someone",
+        submitted_at="2026-01-02T03:04:05Z",
+    )
+    # Non-string state/commit_id degrade to "" and a non-dict user to "".
+    assert reviews[1].state == ""
+    assert reviews[1].commit_id == ""
+    assert reviews[1].user_login == ""
+
+
+def test_list_pr_reviews_non_list_payload_raises_adapter_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": "unexpected"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="non-list"):
+        adapter.list_pr_reviews(OWNER, REPO, PR_NUMBER)
+
+
+def test_list_pr_reviews_per_page_clamped_to_github_range() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert dict(request.url.params) == {"per_page": "100"}
+        return httpx.Response(200, json=[])
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    # 500 -> clamped up to 1; 5000 -> clamped down to 100.
+    adapter.list_pr_reviews(OWNER, REPO, PR_NUMBER, per_page=500)
+    adapter.list_pr_reviews(OWNER, REPO, PR_NUMBER, per_page=5000)
+    assert len(seen) == 2
+
+
+def test_list_pr_reviews_retry_then_succeed_on_500() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries == 1:
+            return httpx.Response(500, json={"message": "boom"})
+        return httpx.Response(200, json=[_review_payload()])
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    reviews = adapter.list_pr_reviews(OWNER, REPO, PR_NUMBER)
+    assert tries == 2
+    assert [r.state for r in reviews] == ["APPROVED"]
+
+
+def test_list_pr_reviews_retry_exhaust_on_503_raises_adapter_error() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(503, json={"message": "unavailable"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError):
+        adapter.list_pr_reviews(OWNER, REPO, PR_NUMBER)
+    assert tries == 3
+
+
+def test_list_pr_reviews_no_retry_on_404() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="404"):
+        adapter.list_pr_reviews(OWNER, REPO, PR_NUMBER)
+    assert tries == 1
+
+
+def test_list_pr_reviews_token_redacted_from_error_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, text=f"validation error: bad token {TOKEN}")
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        adapter.list_pr_reviews(OWNER, REPO, PR_NUMBER)
+
+    msg = str(exc_info.value)
+    assert TOKEN not in msg
+    assert "***" in msg
+
+
+@pytest.mark.parametrize("which", ["owner", "repo"])
+def test_list_pr_reviews_empty_owner_or_repo_raises_value_error_before_any_http(
+    which: str,
+) -> None:
+    called: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request)
+        return httpx.Response(200, json=[])
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    if which == "owner":
+        with pytest.raises(ValueError, match="owner"):
+            adapter.list_pr_reviews("", REPO, PR_NUMBER)
+    else:
+        with pytest.raises(ValueError, match="repo"):
+            adapter.list_pr_reviews(OWNER, "", PR_NUMBER)
+
+    assert called == []
+
+
+def test_list_pr_reviews_invalid_number_raises_value_error_before_any_http() -> None:
+    called: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request)
+        return httpx.Response(200, json=[])
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(ValueError, match="number"):
+        adapter.list_pr_reviews(OWNER, REPO, 0)
+
+    assert called == []
