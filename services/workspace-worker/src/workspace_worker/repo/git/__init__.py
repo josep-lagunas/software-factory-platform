@@ -13,6 +13,7 @@ from workspace_worker.repo.git.adapter import (
     GitPushResult,
     GitSyncResult,
     PullRequestResult,
+    PullRequestReview,
     ReviewResult,
 )
 
@@ -23,5 +24,6 @@ __all__ = [
     "GitPushResult",
     "GitSyncResult",
     "PullRequestResult",
+    "PullRequestReview",
     "ReviewResult",
 ]
