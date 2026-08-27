@@ -97,6 +97,22 @@ SECRET_REF_JSON='{"name":"ANTHROPIC_AUTH_TOKEN"}'
 : "${SFP_GIT_OWNER:="josep-lagunas"}"
 : "${SFP_GIT_REPO:="software-factory-platform"}"
 : "${SFP_WORKTREE_BASE:="/tmp/sfp-worktrees"}"
+# Stream liveness watchdogs (SFP-242). NOT exported here — these are comments
+# only; the settings defaults apply unless an operator overrides them. The SDK
+# query() spawns the Claude Code CLI; when the endpoint goes mute the CLI stays
+# up and the run used to hang for hours with zero stream events. Two budgets
+# bound that (WorkspaceWorkerSettings, env-tunable, SFP_ prefix):
+#   SFP_SPAWN_FIRST_EVENT_TIMEOUT   budget (s) for the FIRST stream event
+#                                   after spawn. Default 300 (5 min).
+#   SFP_SPAWN_PROGRESS_TIMEOUT      max INACTIVITY (s) between consecutive
+#                                   stream events once the first arrived.
+#                                   Default 900 (15 min).
+# A trip terminates the CLI and raises the existing transient error (retried /
+# failed closed by the existing path). Raise these for a known-slow cold start
+# (a 5-min first event can legitimately happen on an unusually slow endpoint);
+# lower them to abort sooner. To override, set them in the caller's env or .env,
+# e.g. SFP_SPAWN_FIRST_EVENT_TIMEOUT=600 ./run-ticket.sh
+# NOTE: a total run LONGER than both budgets is fine — only INACTIVITY trips.
 
 export SFP_ANTHROPIC_BASE_URL SFP_DEFAULT_MODEL SFP_AGENT_MODEL_CODER \
        SFP_LLM_PROVIDER_SECRET_REF SFP_JIRA_EMAIL SFP_JIRA_SITE \
