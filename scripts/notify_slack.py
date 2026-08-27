@@ -33,11 +33,13 @@ _OUTCOME_RE = re.compile(r"(slice (?:ok|aborted): .*)")
 
 
 def _post(client: SlackOutboundClient, text: str, thread: str | None = None) -> str | None:
-    """Best-effort post; returns the thread_ts of the message (for replies)."""
+    """Best-effort post; returns the message's own ts (usable as a thread anchor)."""
     try:
-        receipt = client.send_message(text)
+        receipt = client.send_message(text, thread_ref=thread)
         if receipt.ok:
-            return receipt.thread_ref
+            # thread_ref echoes the *requested* anchor; the message's own ts is
+            # what later replies must thread under.
+            return receipt.provider_message_id or None
         print(f"[notify-run] slack refused: {receipt.error}", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 — glue must never break the run
         print(f"[notify-run] slack unreachable: {type(exc).__name__}", file=sys.stderr)
@@ -59,6 +61,8 @@ def main() -> int:
     )
     if proc.stdout:
         print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)  # run-ticket.sh diagnostics (scrubbed)
 
     outcome = None
     m = _OUTCOME_RE.search(proc.stdout or "")
