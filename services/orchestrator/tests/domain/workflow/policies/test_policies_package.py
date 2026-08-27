@@ -45,14 +45,23 @@ def test_package_exports_the_three_fact_models() -> None:
 
 
 def test_exported_names_are_exactly_the_public_surface() -> None:
+    # SFP-144 extends the public surface with the three context policies and
+    # their fact models. The fact-kind constants stay in facts.py (imported
+    # from there, as the SFP-143 tests already do).
     assert set(policies.__all__) == {
         "CodingStartFact",
         "CodingStartPolicy",
+        "DeployBeginFact",
+        "DeployBeginPolicy",
+        "FailureFact",
         "MergeReadyFact",
         "MergeReadyPolicy",
         "ReviewFact",
         "ReviewStatus",
         "ReviewSuccessPolicy",
+        "ShouldFailPolicy",
+        "UserApprovalFact",
+        "UserApprovalPolicy",
     }
 
 

@@ -29,6 +29,8 @@ from __future__ import annotations
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
+from sfp_contracts.validation.profiles import ValidationProfile
+from sfp_contracts.workflow.failure import FailureClassification
 
 #: The fact-kind prefix for coding-start facts in the engine's string vocabulary.
 CODING_START_FACT_KIND = "coding-start-fact"
@@ -40,6 +42,18 @@ REVIEW_FACT_KIND = "review-outcome-fact"
 
 #: The fact-kind prefix for merge-ready facts in the engine's string vocabulary.
 MERGE_READY_FACT_KIND = "merge-ready-fact"
+
+#: The fact-kind prefix for user-approval facts in the engine's string
+#: vocabulary (SFP-144).
+USER_APPROVAL_FACT_KIND = "user-approval-fact"
+
+#: The fact-kind prefix for deploy-begin facts in the engine's string
+#: vocabulary (SFP-144).
+DEPLOY_BEGIN_FACT_KIND = "deploy-begin-fact"
+
+#: The fact-kind prefix for failure facts in the engine's string vocabulary
+#: (SFP-144).
+FAILURE_FACT_KIND = "failure-fact"
 
 
 class CodingStartFact(BaseModel):
@@ -128,12 +142,102 @@ class MergeReadyFact(BaseModel):
         )
 
 
+class UserApprovalFact(BaseModel):
+    """The business facts :class:`~.user_approval.UserApprovalPolicy` consumes.
+
+    Shape (per the PRSpec): the PR-spec's validation profile — the *only*
+    input ID-024/ID-067 allow the approval requirement to be decided from,
+    never an ad-hoc boolean. The profile renders as its plain string value
+    (ID-013) so an absent or unknown profile is distinguishable from a known
+    one: a known profile renders a recognized string; anything else simply
+    matches no rendering, which the policy fail-closes on.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: The PR-spec's validation tier (landed ``ValidationProfile`` vocabulary).
+    validation_profile: ValidationProfile
+
+    def to_fact_strings(self) -> tuple[str, ...]:
+        """Render deterministically into the engine's fact-string vocabulary."""
+        return (f"{USER_APPROVAL_FACT_KIND}:validation_profile:{self.validation_profile.value}",)
+
+
+class DeployBeginFact(BaseModel):
+    """The business facts :class:`~.deploy_begin.DeployBeginPolicy` consumes.
+
+    Shape (per the PRSpec): whether the merge has completed and, if so, the
+    ref deployment should target. ``merge_completed`` is a plain observed
+    boolean; ``deploy_target_ref`` is a free-form ref string carried as data
+    (the policy only asks whether one is present, never interpreting it). The
+    absent-fact case is the model being absent, which the policy records with
+    its own absent-fact reason; a ``deploy_target_ref`` of ``""`` renders
+    distinctly from an absent field so the empty-ref row names itself.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: Whether the merge stage has completed successfully.
+    merge_completed: bool
+    #: The ref the deployment should target (empty string = not set).
+    deploy_target_ref: str
+
+    def to_fact_strings(self) -> tuple[str, ...]:
+        """Render deterministically into the engine's fact-string vocabulary."""
+        return (
+            f"{DEPLOY_BEGIN_FACT_KIND}:merge_completed:{self.merge_completed}",
+            f"{DEPLOY_BEGIN_FACT_KIND}:deploy_target_ref:{self.deploy_target_ref}",
+        )
+
+
+class FailureFact(BaseModel):
+    """The business facts :class:`~.should_fail.ShouldFailPolicy` consumes.
+
+    Shape (per the PRSpec): one landed
+    :class:`~sfp_contracts.workflow.failure.FailureClassification` — the
+    ``classify_failure`` output shape (SFP-75) — carried whole so the policy
+    routes on its ``category`` / ``cause`` / ``recoverable`` exactly as ID-068
+    enumerates them, never re-enumerating the causes here. Rendering a
+    classification is a deterministic join of its three routing fields; the
+    informational ``detail`` is deliberately *not* rendered (it cannot alter
+    the routing and would make the engine's fact vocabulary unbounded).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: The landed classification of the observed failure (SFP-75).
+    classification: FailureClassification
+
+    def to_fact_strings(self) -> tuple[str, ...]:
+        """Render deterministically into the engine's fact-string vocabulary."""
+        rendered_cause = (
+            self.classification.cause.value if self.classification.cause is not None else NONE
+        )
+        return (
+            f"{FAILURE_FACT_KIND}:category:{self.classification.category.value}",
+            f"{FAILURE_FACT_KIND}:cause:{rendered_cause}",
+            f"{FAILURE_FACT_KIND}:recoverable:{self.classification.recoverable}",
+        )
+
+
+#: The deterministic rendering of "no blocked cause" in the fact vocabulary
+#: (``DEVELOPMENT_FAILURE`` classifications carry ``cause=None``).
+NONE = "NONE"
+
+
 __all__ = [
     "CODING_START_FACT_KIND",
+    "DEPLOY_BEGIN_FACT_KIND",
+    "FAILURE_FACT_KIND",
     "MERGE_READY_FACT_KIND",
     "REVIEW_FACT_KIND",
+    "USER_APPROVAL_FACT_KIND",
     "CodingStartFact",
+    "DeployBeginFact",
+    "FailureFact",
     "MergeReadyFact",
+    "NONE",
     "ReviewFact",
     "ReviewStatus",
+    "UserApprovalFact",
 ]
