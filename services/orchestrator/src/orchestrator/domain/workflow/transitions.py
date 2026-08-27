@@ -1,10 +1,10 @@
-"""Stage-transition drivers for the coding/review stages (MAS §8.4–8.8).
+"""Stage-transition drivers for the coding/review/merge stages (MAS §8.4–8.8).
 
-Thin, **pure** drivers that advance a ticket workflow through the coding and
-review stages, delegating every actual move to the SFP-137 engine
-(:func:`orchestrator.domain.workflow.state_machine.transition`), which validates
-against :data:`TRANSITIONS` and returns the immutable
-:class:`WorkflowDecision` (§8.5). Three edges are driven here:
+Thin, **pure** drivers that advance a ticket workflow through the coding,
+review, and merge/deploy stages, delegating every actual move to the SFP-137
+engine (:func:`orchestrator.domain.workflow.state_machine.transition`), which
+validates against :data:`TRANSITIONS` and returns the immutable
+:class:`WorkflowDecision` (§8.5). The driven edges are:
 
 - ``READY_FOR_PR_SPECIFICATION → READY_FOR_CODING`` (SFP-138) — fired by a
   *successful-plan* fact (the planner ran to ``SUCCESS`` with ≥1 PR-spec).
@@ -17,12 +17,25 @@ against :data:`TRANSITIONS` and returns the immutable
   — fired by a *changes-requested review* fact (a ``ReviewUpdated``-style
   observation whose ``review_status`` is ``CHANGES_REQUESTED``). Rework is
   **normal workflow progression**, never a failure and never an escalation.
+- ``READY_FOR_MERGE → MERGING`` (SFP-140) — fired by an *approval* fact (an
+  ``approved`` review verdict for the PR).
+- ``MERGING → DEPLOYING`` and ``DEPLOYING → COMPLETED`` (SFP-140) — fired by a
+  *merge completed + deploy target present* fact and a *succeeded deployment*
+  fact respectively. A ``failed`` deployment is **not** this driver's move:
+  failure handling belongs to the landed SFP-144 ``ShouldFailPolicy``, so a
+  failed deployment is recorded as a no-move here and the workflow is never
+  routed into ``FAILED`` by this module.
+- ``MERGING → WAITING_FOR_USER`` (SFP-140, the ID-024 parking edge) — fired by
+  an *approval-required* fact (the ticket's validation profile requires human
+  approval before the merge executes). The wait is parked here; it is **never**
+  resolved by this module — resuming is the user-decision edge's concern
+  (ID-069 / §8.9), out of scope.
 
 On a failed, absent, or non-matching fact there is **no** transition, and the
 non-move is recorded as a business fact (§8.8) rather than swallowed —
 including an ``APPROVED`` review fact, which does *not* loop back to coding:
-the merge stage it selects is SFP-140's concern, so it is recorded as a
-non-move here.
+the merge stage it selects is driven below, so within the coding/review drivers
+it is recorded as a non-move there.
 
 Grounded in:
 - MAS §8.5 — every significant transition produces an immutable
@@ -42,6 +55,16 @@ Grounded in:
   quality loop: it drives the rework edge
   ``REVIEW_IN_PROGRESS → CODING_IN_PROGRESS`` and never enters ``FAILED`` or
   any escalation path.
+- ID-024 — a workflow whose validation profile requires human approval parks in
+  ``WAITING_FOR_USER`` while the approval is outstanding; the parking edge is a
+  first-class workflow move (``MERGING → WAITING_FOR_USER`` here), and leaving
+  the wait happens only on the user's decision (§8.9 / ID-069) — never here.
+- ID-067 — ``REQUIRES_HUMAN_APPROVAL`` is the profile set that makes the
+  approval-required fact true; the driver consumes the already-evaluated fact
+  and does not import the profile machinery.
+- ID-072 — the merge *decision* is the Orchestrator's and its *execution* is
+  the Workspace Worker's; the merge-stage driver only moves the workflow to
+  ``MERGING`` on the approval fact.
 - ID-013 — enums serialize as plain strings in any serialized field (the
   ``WorkflowDecision`` ``*_name`` companions).
 - SFP-142 — the policy engine that will own real policy selection is landed as
@@ -75,6 +98,23 @@ REVIEW_STAGE_TARGET = WorkflowState.REVIEW_IN_PROGRESS
 #: escalation.
 REWORK_SOURCE = WorkflowState.REVIEW_IN_PROGRESS
 REWORK_TARGET = WorkflowState.CODING_IN_PROGRESS
+#: The SFP-140 merge-stage edge: the approved review verdict begins the merge
+#: (the merge *decision* stays the Orchestrator's, ID-072).
+MERGE_STAGE_SOURCE = WorkflowState.READY_FOR_MERGE
+MERGE_STAGE_TARGET = WorkflowState.MERGING
+#: The SFP-140 deploy-stage edges: MERGING begins deploying once the merge is
+#: observed complete with a deploy target present, and DEPLOYING completes the
+#: workflow when the deployment is observed succeeded.
+DEPLOY_STAGE_BEGIN_SOURCE = WorkflowState.MERGING
+DEPLOY_STAGE_BEGIN_TARGET = WorkflowState.DEPLOYING
+DEPLOY_STAGE_FINISH_SOURCE = WorkflowState.DEPLOYING
+DEPLOY_STAGE_FINISH_TARGET = WorkflowState.COMPLETED
+#: The SFP-140 / ID-024 parking edge: MERGING parks in WAITING_FOR_USER while a
+#: human approval required by the validation profile is outstanding. The wait
+#: is *parked* here and never resolved here — resuming is the user-decision
+#: edge's concern (ID-069 / §8.9), out of scope for this module.
+MERGE_WAIT_SOURCE = WorkflowState.MERGING
+MERGE_WAIT_TARGET = WorkflowState.WAITING_FOR_USER
 
 #: The trivial fixed policies these drivers apply (SFP-142 owns real policy
 #: selection; a fixed rule is acceptable now per the PRSpec notes).
@@ -83,6 +123,9 @@ SPEC_STAGE_POLICY = "spec-stage-successful-plan"
 CODING_STAGE_POLICY = "coding-stage-job-started"
 REVIEW_STAGE_POLICY = "review-stage-pr-opened"
 REWORK_POLICY = "review-stage-changes-requested-rework"
+MERGE_STAGE_POLICY = "merge-stage-approval-granted"
+DEPLOY_STAGE_POLICY = "deploy-stage-merge-completed-deploy-target"
+MERGE_WAIT_POLICY = "merge-stage-approval-required-parking"
 
 #: The agents whose outputs these stages consume. The canonical agent
 #: identifiers (workspace-worker agents) — kept as data so the fact-type match
@@ -101,6 +144,13 @@ CODING_JOB_RUNNING_STATUS = "running"
 #: verdicts (notably ``APPROVED``) do not match this stage's driver: APPROVED
 #: selects the merge stage (SFP-140) and is recorded here as a non-move (§8.8).
 CHANGES_REQUESTED_STATUS = "CHANGES_REQUESTED"
+
+#: The deployment-outcome vocabulary this module recognizes: ``deployment_status``
+#: is honored only as ``None`` (no observation), ``"succeeded"``, or ``"failed"``.
+#: Any other string is treated as an unrecognized observation — a recorded
+#: no-move naming it, never an exception and never a guessed outcome.
+DEPLOYMENT_SUCCEEDED_STATUS = "succeeded"
+DEPLOYMENT_FAILED_STATUS = "failed"
 
 #: Reasons recorded on the moves (§8.5 ``reason``).
 _SPEC_MOVE_REASON = "successful plan observed: planner produced validated PR-specs"
@@ -121,6 +171,25 @@ _NO_REWORK_REVIEW_REASON = (
     "review fact is not CHANGES_REQUESTED: no coding/review-stage move applies; "
     "the merge stage it may select is SFP-140's concern"
 )
+
+#: Reasons recorded on the SFP-140 merge/deploy moves (§8.5 ``reason``).
+_MERGE_MOVE_REASON = "approval granted: begin merge"
+_DEPLOY_BEGIN_MOVE_REASON = "merge completed and deploy target present: begin deploy"
+_DEPLOY_FINISH_MOVE_REASON = "deployment succeeded"
+_MERGE_WAIT_MOVE_REASON = "approval required before merging: park in WAITING_FOR_USER (ID-024)"
+
+#: Reasons recorded on the SFP-140 merge/deploy non-moves (§8.8).
+_NO_APPROVAL_FACT_REASON = "no approval fact observed: the workflow stays at this stage"
+_NOT_APPROVED_REASON = "approval fact not approved: the workflow stays at this stage"
+_DEPLOY_FAILED_OUTCOME_REASON = (
+    "deployment failed: failure handling belongs to the ShouldFail policy, not this driver"
+)
+_NO_DEPLOY_OUTCOME_REASON = "no deploy outcome observed"
+_NOT_IN_DEPLOY_STAGE_REASON = "not in a deploy stage"
+_MERGE_NOT_COMPLETED_REASON = "merge not completed"
+_NO_DEPLOY_TARGET_REASON = "no deploy target: nothing to deploy"
+_MERGE_WAIT_NOT_REQUIRED_REASON = "approval not required"
+_NO_APPROVAL_REQUIRED_FACT_REASON = "no approval-required fact"
 
 
 def spec_stage_fact_is_successful(
@@ -539,6 +608,442 @@ def drive_rework_loop(
     )
 
 
+# --- Merge stage: READY_FOR_MERGE → MERGING (SFP-140) ---------------------------
+
+
+def _approval_fact_id(approval_fact: tuple[bool | None, str | None]) -> str:
+    """Build the deterministic approval-fact identifier for §8.5 records."""
+    approved = approval_fact[0]
+    approved_part = str(approved).lower() if approved is not None else "unknown-approval"
+    profile_part = approval_fact[1] if approval_fact[1] is not None else "unknown-profile"
+    return f"approval-fact:{approved_part}:{profile_part}"
+
+
+def approval_fact_granted(*, approved: bool | None) -> bool:
+    """Return whether one observed approval fact is an *approval granted* fact.
+
+    The fact shape is the landed approval observation (MAS §12.9: taken from
+    what is landed, not invented): ``(approved, validation_profile)`` — whether
+    the review verdict approved the PR, and the validation profile under which
+    the ticket is being run. Only ``approved is True`` begins the merge: an
+    absent (``None``) or explicitly not-approved (``False``) verdict — including
+    a ``CHANGES_REQUESTED`` one — never merges (§8.8). Kept as a plain, total
+    predicate: pure, deterministic, and independent of any envelope class
+    (AP-011).
+    """
+    return approved is True
+
+
+def drive_merge_stage(
+    current_state: WorkflowState,
+    *,
+    approval_fact: tuple[bool | None, str | None] | None = None,
+) -> tuple[WorkflowState, WorkflowDecision]:
+    """Advance (or deliberately hold) the approval→merge stage (SFP-140).
+
+    The pure merge-stage driver: a function of ``(current_state,
+    approval_fact)`` only — no I/O, no clock, no randomness, no bus (AP-011).
+    Identical inputs always yield an identical resulting state and an equal
+    ``WorkflowDecision``.
+
+    Args:
+        current_state: The workflow's current state.
+        approval_fact: The observed approval business fact as
+            ``(approved, validation_profile)`` — whether the review approved
+            the PR and the profile the ticket is running under — or ``None``
+            when no approval fact has been observed at all. A ``None``
+            ``approved`` member means the verdict was absent from the
+            observation.
+
+    Returns:
+        The resulting workflow state and the immutable :class:`WorkflowDecision`
+        recording what was decided and why. On an approved fact the decision is
+        the engine-produced §8.5 record of the move
+        ``READY_FOR_MERGE → MERGING``; on an absent or not-approved fact the
+        decision is the §8.8 record of the *non-move* (same state on both
+        endpoints, ``reason`` naming the observed verdict). The non-move is
+        returned, never swallowed.
+
+    Raises:
+        IllegalTransitionError: if the move is not in the SFP-137 transition
+            table — e.g. the workflow is not currently at ``READY_FOR_MERGE``
+            when an approval fact arrives. Propagated from the table guard; the
+            driver never performs or invents an implicit fallback transition
+            (MAS §8.2).
+    """
+    if approval_fact is None:
+        # §8.8: no observation yet → record the non-move, hold the state.
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_NO_APPROVAL_FACT_REASON,
+            applied_policy=MERGE_STAGE_POLICY,
+            business_facts_considered=("approval-fact:absent",),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    if not approval_fact_granted(approved=approval_fact[0]):
+        # §8.8: a fact was observed but it is not an approval — an absent
+        # verdict or a CHANGES_REQUESTED one never merges. Record the non-move
+        # naming the observed verdict; the workflow stays ready for merge.
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_NOT_APPROVED_REASON,
+            applied_policy=MERGE_STAGE_POLICY,
+            business_facts_considered=(_approval_fact_id(approval_fact),),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    # Approval granted → request the move through the SFP-137 engine. The
+    # engine is the sole legality authority: if the edge is not in TRANSITIONS
+    # the IllegalTransitionError propagates (no implicit move, ever).
+    return transition(
+        current_state,
+        MERGE_STAGE_TARGET,
+        reason=_MERGE_MOVE_REASON,
+        applied_policy=MERGE_STAGE_POLICY,
+        business_facts_considered=(_approval_fact_id(approval_fact),),
+        aggregate_changes=("tickets.workflow_status",),
+    )
+
+
+# --- Deploy stage: MERGING → DEPLOYING → COMPLETED (SFP-140) --------------------
+
+
+def _deploy_fact_id(
+    *,
+    merge_completed: bool | None,
+    deploy_target_ref: str | None,
+) -> str:
+    """Build the deterministic deploy-target-fact identifier for §8.5 records."""
+    completed_part = (
+        str(merge_completed).lower() if merge_completed is not None else "unknown-merge-completed"
+    )
+    # An empty ref is the same observation as an absent one (nothing to deploy),
+    # so it renders identically — never as a dangling empty segment.
+    target_part = deploy_target_ref if deploy_target_ref else "no-deploy-target"
+    return f"deploy-fact:{completed_part}:{target_part}"
+
+
+def _deploy_outcome_fact_id(deployment_status: str) -> str:
+    """Build the deterministic deploy-outcome-fact identifier for §8.5 records."""
+    return f"deploy-outcome-fact:{deployment_status}"
+
+
+def deploy_outcome_recognized(*, deployment_status: str | None) -> bool:
+    """Return whether one observed deployment status is a recognized outcome.
+
+    The fact shape is the landed deployment-outcome observation (MAS §12.9:
+    taken from what is landed, not invented): ``deployment_status`` is honored
+    only as ``"succeeded"`` or ``"failed"``. ``None`` means no outcome has been
+    observed, and any other string is an unrecognized vocabulary value — in
+    both cases there is no recognized outcome yet, which the driver records as
+    a no-move naming what it saw (never an exception, never a guess). Kept as a
+    plain, total predicate: pure, deterministic (AP-011).
+    """
+    return deployment_status in _RECOGNIZED_DEPLOY_OUTCOMES
+
+
+#: The only deployment-outcome values this module recognizes (a frozenset so
+#: the predicate stays a plain membership test, not a chain of comparisons).
+_RECOGNIZED_DEPLOY_OUTCOMES = frozenset(
+    {DEPLOYMENT_SUCCEEDED_STATUS, DEPLOYMENT_FAILED_STATUS},
+)
+
+
+def drive_deploy_stage(
+    current_state: WorkflowState,
+    *,
+    merge_completed: bool | None = None,
+    deploy_target_ref: str | None = None,
+    deployment_status: str | None = None,
+) -> tuple[WorkflowState, WorkflowDecision]:
+    """Advance (or deliberately hold) the merge→deploy→completed stage (SFP-140).
+
+    The pure deploy-stage driver: a function of ``(current_state,
+    merge_completed, deploy_target_ref, deployment_status)`` only — no I/O, no
+    clock, no randomness, no bus (AP-011). Identical inputs always yield an
+    identical resulting state and an equal ``WorkflowDecision``.
+
+    The decision table, verbatim:
+
+    ======  ==========================  ==========================  =====================
+    Row     State                       Facts                       Outcome
+    ======  ==========================  ==========================  =====================
+    1       ``DEPLOYING``               status ``"succeeded"``      → ``COMPLETED``
+    2       ``DEPLOYING``               status ``"failed"``         no-move (§8.8) — the
+                                                                      landed SFP-144
+                                                                      ``ShouldFailPolicy``
+                                                                      owns failure
+    3       ``DEPLOYING``               status ``None``/other       no-move — no recognized
+                                                                      outcome observed
+    4       ``MERGING``                 ``merge_completed is True`` → ``DEPLOYING``
+                                        **and** ``deploy_target_ref``
+    5       ``MERGING``                 row 4's facts not met        no-move, naming which
+    6       any other state             —                           no-move — not a deploy
+                                                                      stage
+    ======  ==========================  ==========================  =====================
+
+    At ``MERGING`` the deployment outcome is deliberately **not** consulted:
+    no deployment exists yet, so a stray outcome observation cannot skip the
+    deploy stage.
+
+    Args:
+        current_state: The workflow's current state.
+        merge_completed: Whether the merge was observed completed (the SFP-240
+            gate context is the source of this observation) — ``None`` when
+            not observed.
+        deploy_target_ref: The ref the merged work is deployed to — ``None`` /
+            empty when there is nothing to deploy yet.
+        deployment_status: The deployment outcome, honored only as
+            ``"succeeded"`` / ``"failed"``. Any other value (including an
+            arbitrary unrecognized string) is treated as an unrecognized
+            observation and recorded as a no-move naming it — never an
+            exception.
+
+    Returns:
+        The resulting workflow state and the immutable :class:`WorkflowDecision`
+        recording what was decided and why. A move is requested only on rows 1
+        and 4, through the SFP-137 engine; every other row returns the §8.8
+        record of the *non-move* (same state on both endpoints, ``reason``
+        naming the exact cause). The non-move is returned, never swallowed —
+        and this driver **never** requests ``FAILED`` (row 2 defers to the
+        landed ``ShouldFailPolicy``).
+
+    Raises:
+        IllegalTransitionError: if the decided move is not in the SFP-137
+            transition table. Propagated from the table guard; the driver
+            never performs or invents an implicit fallback transition
+            (MAS §8.2).
+    """
+    if current_state is DEPLOY_STAGE_FINISH_SOURCE:
+        return _drive_deploy_finish(current_state, deployment_status=deployment_status)
+
+    if current_state is DEPLOY_STAGE_BEGIN_SOURCE:
+        return _drive_deploy_begin(
+            current_state,
+            merge_completed=merge_completed,
+            deploy_target_ref=deploy_target_ref,
+        )
+
+    # Row 6: any other state is not a deploy stage — record the non-move (§8.8)
+    # rather than silently doing nothing.
+    return current_state, WorkflowDecision(
+        previous_state=current_state,
+        resulting_state=current_state,
+        reason=_NOT_IN_DEPLOY_STAGE_REASON,
+        applied_policy=DEPLOY_STAGE_POLICY,
+        business_facts_considered=(),
+        previous_state_name=current_state.name,
+        resulting_state_name=current_state.name,
+    )
+
+
+def _drive_deploy_finish(
+    current_state: WorkflowState,
+    *,
+    deployment_status: str | None,
+) -> tuple[WorkflowState, WorkflowDecision]:
+    """Rows 1–3: decide the ``DEPLOYING`` outcome (SFP-140).
+
+    Raises:
+        IllegalTransitionError: if the row-1 move is not in the SFP-137 table.
+    """
+    if deployment_status == DEPLOYMENT_SUCCEEDED_STATUS:
+        # Row 1: the deployment succeeded → the workflow completes.
+        return transition(
+            current_state,
+            DEPLOY_STAGE_FINISH_TARGET,
+            reason=_DEPLOY_FINISH_MOVE_REASON,
+            applied_policy=DEPLOY_STAGE_POLICY,
+            business_facts_considered=(_deploy_outcome_fact_id(deployment_status),),
+            aggregate_changes=("tickets.workflow_status",),
+        )
+
+    if deployment_status == DEPLOYMENT_FAILED_STATUS:
+        # Row 2: a failed deployment is NOT this driver's move — failure
+        # handling belongs to the landed SFP-144 ShouldFailPolicy (§8.8: the
+        # non-move is a recorded business fact; FAILED is never entered here).
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_DEPLOY_FAILED_OUTCOME_REASON,
+            applied_policy=DEPLOY_STAGE_POLICY,
+            business_facts_considered=(_deploy_outcome_fact_id(deployment_status),),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    # Row 3: no recognized outcome — unobserved (None) or an unrecognized
+    # vocabulary value. Treat as absent, name what was seen (§8.8), never raise.
+    return current_state, WorkflowDecision(
+        previous_state=current_state,
+        resulting_state=current_state,
+        reason=_NO_DEPLOY_OUTCOME_REASON,
+        applied_policy=DEPLOY_STAGE_POLICY,
+        business_facts_considered=(
+            _deploy_outcome_fact_id(deployment_status if deployment_status else "none"),
+        ),
+        previous_state_name=current_state.name,
+        resulting_state_name=current_state.name,
+    )
+
+
+def _drive_deploy_begin(
+    current_state: WorkflowState,
+    *,
+    merge_completed: bool | None,
+    deploy_target_ref: str | None,
+) -> tuple[WorkflowState, WorkflowDecision]:
+    """Rows 4–5: decide the ``MERGING`` → deploy begin (SFP-140).
+
+    Raises:
+        IllegalTransitionError: if the row-4 move is not in the SFP-137 table.
+    """
+    fact_id = _deploy_fact_id(
+        merge_completed=merge_completed,
+        deploy_target_ref=deploy_target_ref,
+    )
+
+    # Row 5a: the merge has not been observed completed — nothing to deploy yet.
+    if merge_completed is not True:
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_MERGE_NOT_COMPLETED_REASON,
+            applied_policy=DEPLOY_STAGE_POLICY,
+            business_facts_considered=(fact_id,),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    # Row 5b: the merge completed but no deploy target was observed — there is
+    # nothing to deploy yet.
+    if not deploy_target_ref:
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_NO_DEPLOY_TARGET_REASON,
+            applied_policy=DEPLOY_STAGE_POLICY,
+            business_facts_considered=(fact_id,),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    # Row 4: merge observed complete and a deploy target is present → begin
+    # deploying. The engine is the sole legality authority; an illegal move
+    # propagates (no implicit move, ever).
+    return transition(
+        current_state,
+        DEPLOY_STAGE_BEGIN_TARGET,
+        reason=_DEPLOY_BEGIN_MOVE_REASON,
+        applied_policy=DEPLOY_STAGE_POLICY,
+        business_facts_considered=(fact_id,),
+        aggregate_changes=("tickets.workflow_status",),
+    )
+
+
+# --- Merge-wait parking: MERGING → WAITING_FOR_USER (ID-024) --------------------
+
+
+def _approval_required_fact_id(approval_required_fact: bool | None) -> str:
+    """Build the deterministic approval-required-fact identifier (§8.5)."""
+    return (
+        str(approval_required_fact).lower()
+        if approval_required_fact is not None
+        else "unknown-approval-required"
+    )
+
+
+def drive_merge_wait(
+    current_state: WorkflowState,
+    *,
+    approval_required_fact: bool | None = None,
+) -> tuple[WorkflowState, WorkflowDecision]:
+    """Park (or deliberately hold) the MERGING approval wait (SFP-140, ID-024).
+
+    The pure merge-wait driver: a function of ``(current_state,
+    approval_required_fact)`` only — no I/O, no clock, no randomness, no bus
+    (AP-011). Identical inputs always yield an identical resulting state and an
+    equal ``WorkflowDecision``.
+
+    ID-024: a workflow whose validation profile requires human approval
+    (:data:`~sfp_contracts.validation.profiles.REQUIRES_HUMAN_APPROVAL`, ID-067)
+    parks in ``WAITING_FOR_USER`` while the approval is outstanding. This
+    driver owns only the **parking** edge ``MERGING → WAITING_FOR_USER``; it
+    never resolves the wait — leaving ``WAITING_FOR_USER`` happens on the
+    user's decision (§8.9 / ID-069), which is a user-decision edge driven by a
+    user-decision observation, not by any stage fact, and is out of scope here.
+
+    Args:
+        current_state: The workflow's current state.
+        approval_required_fact: The observed *approval required* business fact —
+            ``True`` when the ticket's validation profile requires human
+            approval, ``False`` when it does not — or ``None`` when no such
+            fact has been observed at all.
+
+    Returns:
+        The resulting workflow state and the immutable :class:`WorkflowDecision`
+        recording what was decided and why. On a ``True`` fact the decision is
+        the engine-produced §8.5 record of the parking move
+        ``MERGING → WAITING_FOR_USER``; on a ``False`` or absent fact the
+        decision is the §8.8 record of the *non-move* (same state on both
+        endpoints, ``reason`` naming the cause). The non-move is returned,
+        never swallowed.
+
+    Raises:
+        IllegalTransitionError: if the move is not in the SFP-137 transition
+            table — e.g. the workflow is not currently at ``MERGING`` when an
+            approval-required fact arrives. Propagated from the table guard;
+            the driver never performs or invents an implicit fallback
+            transition (MAS §8.2).
+    """
+    if approval_required_fact is None:
+        # §8.8: no observation yet → record the non-move, hold the state.
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_NO_APPROVAL_REQUIRED_FACT_REASON,
+            applied_policy=MERGE_WAIT_POLICY,
+            business_facts_considered=("approval-required-fact:absent",),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    if approval_required_fact is not True:
+        # §8.8: approval is not required → no parking move; record the non-move
+        # naming the observed fact and keep merging.
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_MERGE_WAIT_NOT_REQUIRED_REASON,
+            applied_policy=MERGE_WAIT_POLICY,
+            business_facts_considered=(
+                f"approval-required-fact:{_approval_required_fact_id(approval_required_fact)}",
+            ),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    # Approval required → park through the SFP-137 engine (ID-024). The engine
+    # is the sole legality authority: if the edge is not in TRANSITIONS the
+    # IllegalTransitionError propagates (no implicit move, ever). The wait is
+    # parked, never resolved here.
+    return transition(
+        current_state,
+        MERGE_WAIT_TARGET,
+        reason=_MERGE_WAIT_MOVE_REASON,
+        applied_policy=MERGE_WAIT_POLICY,
+        business_facts_considered=(
+            f"approval-required-fact:{_approval_required_fact_id(approval_required_fact)}",
+        ),
+        aggregate_changes=("tickets.workflow_status",),
+    )
+
+
 __all__ = [
     "CHANGES_REQUESTED_STATUS",
     "CODER_AGENT",
@@ -546,6 +1051,19 @@ __all__ = [
     "CODING_STAGE_POLICY",
     "CODING_STAGE_SOURCE",
     "CODING_STAGE_TARGET",
+    "DEPLOYMENT_FAILED_STATUS",
+    "DEPLOYMENT_SUCCEEDED_STATUS",
+    "DEPLOY_STAGE_BEGIN_SOURCE",
+    "DEPLOY_STAGE_BEGIN_TARGET",
+    "DEPLOY_STAGE_FINISH_SOURCE",
+    "DEPLOY_STAGE_FINISH_TARGET",
+    "DEPLOY_STAGE_POLICY",
+    "MERGE_STAGE_POLICY",
+    "MERGE_STAGE_SOURCE",
+    "MERGE_STAGE_TARGET",
+    "MERGE_WAIT_POLICY",
+    "MERGE_WAIT_SOURCE",
+    "MERGE_WAIT_TARGET",
     "PLANNER_AGENT",
     "REVIEW_STAGE_POLICY",
     "REVIEW_STAGE_SOURCE",
@@ -553,9 +1071,14 @@ __all__ = [
     "REWORK_POLICY",
     "REWORK_SOURCE",
     "REWORK_TARGET",
+    "approval_fact_granted",
     "changes_requested_review_fact",
     "coding_job_started_fact",
+    "deploy_outcome_recognized",
     "drive_coding_stage",
+    "drive_deploy_stage",
+    "drive_merge_stage",
+    "drive_merge_wait",
     "drive_review_stage",
     "drive_rework_loop",
     "drive_spec_stage",
