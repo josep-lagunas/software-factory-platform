@@ -27,12 +27,25 @@ retried — ``TRANSIENT_EXCEPTIONS`` (``_TransientSDKError`` for empty streams a
 the SDK is imported). Non-conformant output / ``is_error`` / non-JSON are HARD
 rejects (not retried). Fail-closed: any unhandled exception becomes
 ``AgentRunResult(success=False, ...)``; no exception escapes ``run()``.
+
+Stream liveness watchdogs (SFP-242): the SDK's ``query()`` spawns the Claude
+Code CLI and yields its stream. When the endpoint goes mute the CLI stays up and
+the run hangs for hours with zero events. Two budgets bound that — a
+first-event budget (default 300s) and a between-events inactivity budget
+(default 900s), both env-tunable via ``WorkspaceWorkerSettings``
+(``SFP_SPAWN_FIRST_EVENT_TIMEOUT`` / ``SFP_SPAWN_PROGRESS_TIMEOUT``). A trip
+closes the stream — on the real path that runs the SDK's own terminate→kill
+escalation, reaping the CLI — and raises the EXISTING ``_TransientSDKError``
+with a watchdog-naming message, so the caller's abort/retry path is unchanged.
+Timeouts are measured with :func:`time.monotonic` (MAS §12.7 — never wall
+clock).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -67,6 +80,17 @@ class _TransientSDKError(Exception):
 #: rate-limit; 5xx are upstream/server faults. Anything else reaching the
 #: hard-reject path is an output error, not infrastructure.
 _TRANSIENT_API_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504, 529})
+
+#: Watchdog stage names used in the raised message (SFP-242). "spawn" is the
+#: budget covering the FIRST event after the CLI is spawned; "progress" is the
+#: between-events inactivity budget once streaming has started.
+_FIRST_EVENT_STAGE = "spawn"
+_PROGRESS_STAGE = "progress"
+
+#: Upper bound (s) on stream cleanup after a watchdog trip before the error is
+#: raised. Generous vs. the SDK's own close() escalation (~20s worst case);
+#: only a generator that ignores cancellation can reach it.
+_WATCHDOG_CLOSE_GRACE_S = 30.0
 
 #: Async sleep callable used between retry attempts; tests replace it with a
 #: no-op so retries are instantaneous (no real waiting).
@@ -280,8 +304,9 @@ class ClaudeAgentRuntime:
                 dict(request.context), default=str, ensure_ascii=False
             )
         final_message: Any = await self._retryer()(
-            self._consume_stream, query_fn, effective_prompt, options
+            self._consume_stream, query_fn, effective_prompt, options, request.agent
         )
+        # ``request.agent`` is threaded through to the watchdog messages above.
 
         # 4. Hard-reject an SDK error or missing result (NOT retried).
         is_error = bool(getattr(final_message, "is_error", False))
@@ -327,21 +352,67 @@ class ClaudeAgentRuntime:
             output=parsed,
         )
 
-    async def _consume_stream(self, query_fn: QueryFn, prompt: str, options: Any) -> Any:
+    async def _consume_stream(
+        self, query_fn: QueryFn, prompt: str, options: Any, agent: str | None = None
+    ) -> Any:
         """Consume the SDK stream and return the final ``ResultMessage``.
 
-        Raises :class:`_TransientSDKError` (driving a retry) on an empty stream
-        or a transient (5xx/429) ``api_error_status``. Any other condition is
-        surfaced to :meth:`_run_async` for a hard-reject decision.
+        Raises :class:`_TransientSDKError` (driving a retry) on an empty stream,
+        a transient (5xx/429) ``api_error_status``, or a watchdog trip (SFP-242:
+        no first event within ``spawn_first_event_timeout_s``, or no further
+        event within ``spawn_progress_timeout_s`` of the last one). Any other
+        condition is surfaced to :meth:`_run_async` for a hard-reject decision.
+
+        Watchdog mechanics: each ``__anext__`` is wrapped in
+        :func:`asyncio.wait_for` with the currently active budget (first-event
+        budget until the first event arrives, inactivity budget afterwards). On
+        timeout, ``wait_for`` cancels the suspended ``__anext__`` and we
+        ``aclose()`` the generator — on the real SDK path its ``finally: await
+        query.close()`` runs the transport's shielded terminate→kill escalation
+        (grace wait → SIGTERM → SIGKILL), so the CLI is reaped BEFORE the error
+        propagates rather than orphaned. Closing is itself bounded so a wedged
+        generator cannot turn a minute-scale abort back into a hang.
+
+        ``agent`` names the agent role in the watchdog message (e.g. "coder
+        spawn watchdog: ..."); it is the request's role, not parsed output.
         """
         final_message: Any = None
+        first_budget = self._settings.spawn_first_event_timeout_s
+        progress_budget = self._settings.spawn_progress_timeout_s
+        agent_label = agent if agent else "agent"
+        stream = query_fn(prompt=prompt, options=options)
+        # monotonic (never wall clock) so an NTP jump cannot fake a trip or
+        # mask a real one (MAS §12.7 determinism).
+        started = time.monotonic()
+        last_event_at = started
         try:
-            async for message in query_fn(prompt=prompt, options=options):
+            while True:
+                budget = first_budget if final_message is None else progress_budget
+                try:
+                    message = await asyncio.wait_for(stream.__anext__(), timeout=budget)
+                except StopAsyncIteration:
+                    break
+                except TimeoutError:
+                    stage = _FIRST_EVENT_STAGE if final_message is None else _PROGRESS_STAGE
+                    elapsed = time.monotonic() - (
+                        started if final_message is None else last_event_at
+                    )
+                    await self._close_stream_silently(stream)
+                    raise _TransientSDKError(
+                        f"{agent_label} {stage} watchdog: no stream events in "
+                        f"{budget:.0f}s (silent for {elapsed:.0f}s) — CLI stream "
+                        f"closed (endpoint mute?)"
+                    ) from None
                 final_message = message
-        except Exception as exc:  # noqa: BLE001 — SMOKE-PATCH (local, NOT committed):
-            # the SDK sometimes raises an opaque "Claude Code returned an error
+                last_event_at = time.monotonic()
+        except Exception as exc:  # noqa: BLE001 — see below
+            # The SDK sometimes raises an opaque "Claude Code returned an error
             # result" on transient CLI/endpoint hiccups; retry rather than
-            # hard-fail the whole pipeline on one flaky call.
+            # hard-fail the whole pipeline on one flaky call. Watchdog trips
+            # (already _TransientSDKError) re-raise unchanged so their message
+            # names the watchdog instead of being re-wrapped.
+            if isinstance(exc, _TransientSDKError):
+                raise
             raise _TransientSDKError(f"sdk stream raised: {type(exc).__name__}: {exc}") from exc
 
         if final_message is None:
@@ -366,6 +437,24 @@ class ClaudeAgentRuntime:
             raise _TransientSDKError("agent produced an empty result")
 
         return final_message
+
+    @staticmethod
+    async def _close_stream_silently(stream: Any) -> None:
+        """Close a stream generator on a watchdog trip, best-effort and bounded.
+
+        On the real SDK path ``aclose()`` runs the generator's ``finally`` →
+        transport ``close()`` (terminate → kill escalation), releasing the CLI.
+        A wedged generator could hang that cleanup, so it is bounded; any error
+        is swallowed — the watchdog error is the actionable signal and MUST
+        propagate.
+        """
+        aclose = getattr(stream, "aclose", None)
+        if aclose is None:  # pragma: no cover — defensive: not an async generator
+            return
+        try:
+            await asyncio.wait_for(aclose(), timeout=_WATCHDOG_CLOSE_GRACE_S)
+        except Exception:  # noqa: BLE001 — cleanup is best-effort
+            pass
 
     def _retryer(self) -> AsyncRetrying:
         """Tenacity retryer: transient-only, exponential backoff, reraise."""
