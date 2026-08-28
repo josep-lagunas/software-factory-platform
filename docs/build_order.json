@@ -12,7 +12,6 @@
     "SFP-240",
     "SFP-241",
     "SFP-242",
-    "SFP-243",
     "SFP-5",
     "SFP-65",
     "SFP-67",
@@ -118,6 +117,7 @@
     "SFP-150",
     "SFP-159",
     "SFP-164",
+    "SFP-243",
     "SFP-52",
     "SFP-63",
     "SFP-102",
@@ -288,15 +288,6 @@
       "executor": "ai-agent",
       "phase": "Platform",
       "title": "Spawn/progress watchdog in ClaudeAgentRuntime"
-    },
-    {
-      "ticket": "SFP-243",
-      "wave": 0,
-      "deps": [],
-      "area": "ORCH",
-      "executor": "ai-agent",
-      "phase": "Platform",
-      "title": "Ticket enrichment agent: gate ambiguities → implementation-ready spec"
     },
     {
       "ticket": "SFP-5",
@@ -1485,6 +1476,18 @@
       "executor": "ai-agent",
       "phase": "Platform",
       "title": "Crash mid-outbox → no duplicate business effect"
+    },
+    {
+      "ticket": "SFP-243",
+      "wave": 6,
+      "deps": [
+        "SFP-236",
+        "SFP-36"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Ticket enrichment agent: gate ambiguities → implementation-ready spec"
     },
     {
       "ticket": "SFP-52",

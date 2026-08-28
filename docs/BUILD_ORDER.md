@@ -22,7 +22,6 @@ Waves computed via longest-path (Kahn): `wave(t)=0` if no deps, else `1+max(wave
 | SFP-240 | Sync branch base before push (stale-base conflicts) | WORKER | ai-agent | Platform | — |
 | SFP-241 | Verify/re-obtain PR review before merge | WORKER | ai-agent | Platform | — |
 | SFP-242 | Spawn/progress watchdog in ClaudeAgentRuntime | WORKER | ai-agent | Platform | — |
-| SFP-243 | Ticket enrichment agent: gate ambiguities → implementation-ready spec | ORCH | ai-agent | Platform | — |
 
 ## Wave 1
 
@@ -158,6 +157,7 @@ Waves computed via longest-path (Kahn): `wave(t)=0` if no deps, else `1+max(wave
 | SFP-150 | Batch task definition (container, sandbox, egress policy) | WSW | ai-agent | Platform | SFP-76, SFP-48 |
 | SFP-159 | release workflow: build + push (ECR) | CICD | ai-agent | Platform | SFP-75 |
 | SFP-164 | Crash mid-outbox → no duplicate business effect | VAL | ai-agent | Platform | SFP-92 |
+| SFP-243 | Ticket enrichment agent: gate ambiguities → implementation-ready spec | ORCH | ai-agent | Platform | SFP-236, SFP-36 |
 
 ## Wave 7
 
