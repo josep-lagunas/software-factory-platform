@@ -22,6 +22,7 @@ Waves computed via longest-path (Kahn): `wave(t)=0` if no deps, else `1+max(wave
 | SFP-240 | Sync branch base before push (stale-base conflicts) | WORKER | ai-agent | Platform | — |
 | SFP-241 | Verify/re-obtain PR review before merge | WORKER | ai-agent | Platform | — |
 | SFP-242 | Spawn/progress watchdog in ClaudeAgentRuntime | WORKER | ai-agent | Platform | — |
+| SFP-244 | Slack operational command interpreter (RUN/STATUS/APPROVE/STOP/HELP, deterministic v0) | COMM | ai-agent | Platform | — |
 
 ## Wave 1
 
