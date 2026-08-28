@@ -4129,6 +4129,24 @@ The project-level intake funnel (MAS→Blueprint→tickets) stays deferred (SFP-
 **Non-doc dep:** SFP-232 (structured gate output — Jira-only, never had a doc entry). SFP-36 is the
 AgentRuntime seam ticket (ID-019). **Soft:** SFP-149 placement (not a DAG edge).
 
+### SFP-244 [COMM] 🤖 — Slack operational command interpreter (RUN/STATUS/APPROVE/STOP/HELP, deterministic v0)
+**Labels:** COMM, ai-agent, platform, dogfood, slack | **Deps:** — | **Status:** To Do (created 2026-08-28)
+
+**Context:** the parse layer turning a Slack ops-channel message into a typed OperationalCommand
+(five fixed kinds; deterministic pattern matching, no NLP — unmatched input → None, never a guess).
+Pure parse-only module; execution wiring is a declared follow-up. Completes the Slack control-plane
+loop with SFP-132 (inbound) + SFP-156 (ask/notify emitters) + the landed outbound (PR #136/#137).
+
+### SFP-132 enrichment note (original doc entry above, doc-115)
+**Labels:** COMM, ai-agent, platform | **Deps:** SFP-107, SFP-112 (unchanged) | **Status:** To Do (enriched 2026-08-28)
+
+**Context:** the Jira body now carries the full implementation-ready spec: signed-events HTTP endpoint
+(v0 signature + 5-min replay guard, url_verification echo), ExternalEventReceived {source, external_id}
+on the in-memory bus with injected envelope identity, idempotent by external_id, dev runner on :8788 for
+tunnel dogfood (no AWS). HUMAN ACTION declared in its Dependencies: enable Event Subscriptions on the
+Slack app (~10 min; scopes from SFP-86 already cover it — the deferred-scope amendment is satisfied
+without new scopes). Downstream consumers: SFP-244 (interpreter), UserInteraction lifecycle (SFP-112 Done).
+
 **Dependency updates (existing tickets):** none — all eight are additive; none re-wires original DAG edges.
 
 > **Parser/format note (review finding, PR #142):** the hierarchy parser (`tools/create_jira_tickets.py`,

@@ -12,6 +12,7 @@
     "SFP-240",
     "SFP-241",
     "SFP-242",
+    "SFP-244",
     "SFP-5",
     "SFP-65",
     "SFP-67",
@@ -288,6 +289,15 @@
       "executor": "ai-agent",
       "phase": "Platform",
       "title": "Spawn/progress watchdog in ClaudeAgentRuntime"
+    },
+    {
+      "ticket": "SFP-244",
+      "wave": 0,
+      "deps": [],
+      "area": "COMM",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Slack operational command interpreter (RUN/STATUS/APPROVE/STOP/HELP, deterministic v0)"
     },
     {
       "ticket": "SFP-5",
