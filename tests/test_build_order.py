@@ -141,9 +141,11 @@ def test_tc002_integration_smoke_real_doc(tmp_path):
     assert rc == 0
     _, oracle = cjt.parse_hierarchy(str(REAL_DOC))
     data = json.loads(out_json.read_text())
-    # count == parse_hierarchy count == 171 (NOT the doc's stated 170)
-    assert len(data["tickets"]) == len(oracle) == 171
-    assert len(data["flat_order"]) == 171
+    # count == parse_hierarchy count, derived — the doc grew from 171 to 180
+    # when the post-hierarchy additions section (PRs #142/#144) landed; the
+    # oracle already parses every ### SFP-N entry, so assert against it.
+    assert len(data["tickets"]) == len(oracle)
+    assert len(data["flat_order"]) == len(oracle)
 
 
 # ============================================================
