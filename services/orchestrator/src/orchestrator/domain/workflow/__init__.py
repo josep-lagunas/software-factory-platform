@@ -5,9 +5,10 @@ explicit transition table + pure :func:`~.state_machine.transition` core and
 the :class:`~.state_machine.WorkflowDecision` record
 (:mod:`.state_machine`), the thin bus-emitting
 :class:`~.state_machine.WorkflowTransitionPublisher` wrapper, and the pure
-per-stage drivers (:mod:`.transitions`, SFP-138/SFP-139/SFP-140 — spec stage,
-the coding/review stages with the ID-068 rework loop, and the merge/deploy
-stages with the ID-024 merge-wait parking edge). On top of it,
+per-stage drivers (:mod:`.transitions`, SFP-138/SFP-139/SFP-140/SFP-141 —
+spec stage, the coding/review stages with the ID-068 rework loop, the
+merge/deploy stages with the ID-024 merge-wait parking edge, and the
+WAITING_FOR_USER continuation + terminal-failure edges). On top of it,
 the pure policy engine (:mod:`.policy_engine`, MAS §8.14) evaluates pluggable
 policies into typed :class:`~.policy_engine.PolicyOutcome` values — decide
 only; the state machine remains the executor/guard.
@@ -63,6 +64,13 @@ from orchestrator.domain.workflow.transitions import (
     REWORK_POLICY,
     REWORK_SOURCE,
     REWORK_TARGET,
+    TERMINAL_FAILURE_POLICY,
+    TERMINAL_FAILURE_TARGET,
+    USER_DECISION_ANSWER,
+    USER_DECISION_APPROVE,
+    USER_DECISION_POLICY,
+    USER_DECISION_REJECT,
+    USER_DECISION_SOURCE,
     approval_fact_granted,
     changes_requested_review_fact,
     coding_job_started_fact,
@@ -74,8 +82,11 @@ from orchestrator.domain.workflow.transitions import (
     drive_review_stage,
     drive_rework_loop,
     drive_spec_stage,
+    drive_terminal_failure,
+    drive_user_decision,
     pr_created_fact,
     spec_stage_fact_is_successful,
+    user_decision_recognized,
 )
 
 __all__ = [
@@ -100,6 +111,13 @@ __all__ = [
     "MERGE_WAIT_SOURCE",
     "MERGE_WAIT_TARGET",
     "NO_TRANSITION",
+    "TERMINAL_FAILURE_POLICY",
+    "TERMINAL_FAILURE_TARGET",
+    "USER_DECISION_APPROVE",
+    "USER_DECISION_ANSWER",
+    "USER_DECISION_POLICY",
+    "USER_DECISION_REJECT",
+    "USER_DECISION_SOURCE",
     "PLANNER_AGENT",
     "REVIEW_STAGE_POLICY",
     "REVIEW_STAGE_SOURCE",
@@ -130,9 +148,12 @@ __all__ = [
     "drive_rework_loop",
     "drive_review_stage",
     "drive_spec_stage",
+    "drive_terminal_failure",
+    "drive_user_decision",
     "evaluate",
     "evaluate_policy_set",
     "pr_created_fact",
     "spec_stage_fact_is_successful",
     "transition",
+    "user_decision_recognized",
 ]

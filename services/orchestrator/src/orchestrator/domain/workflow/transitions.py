@@ -28,8 +28,17 @@ validates against :data:`TRANSITIONS` and returns the immutable
 - ``MERGING → WAITING_FOR_USER`` (SFP-140, the ID-024 parking edge) — fired by
   an *approval-required* fact (the ticket's validation profile requires human
   approval before the merge executes). The wait is parked here; it is **never**
-  resolved by this module — resuming is the user-decision edge's concern
-  (ID-069 / §8.9), out of scope.
+  resolved by this module — resuming is the user-decision driver below.
+- ``WAITING_FOR_USER → {FAILED | READY_FOR_MERGE | <resumed stage>}``
+  (SFP-141, the resolve edge of the SFP-140 park) — fired by a *user decision*
+  fact (a confirmed ``UserDecision``-style observation, ID-069). ``REJECT``
+  ends the workflow failed; ``APPROVE`` releases the parked merge
+  (ID-024); ``ANSWER`` resumes the stage the decision names.
+- ``<active or waiting> → FAILED`` (SFP-141, the terminal-failure edge) —
+  fired by a *should-fail* fact (the landed SFP-144 ``ShouldFailPolicy``
+  verdict). The driver **consumes** the boolean only; it never re-derives
+  failure genuineness — the taxonomy is the policy's, consumed not duplicated
+  (ID-068).
 
 On a failed, absent, or non-matching fact there is **no** transition, and the
 non-move is recorded as a business fact (§8.8) rather than swallowed —
@@ -65,6 +74,11 @@ Grounded in:
 - ID-072 — the merge *decision* is the Orchestrator's and its *execution* is
   the Workspace Worker's; the merge-stage driver only moves the workflow to
   ``MERGING`` on the approval fact.
+- ID-069 — a user decision is only ever a confirmed, structured ``UserDecision``
+  fact (the v0 vocabulary: ``REJECT``, ``APPROVE``, ``ANSWER``); the
+  user-decision driver consumes that fact and never observes raw chat.
+- §8.9 — users influence the workflow only through decisions; the
+  user-decision driver is the single place a WAITING_FOR_USER wait resolves.
 - ID-013 — enums serialize as plain strings in any serialized field (the
   ``WorkflowDecision`` ``*_name`` companions).
 - SFP-142 — the policy engine that will own real policy selection is landed as
@@ -81,8 +95,8 @@ outside this module.
 
 from __future__ import annotations
 
-from orchestrator.domain.workflow.state_machine import WorkflowDecision, transition
-from orchestrator.domain.workflow.states import WorkflowState
+from orchestrator.domain.workflow.state_machine import TRANSITIONS, WorkflowDecision, transition
+from orchestrator.domain.workflow.states import STATES, TERMINAL_STATES, WorkflowState
 
 #: The single stage edge each driver owns (§8.4 order). Taken from the SFP-137
 #: table's semantics; the legality check itself lives in ``TRANSITIONS`` and is
@@ -115,6 +129,15 @@ DEPLOY_STAGE_FINISH_TARGET = WorkflowState.COMPLETED
 #: edge's concern (ID-069 / §8.9), out of scope for this module.
 MERGE_WAIT_SOURCE = WorkflowState.MERGING
 MERGE_WAIT_TARGET = WorkflowState.WAITING_FOR_USER
+#: The SFP-141 user-decision resolve edge source: the parked wait itself. The
+#: targets it may resolve to are exactly the WAITING_FOR_USER row of the
+#: SFP-137 table (derived below — never re-listed by hand, so the driver and
+#: the table can never drift).
+USER_DECISION_SOURCE = WorkflowState.WAITING_FOR_USER
+#: The SFP-141 terminal-failure edge target. Legality itself lives in the
+#: SFP-137 table (reachable from ``ACTIVE_STATES`` and from
+#: ``WAITING_FOR_USER``); the driver never re-implements that set.
+TERMINAL_FAILURE_TARGET = WorkflowState.FAILED
 
 #: The trivial fixed policies these drivers apply (SFP-142 owns real policy
 #: selection; a fixed rule is acceptable now per the PRSpec notes).
@@ -126,6 +149,8 @@ REWORK_POLICY = "review-stage-changes-requested-rework"
 MERGE_STAGE_POLICY = "merge-stage-approval-granted"
 DEPLOY_STAGE_POLICY = "deploy-stage-merge-completed-deploy-target"
 MERGE_WAIT_POLICY = "merge-stage-approval-required-parking"
+USER_DECISION_POLICY = "user-decision-observed"
+TERMINAL_FAILURE_POLICY = "terminal-failure-policy-verdict"
 
 #: The agents whose outputs these stages consume. The canonical agent
 #: identifiers (workspace-worker agents) — kept as data so the fact-type match
@@ -151,6 +176,20 @@ CHANGES_REQUESTED_STATUS = "CHANGES_REQUESTED"
 #: no-move naming it, never an exception and never a guessed outcome.
 DEPLOYMENT_SUCCEEDED_STATUS = "succeeded"
 DEPLOYMENT_FAILED_STATUS = "failed"
+
+#: The user-decision vocabulary this driver recognizes, pinned to the v0
+#: ``UserDecision`` members (ID-069). Only these three resolve a wait:
+#: ``REJECT`` ends the workflow failed, ``APPROVE`` releases the parked merge
+#: (ID-024), and ``ANSWER`` resumes the stage the decision names. The rest of
+#: the v0 vocabulary (REQUEST_CHANGES, PROVIDE_CONTEXT, ANSWER_QUESTION,
+#: CLARIFICATION) is not a wait-resolving decision for this edge — any other
+#: value (including those) is a recorded no-move, never an exception.
+USER_DECISION_REJECT = "REJECT"
+USER_DECISION_APPROVE = "APPROVE"
+USER_DECISION_ANSWER = "ANSWER"
+_RECOGNIZED_USER_DECISIONS = frozenset(
+    {USER_DECISION_REJECT, USER_DECISION_APPROVE, USER_DECISION_ANSWER},
+)
 
 #: Reasons recorded on the moves (§8.5 ``reason``).
 _SPEC_MOVE_REASON = "successful plan observed: planner produced validated PR-specs"
@@ -190,6 +229,27 @@ _MERGE_NOT_COMPLETED_REASON = "merge not completed"
 _NO_DEPLOY_TARGET_REASON = "no deploy target: nothing to deploy"
 _MERGE_WAIT_NOT_REQUIRED_REASON = "approval not required"
 _NO_APPROVAL_REQUIRED_FACT_REASON = "no approval-required fact"
+
+#: Reasons recorded on the SFP-141 user-decision moves (§8.5 ``reason``).
+_REJECT_MOVE_REASON = "user REJECT: workflow ends failed"
+_APPROVE_MOVE_REASON = "user APPROVE: merge may proceed"
+_ANSWER_MOVE_REASON_TEMPLATE = "user answer received: resume {target}"
+
+#: Reasons recorded on the SFP-141 user-decision non-moves (§8.8).
+_NO_USER_DECISION_REASON = "no user decision observed"
+_UNRECOGNIZED_USER_DECISION_REASON = "user decision unrecognized"
+_NOT_WAITING_FOR_USER_REASON = "not WAITING_FOR_USER: no wait to resolve"
+_ANSWER_WITHOUT_TARGET_REASON = "answer without a recognized target stage"
+
+#: Reasons recorded on the SFP-141 terminal-failure move / non-moves.
+_TERMINAL_FAILURE_MOVE_REASON_TEMPLATE = (
+    "genuine failure ({category}/{cause}): workflow ends failed"
+)
+_NO_FAILURE_FACT_REASON = "no failure fact observed"
+_SHOULD_NOT_FAIL_REASON = (
+    "failure policy says no failed move: rework/retry/wait semantics belong to the policy"
+)
+_ALREADY_TERMINAL_REASON = "already terminal"
 
 
 def spec_stage_fact_is_successful(
@@ -1044,6 +1104,365 @@ def drive_merge_wait(
     )
 
 
+# --- User-decision continuation: WAITING_FOR_USER → {FAILED | READY_FOR_MERGE |
+# --- <resumed stage>} (SFP-141, the resolve edge of the SFP-140 park) ------------
+
+
+def _user_decision_fact_id(decision_fact: tuple[str | None, str | None]) -> str:
+    """Build the deterministic user-decision-fact identifier for §8.5 records."""
+    decision_part = decision_fact[0] if decision_fact[0] is not None else "no-decision"
+    # An empty target is the same observation as an absent one (the decision
+    # named no stage), so it renders identically — never a dangling segment.
+    target_part = decision_fact[1] if decision_fact[1] else "no-target"
+    return f"user-decision-fact:{decision_part}:{target_part}"
+
+
+def user_decision_recognized(*, decision: str | None) -> bool:
+    """Return whether one observed decision is a *wait-resolving* user decision.
+
+    The fact shape is the landed confirmed ``UserDecision`` observation (MAS
+    §12.9 / ID-069: taken from what is landed, not invented): only a
+    structured, CONFIRM-gated decision reaches this driver — raw chat never
+    does. Of the v0 vocabulary, exactly ``REJECT`` / ``APPROVE`` / ``ANSWER``
+    resolve a wait; the remaining members (``REQUEST_CHANGES``,
+    ``PROVIDE_CONTEXT``, ``ANSWER_QUESTION``, ``CLARIFICATION``) and any
+    unrecognized or absent value do not, and are recorded as a no-move naming
+    what was seen (never an exception, never a guess). Kept as a plain, total
+    predicate: pure, deterministic (AP-011).
+    """
+    return decision in _RECOGNIZED_USER_DECISIONS
+
+
+#: The stages a parked wait may resume to — read from the landed SFP-137
+#: table's ``WAITING_FOR_USER`` row, never re-listed by hand. Exposed for
+#: tests and diagnostics to assert against the table directly; the driver
+#: itself does not consult it for control flow — every named stage is handed
+#: to the engine, whose table guard is the sole legality authority (§8.2).
+_WAIT_RESUME_TARGETS: frozenset[WorkflowState] = TRANSITIONS[WorkflowState.WAITING_FOR_USER]
+
+
+def drive_user_decision(
+    current_state: WorkflowState,
+    *,
+    decision_fact: tuple[str | None, str | None] | None = None,
+) -> tuple[WorkflowState, WorkflowDecision]:
+    """Resolve (or deliberately hold) a parked user wait (SFP-141).
+
+    The pure user-decision driver: a function of ``(current_state,
+    decision_fact)`` only — no I/O, no clock, no randomness, no bus (AP-011).
+    Identical inputs always yield an identical resulting state and an equal
+    ``WorkflowDecision``.
+
+    This is the resolve counterpart of :func:`drive_merge_wait`'s park edge: a
+    workflow parked in ``WAITING_FOR_USER`` leaves it **only** on the user's
+    confirmed decision (§8.9 / ID-069). The decision table, verbatim:
+
+    ======  =====================  =============================  ==========================
+    Row     State                  Facts                         Outcome
+    ======  =====================  =============================  ==========================
+    1       any                    fact ``None``                 no-move (§8.8)
+    2       any                    decision ``None``/other       no-move — unrecognized
+    3       not ``WAITING_FOR_     any recognized decision       no-move — no wait to
+            USER``                                               resolve
+    4       ``WAITING_FOR_USER``   decision ``REJECT``           → ``FAILED`` (ID-069)
+    5       ``WAITING_FOR_USER``   decision ``APPROVE``          → ``READY_FOR_MERGE``
+                                                               (ID-024 merge release)
+    6       ``WAITING_FOR_USER``   decision ``ANSWER`` + a       → resume ``<target>``
+                                  recognized ``target``
+    6b      ``WAITING_FOR_USER``   ``ANSWER`` naming no stage     no-move — no recognized
+                                  (``None``/blank/not a stage)   target stage
+    ======  =====================  =============================  ==========================
+
+    Row 6's legal resume targets are the SFP-137 table's
+    ``WAITING_FOR_USER`` row (:data:`_WAIT_RESUME_TARGETS`, derived — the
+    driver never re-lists them); legality stays the engine's, not this
+    driver's. An ANSWER that names no stage of the workflow
+    at all is row 6b's recorded no-move. An ANSWER that names a stage flows
+    through the engine whatever the stage is: a target in the resume row
+    moves, and any other named target lets the table guard's
+    :class:`IllegalTransitionError` propagate (§8.2) — never caught, never
+    softened into a no-move.
+
+    Args:
+        current_state: The workflow's current state.
+        decision_fact: The observed user-decision business fact as
+            ``(decision, target)`` — the confirmed ``UserDecision`` value and,
+            for an ``ANSWER``, the stage the answer resumes — or ``None`` when
+            no user decision has been observed at all. ``None`` members inside
+            the tuple mean the corresponding field was absent from the
+            observation.
+
+    Returns:
+        The resulting workflow state and the immutable :class:`WorkflowDecision`
+        recording what was decided and why. Rows 4–6 request their move through
+        the SFP-137 engine (the engine is the sole legality authority); every
+        other row returns the §8.8 record of the *non-move* (same state on
+        both endpoints, ``reason`` naming the exact cause). The non-move is
+        returned, never swallowed.
+
+    Raises:
+        IllegalTransitionError: if the decided move is not in the SFP-137
+            transition table — e.g. an ``ANSWER`` naming a stage that is not
+            in the ``WAITING_FOR_USER`` row of :data:`TRANSITIONS`. Propagated
+            from the table guard; the driver never catches or softens it and
+            never performs an implicit fallback transition (MAS §8.2).
+    """
+    if decision_fact is None:
+        # Row 1 (§8.8): no observation yet → record the non-move, hold the state.
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_NO_USER_DECISION_REASON,
+            applied_policy=USER_DECISION_POLICY,
+            business_facts_considered=("user-decision-fact:absent",),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    if not user_decision_recognized(decision=decision_fact[0]):
+        # Row 2 (§8.8): a decision was observed but it is not one of the three
+        # wait-resolving values — absent, unrecognized, or a v0 member that
+        # does not resolve this edge. Name what was seen; never raise.
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_UNRECOGNIZED_USER_DECISION_REASON,
+            applied_policy=USER_DECISION_POLICY,
+            business_facts_considered=(_user_decision_fact_id(decision_fact),),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    if current_state is not USER_DECISION_SOURCE:
+        # Row 3 (§8.8): there is no parked wait to resolve — a user decision
+        # lands only while WAITING_FOR_USER. Recorded, never an error.
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_NOT_WAITING_FOR_USER_REASON,
+            applied_policy=USER_DECISION_POLICY,
+            business_facts_considered=(_user_decision_fact_id(decision_fact),),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    decision, target_name = decision_fact
+
+    if decision == USER_DECISION_REJECT:
+        # Row 4 (ID-069): the user rejected — the workflow ends failed.
+        return transition(
+            current_state,
+            TERMINAL_FAILURE_TARGET,
+            reason=_REJECT_MOVE_REASON,
+            applied_policy=USER_DECISION_POLICY,
+            business_facts_considered=(_user_decision_fact_id(decision_fact),),
+            aggregate_changes=("tickets.workflow_status",),
+        )
+
+    if decision == USER_DECISION_APPROVE:
+        # Row 5 (ID-024): the user approved — the parked merge may proceed.
+        return transition(
+            current_state,
+            MERGE_STAGE_SOURCE,
+            reason=_APPROVE_MOVE_REASON,
+            applied_policy=USER_DECISION_POLICY,
+            business_facts_considered=(_user_decision_fact_id(decision_fact),),
+            aggregate_changes=("tickets.workflow_status",),
+        )
+
+    # Row 6 / 6b (ANSWER): resume the stage the answer names. The recognized
+    # target set is read from the table's WAITING_FOR_USER row. An ANSWER that
+    # names no stage at all (absent / blank / not a workflow stage) is the
+    # recorded no-move of row 6b — the observation is incomplete, so there is
+    # nothing to resume and nothing to ask the engine about. An ANSWER that
+    # *does* name a stage is handed to the engine as given: if that stage is
+    # not in the table's resume row the IllegalTransitionError propagates
+    # (§8.2) — the driver never filters a named stage into a soft no-move and
+    # never substitutes a fallback target.
+    resume_target = _answer_resume_target(target_name)
+    if resume_target is None:
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_ANSWER_WITHOUT_TARGET_REASON,
+            applied_policy=USER_DECISION_POLICY,
+            business_facts_considered=(_user_decision_fact_id(decision_fact),),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    return transition(
+        current_state,
+        resume_target,
+        reason=_ANSWER_MOVE_REASON_TEMPLATE.format(target=resume_target.name),
+        applied_policy=USER_DECISION_POLICY,
+        business_facts_considered=(_user_decision_fact_id(decision_fact),),
+        aggregate_changes=("tickets.workflow_status",),
+    )
+
+
+def _answer_resume_target(target_name: str | None) -> WorkflowState | None:
+    """Lift an ANSWER's resume target to a stage — never a legality verdict.
+
+    Returns the landed :class:`WorkflowState` named by ``target_name``, or
+    ``None`` when the answer names no stage of this workflow at all (absent,
+    blank, or a string that is not one of the ten §8.4 stage names). Legality
+    is deliberately **not** decided here: a target that names a real stage
+    flows to the SFP-137 engine whatever the stage is, and if that stage is
+    not in the table's ``WAITING_FOR_USER`` resume row the engine's guard
+    raises :class:`IllegalTransitionError` (§8.2) — never caught, never
+    softened into a no-move, never substituted with a fallback target.
+    Read-only against the landed state set; the resume row itself is derived
+    from :data:`TRANSITIONS`, never copied, so the driver cannot drift.
+
+    The lookup compares names against :data:`STATES` rather than subscripting
+    the enum: the stage names are data (the §8.4 pinned list), and a plain
+    name comparison keeps the predicate total — no exception path for a string
+    that names no stage — and stays independent of the enum's value scheme.
+    """
+    if not target_name:
+        return None
+    for state in STATES:
+        if state.name == target_name:
+            return state
+    return None
+
+
+# --- Terminal failure: <active or waiting> → FAILED (SFP-141) -------------------
+
+
+def _failure_fact_id(
+    failure_fact: tuple[bool | None, str | None, str | None],
+) -> str:
+    """Build the deterministic failure-fact identifier for §8.5 records."""
+    should_fail = failure_fact[0]
+    should_fail_part = (
+        str(should_fail).lower() if should_fail is not None else "unknown-should-fail"
+    )
+    category_part = failure_fact[1] if failure_fact[1] else "no-category"
+    cause_part = failure_fact[2] if failure_fact[2] else "no-cause"
+    return f"failure-fact:{should_fail_part}:{category_part}:{cause_part}"
+
+
+def drive_terminal_failure(
+    current_state: WorkflowState,
+    *,
+    failure_fact: tuple[bool | None, str | None, str | None] | None = None,
+) -> tuple[WorkflowState, WorkflowDecision]:
+    """Consume the should-fail verdict into the ``FAILED`` edge (SFP-141).
+
+    The pure terminal-failure driver: a function of ``(current_state,
+    failure_fact)`` only — no I/O, no clock, no randomness, no bus (AP-011).
+    Identical inputs always yield an identical resulting state and an equal
+    ``WorkflowDecision``.
+
+    The fact is the landed SFP-144 ``ShouldFailPolicy`` output shape
+    (``(should_fail, category, cause)``). The driver consumes the boolean
+    **only**: it never re-derives failure genuineness and never inspects
+    ``category`` / ``cause`` for control flow — the ID-068 taxonomy is the
+    policy's, consumed here, not duplicated (MAS §12.9). ``category`` and
+    ``cause`` ride along into the reason and the deterministic fact id.
+
+    The decision table, verbatim:
+
+    ======  ==============================  ====================  ==================
+    Row     State                          Facts                Outcome
+    ======  ==============================  ====================  ==================
+    1       any                            fact ``None``        no-move (§8.8)
+    2       any                            ``should_fail`` not  no-move — the policy
+                                           ``True`` (incl. the  owns rework/retry/wait
+                                           DEVELOPMENT_FAILURE
+                                           and BLOCKED verdicts)
+    3       terminal (``COMPLETED`` /      ``should_fail``      no-move — already
+            ``FAILED``)                    ``is True``          terminal
+    4       ``ACTIVE_STATES`` ∪            ``should_fail``      → ``FAILED``
+            ``WAITING_FOR_USER``           ``is True``
+    ======  ==============================  ====================  ==================
+
+    Args:
+        current_state: The workflow's current state.
+        failure_fact: The observed should-fail business fact as
+            ``(should_fail, category, cause)`` — mirroring the SFP-144
+            ``ShouldFailPolicy`` output — or ``None`` when no failure fact has
+            been observed at all. ``None`` members inside the tuple mean the
+            corresponding field was absent from the observation.
+
+    Returns:
+        The resulting workflow state and the immutable :class:`WorkflowDecision`
+        recording what was decided and why. Row 4 requests the move through
+        the SFP-137 engine with the deterministic fact id in
+        ``business_facts_considered``; every other row returns the §8.8 record
+        of the *non-move* (same state on both endpoints, ``reason`` naming the
+        exact cause). The non-move is returned, never swallowed.
+
+    Raises:
+        IllegalTransitionError: if the row-4 move is not in the SFP-137
+            transition table (a terminal state is caught earlier by row 3; the
+            guard remains the sole authority). Propagated from the table
+            guard; the driver never catches or softens it (MAS §8.2).
+    """
+    if failure_fact is None:
+        # Row 1 (§8.8): no observation yet → record the non-move, hold the state.
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_NO_FAILURE_FACT_REASON,
+            applied_policy=TERMINAL_FAILURE_POLICY,
+            business_facts_considered=("failure-fact:absent",),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    fact_id = _failure_fact_id(failure_fact)
+
+    if failure_fact[0] is not True:
+        # Row 2 (§8.8): the policy said no. Its DEVELOPMENT_FAILURE (ID-068
+        # rework loop) and BLOCKED verdicts (retry / wait) land here too — the
+        # rework/retry/wait semantics belong to the policy, never to this
+        # driver. The boolean is consumed as given; category/cause are not
+        # consulted for control flow.
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_SHOULD_NOT_FAIL_REASON,
+            applied_policy=TERMINAL_FAILURE_POLICY,
+            business_facts_considered=(fact_id,),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    if current_state in TERMINAL_STATES:
+        # Row 3 (§8.8): a terminal workflow never moves — neither COMPLETED
+        # nor FAILED is a source of a further move, and the workflow restarts
+        # as a *new* workflow instead. Recorded, never an error.
+        return current_state, WorkflowDecision(
+            previous_state=current_state,
+            resulting_state=current_state,
+            reason=_ALREADY_TERMINAL_REASON,
+            applied_policy=TERMINAL_FAILURE_POLICY,
+            business_facts_considered=(fact_id,),
+            previous_state_name=current_state.name,
+            resulting_state_name=current_state.name,
+        )
+
+    # Row 4: the policy said fail — consume the verdict into the FAILED edge
+    # through the SFP-137 engine. The engine is the sole legality authority:
+    # if the edge is not in TRANSITIONS the IllegalTransitionError propagates
+    # (no implicit move, ever). The reason formats the policy's category/cause
+    # verbatim; the fact id rides along in business_facts_considered.
+    return transition(
+        current_state,
+        TERMINAL_FAILURE_TARGET,
+        reason=_TERMINAL_FAILURE_MOVE_REASON_TEMPLATE.format(
+            category=failure_fact[1] if failure_fact[1] else "no-category",
+            cause=failure_fact[2] if failure_fact[2] else "no-cause",
+        ),
+        applied_policy=TERMINAL_FAILURE_POLICY,
+        business_facts_considered=(fact_id,),
+        aggregate_changes=("tickets.workflow_status",),
+    )
+
+
 __all__ = [
     "CHANGES_REQUESTED_STATUS",
     "CODER_AGENT",
@@ -1065,6 +1484,13 @@ __all__ = [
     "MERGE_WAIT_SOURCE",
     "MERGE_WAIT_TARGET",
     "PLANNER_AGENT",
+    "TERMINAL_FAILURE_POLICY",
+    "TERMINAL_FAILURE_TARGET",
+    "USER_DECISION_APPROVE",
+    "USER_DECISION_ANSWER",
+    "USER_DECISION_POLICY",
+    "USER_DECISION_REJECT",
+    "USER_DECISION_SOURCE",
     "REVIEW_STAGE_POLICY",
     "REVIEW_STAGE_SOURCE",
     "REVIEW_STAGE_TARGET",
@@ -1082,6 +1508,9 @@ __all__ = [
     "drive_review_stage",
     "drive_rework_loop",
     "drive_spec_stage",
+    "drive_terminal_failure",
+    "drive_user_decision",
     "pr_created_fact",
     "spec_stage_fact_is_successful",
+    "user_decision_recognized",
 ]
