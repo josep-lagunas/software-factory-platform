@@ -4075,6 +4075,72 @@ GitHub account creation requires a human; it cannot be executed by an agent.
 
 ---
 
+# Post-Hierarchy Additions (dogfood lessons, added 2026-08)
+
+Tickets SFP-236..243 were created in Jira **after** the initial 171-ticket backlog, from measured
+dogfooding evidence (the SFP-79 first real-ticket cycle and the SFP-137 ORCH cascade). They are
+NOT part of the original DAG below; they are hardening and loop-closing work on the Phase A
+pipeline itself. Source of truth for their full bodies: Jira. Dependencies on original tickets
+are noted inline.
+
+### SFP-236 [AGENT] 🤖 — Pipeline: surface readiness-gate detail on non-READY abort
+**Labels:** AGENT, ai-agent, fix, manual-core, observability, pipeline | **Deps:** — | **Status:** Done (PR #125) | **References:** SFP-51, SFP-232
+
+**Context:** aborts surfaced only "not READY"; the structured blocking_ambiguities/missing_inputs/rubric_failed were swallowed.
+**Non-doc dep:** ticket_pipeline (slice) — predates the doc DAG; SFP-232 was Jira-only and never had a doc entry (see section note).
+
+### SFP-237 [AGENT] 🤖 — Align ticket_pipeline model tiers with the orchestrator harness
+**Labels:** AGENT, ai-agent, config, dogfood, manual-core, pipeline | **Deps:** — | **Status:** Done
+
+**Context:** reviewer→glm-5.2, coder→glm-5.1 tier alignment (SFP-79 lesson: bare BLOCKED from a weak reviewer tier).
+
+### SFP-238 [AGENT] 🤖 — Force reviewer rationale (all verdicts) + structured PR body
+**Labels:** AGENT, ai-agent, config, contracts, dogfood, manual-core, pipeline | **Deps:** — | **Status:** Done
+
+**Context:** ID-066 amendment — rationale required on APPROVED too; PR body structured.
+
+### SFP-239 [WORKER] 🤖 — Validate cached clone/worktree before reuse
+**Labels:** WORKER, ai-agent, dogfood, fix, manual-core, pipeline | **Deps:** — | **Status:** Done (PR #132)
+
+**Context:** hollow /tmp cache recovery instead of hard failure.
+
+### SFP-240 [WORKER] 🤖 — Sync branch base before push (stale-base conflicts)
+**Labels:** WORKER, ai-agent, dogfood, fix, manual-core, pipeline | **Deps:** — | **Status:** Done (PR #134)
+
+**Context:** pre-push merge of origin/main into the ticket branch; fail-closed naming conflicted files.
+
+### SFP-241 [WORKER] 🤖 — Verify/re-obtain PR review before merge
+**Labels:** WORKER, ai-agent, dogfood, fix, manual-core, pipeline | **Deps:** — | **Status:** Done (PR #135)
+
+**Context:** dismissed/stale review self-heal; never merge non-APPROVED.
+
+### SFP-242 [WORKER] 🤖 — Spawn/progress watchdog in ClaudeAgentRuntime
+**Labels:** WORKER, ai-agent, dogfood, fix, manual-core, pipeline, reliability | **Deps:** — | **Status:** Done (PR #139)
+
+**Context:** first-event 5min + progress 15min budgets, env-tunable; kill→transient-error (4 measured silent hangs).
+
+### SFP-243 [ORCH] 🤖 — Ticket enrichment agent: gate ambiguities → implementation-ready spec
+**Labels:** ORCH, ai-agent, dogfood, platform, reliability | **Deps:** SFP-236, SFP-36 *(B→A)* | **Status:** To Do (candidate, queued by owner)
+
+**Context:** closes the readiness-gate loop natively — the agent that does what the human-orchestrator
+did by hand (SFP-144/140 enrichment cycles, measured 2026-08-27/28; 13-ticket ORCH batch used
+per-type templates). Parses-with-8-sections dry-run + 2-iteration loop bound → MANUAL_REQUIRED.
+The project-level intake funnel (MAS→Blueprint→tickets) stays deferred (SFP-85 line).
+**Non-doc dep:** SFP-232 (structured gate output — Jira-only, never had a doc entry). SFP-36 is the
+AgentRuntime seam ticket (ID-019). **Soft:** SFP-149 placement (not a DAG edge).
+
+**Dependency updates (existing tickets):** none — all eight are additive; none re-wires original DAG edges.
+
+> **Parser/format note (review finding, PR #142):** the hierarchy parser (`tools/create_jira_tickets.py`,
+> `LABELS_RE`) reads Labels **and** Deps only from the single pipe-separated metadata line under the
+> heading. Entries in this section therefore use that canonical one-line shape; dependencies that are
+> NOT doc tickets (SFP-232 — never had a doc entry; the ticket_pipeline slice) stay in prose, because
+> `build_order.py` fails closed on any dep that is not a doc entry. Labels are copied verbatim from Jira
+> (source of truth), which carries the area label (`AGENT`/`WORKER`/`ORCH`) instead of the original
+> bracket-mapped forms (`agent-layer`/`workspace-worker`).
+
+---
+
 # Dependency invariant check
 
 Rule: no `manual-core` ticket (SFP-1..SFP-63) may depend on a `platform` ticket (SFP-64..SFP-170). `platform` → `manual-core` edges are allowed and marked *(B→A)*. This guarantees the Manual Core is a self-contained, manually runnable subgraph (the bootstrap target).
