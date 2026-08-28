@@ -15,6 +15,14 @@ Waves computed via longest-path (Kahn): `wave(t)=0` if no deps, else `1+max(wave
 | SFP-3 | Create SFP Jira project + API token | PREREQ | manual | Manual Core | — |
 | SFP-4 | Configure local development environment | PREREQ | manual | Manual Core | — |
 | SFP-64 | AWS account + billing (eu-west-1) | PREREQ | manual | Platform | — |
+| SFP-236 | Pipeline: surface readiness-gate detail on non-READY abort | AGENT | ai-agent | Platform | — |
+| SFP-237 | Align ticket_pipeline model tiers with the orchestrator harness | AGENT | ai-agent | Platform | — |
+| SFP-238 | Force reviewer rationale (all verdicts) + structured PR body | AGENT | ai-agent | Platform | — |
+| SFP-239 | Validate cached clone/worktree before reuse | WORKER | ai-agent | Platform | — |
+| SFP-240 | Sync branch base before push (stale-base conflicts) | WORKER | ai-agent | Platform | — |
+| SFP-241 | Verify/re-obtain PR review before merge | WORKER | ai-agent | Platform | — |
+| SFP-242 | Spawn/progress watchdog in ClaudeAgentRuntime | WORKER | ai-agent | Platform | — |
+| SFP-243 | Ticket enrichment agent: gate ambiguities → implementation-ready spec | ORCH | ai-agent | Platform | — |
 
 ## Wave 1
 
