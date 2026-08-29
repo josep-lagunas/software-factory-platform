@@ -18,17 +18,20 @@ and asserted to cover all 8 :class:`~sfp_contracts.commands.CommandType`
 members at import time, so a future 9th command fails loudly here rather than
 being silently misrouted to "unknown".
 
-Out of scope (SFP-146): binding capacity to an AWS Batch ``max-vCpus`` ceiling;
-out of scope (SFP-152..157): wiring admission checks into the emitters.
+Out of scope here: binding capacity to an AWS Batch ``max-vCpus`` ceiling (the
+:class:`ExecutionDispatcher` implementations under
+``orchestrator/infrastructure/dispatch/`` own that, SFP-146); out of scope
+(SFP-152..157): wiring admission checks into the emitters.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
-from sfp_contracts.commands import CommandType
+from sfp_contracts.commands import CommandEnvelope, CommandType
 
 #: Execution-bound commands: consume a capacity slot for their duration.
 #: They are the commands the ID-061 manual N=1 discipline serialized.
@@ -225,3 +228,78 @@ class AdmissionScheduler:
             admitted=False,
             reason="execution: completed, queue empty",
         )
+
+    async def dispatch_admitted(
+        self,
+        dispatcher: ExecutionDispatcher,
+        envelope: CommandEnvelope,
+    ) -> DispatchReceipt:
+        """Gate one envelope through admission, then dispatch if admitted.
+
+        The execution dispatch seam (SFP-146): submission is keyed by
+        ``envelope.command_type``; a not-admitted submission returns the queued
+        receipt **without awaiting** ``dispatcher.dispatch`` — the dispatcher is
+        never invoked on the queued path (the spy-asserted guarantee). An
+        admitted submission awaits ``dispatcher.dispatch(envelope)`` exactly
+        once and returns its :class:`DispatchReceipt` unmodified.
+
+        Pure with respect to workflow state (ID-061 / MAS §11.8): this method
+        records admission bookkeeping and (at most) awaits the dispatcher; it
+        never touches workflow state — the scheduler is not a transition
+        source. The dispatcher owns vendor interaction; whether a dispatched
+        command later advances workflow state is the consumer/observation
+        side's concern (out of scope here).
+        """
+        decision = self.submit(envelope.command_type.value)
+        if not decision.admitted:
+            return DispatchReceipt(
+                accepted=False,
+                external_id=None,
+                reason="not admitted: queued",
+            )
+        return await dispatcher.dispatch(envelope)
+
+
+class DispatchReceipt(BaseModel):
+    """The outcome of one execution dispatch attempt (SFP-146).
+
+    An orchestrator-local twin of communication's
+    :class:`~communication.interfaces.outbound.DeliveryReceipt` (SFP-133
+    pattern reference only — deliberately NOT imported: cross-service imports
+    are identifier-only analogs, not code dependencies, per the intra-service
+    FK policy). Exactly the three fields below; unknown fields are rejected.
+    Frozen like :class:`AdmissionDecision`: a receipt is history, never
+    mutated after the fact (MAS §8.12).
+
+    Attributes:
+        accepted: Whether the dispatcher accepted the command for execution
+            (or admission accepted it, on the dispatched path).
+        external_id: The execution-provider-assigned identifier (Local:
+            sequence id; future AWS Batch: the job id). ``None`` when nothing
+            was dispatched (the queued path) or the provider assigned none.
+        reason: A human-readable reason string — contract, asserted verbatim
+            in tests (``"not admitted: queued"`` on the queued path; otherwise
+            the dispatcher's own reason, empty for a plain local accept).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    accepted: bool
+    external_id: str | None = None
+    reason: str = ""
+
+
+@runtime_checkable
+class ExecutionDispatcher(Protocol):
+    """The vendor-neutral execution dispatch seam (SFP-146).
+
+    Mirrors the in-memory bus Protocol precedent (SFP-42): concrete
+    dispatchers (Local now, AWS Batch later) satisfy this structurally — no
+    inheritance, no SDK import above the seam.
+    :meth:`AdmissionScheduler.dispatch_admitted` is the only caller; the
+    dispatcher is invoked **only** for admitted execution-bound submissions.
+    """
+
+    async def dispatch(self, command: CommandEnvelope) -> DispatchReceipt:
+        """Dispatch one admitted command; return its :class:`DispatchReceipt`."""
+        ...
