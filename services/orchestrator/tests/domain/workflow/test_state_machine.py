@@ -157,7 +157,9 @@ def test_transition_rejects_a_current_state_outside_the_table() -> None:
     # unreachable in practice — but a move from an unknown current state must
     # still raise rather than fall through (no implicit moves, ever).
     class _NonState(WorkflowState.__base__):  # type: ignore[misc]
-        NOT_A_STATE = 999
+        # StrEnum (SFP-147 domain ownership) requires str values — the rogue
+        # member only needs to be *outside* the §8.4 set, not an int.
+        NOT_A_STATE = "NOT_A_STATE"
 
     rogue = _NonState.NOT_A_STATE  # type: ignore[attr-defined]
     with pytest.raises(IllegalTransitionError):

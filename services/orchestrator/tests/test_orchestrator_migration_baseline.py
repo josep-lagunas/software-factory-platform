@@ -168,13 +168,27 @@ def test_base_is_a_declarative_base() -> None:
 
 
 def test_persistence_package_exports_base_and_ticket_models() -> None:
-    """The package exports Base plus the landed Ticket model + WorkflowStatus."""
+    """The package exports Base plus the landed Ticket model + WorkflowStatus.
+
+    Extended by SFP-147 with the aggregate-repository adapter surface
+    (``SqlAlchemyAggregateRepository``, ``AggregateVersionRow``,
+    ``SessionFactory``, ``session_scope``) — the persistence package is where
+    the PRSpec places the repository adapter, so its export list grows here.
+    """
     import orchestrator.infrastructure.persistence as pkg
 
     assert hasattr(pkg, "Base")
     assert hasattr(pkg, "Ticket")
     assert hasattr(pkg, "WorkflowStatus")
-    assert pkg.__all__ == ["Base", "Ticket", "WorkflowStatus"]
+    assert pkg.__all__ == [
+        "AggregateVersionRow",
+        "Base",
+        "SessionFactory",
+        "SqlAlchemyAggregateRepository",
+        "Ticket",
+        "WorkflowStatus",
+        "session_scope",
+    ]
 
 
 # --- alembic.ini ------------------------------------------------------------

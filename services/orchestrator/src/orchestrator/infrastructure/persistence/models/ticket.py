@@ -1,8 +1,10 @@
-"""The ``Ticket`` persistence model + ``WorkflowStatus`` enum (MAS §8.4, ID-058).
+"""The ``Ticket`` persistence model (MAS §8.4, ID-058).
 
 Grounded in:
-- MAS §8.4 — the Orchestrator workflow state machine. ``WorkflowStatus``
-  enumerates exactly the pinned §8.4 states, in the pinned order.
+- MAS §8.4 — the Orchestrator workflow state machine. The stored workflow
+  state is the domain's :class:`~orchestrator.domain.workflow.states.
+  WorkflowState` (aliased here as ``WorkflowStatus``) — the §8.4 states, in
+  the pinned order, defined once in the domain.
 - MAS §6.5 — cross-context references are plain identifier columns, NOT foreign
   keys. ``project_id`` references the parent Project by identifier only (no FK
   to a projects table); SFP-100 owns the Project model.
@@ -14,11 +16,15 @@ Mirrors the Identity ``User`` model (ID-058) for structure and conventions. The
 ``updated_at`` auto-fill-on-update mechanism is deferred to a separate
 platform-wide follow-up ticket: both timestamps are insert-side
 ``server_default=func.now()`` only — no trigger, no ``onupdate``.
+
+Enum ownership (SFP-147): the canonical workflow-state enum lives in the
+domain; this model aliases it so the historical persistence name keeps
+working (``WorkflowStatus = WorkflowState``). The dependency arrow points
+infrastructure -> domain — the domain never imports this package.
 """
 
 from __future__ import annotations
 
-import enum
 import uuid
 from datetime import datetime
 
@@ -27,26 +33,14 @@ from sqlalchemy import DateTime, Enum, Index, String
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
+from orchestrator.domain.workflow.states import WorkflowState
 from orchestrator.infrastructure.persistence.base import Base
 
-
-class WorkflowStatus(enum.Enum):
-    """Orchestrator workflow states, pinned to MAS §8.4 (order is significant).
-
-    This enum only enumerates the §8.4 states; it does NOT encode transition
-    semantics — those are downstream of this PR.
-    """
-
-    READY_FOR_PR_SPECIFICATION = enum.auto()
-    READY_FOR_CODING = enum.auto()
-    CODING_IN_PROGRESS = enum.auto()
-    REVIEW_IN_PROGRESS = enum.auto()
-    WAITING_FOR_USER = enum.auto()
-    READY_FOR_MERGE = enum.auto()
-    MERGING = enum.auto()
-    DEPLOYING = enum.auto()
-    COMPLETED = enum.auto()
-    FAILED = enum.auto()
+#: Persistence-side alias for the domain-owned workflow state enum. The
+#: domain (:mod:`orchestrator.domain.workflow.states`) is the single source
+#: of truth; ``WorkflowStatus`` remains exported for every existing
+#: persistence-side consumer (models, tests) without a second definition.
+WorkflowStatus = WorkflowState
 
 
 class Ticket(Base):

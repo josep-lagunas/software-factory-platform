@@ -1,9 +1,10 @@
-"""Tests for the workflow domain states module (MAS §8.4, SFP-137).
+"""Tests for the workflow domain states module (MAS §8.4, SFP-137; SFP-147).
 
 Asserts the exact §8.4 ten-state set in the pinned order, the 1:1 alignment
-with the landed ``WorkflowStatus`` persistence enum (PR #114 — no divergent
-duplicate), and the ACTIVE/TERMINAL classifications the transition table is
-built from.
+with the persistence-side ``WorkflowStatus`` alias (PR #114 landed the enum
+on the ``Ticket`` model; SFP-147 moved the canonical definition into the
+domain — no divergent duplicate, dependency arrow infrastructure -> domain),
+and the ACTIVE/TERMINAL classifications the transition table is built from.
 """
 
 from __future__ import annotations
@@ -39,11 +40,13 @@ def test_states_exactly_the_ten_mas_8_4_states_in_order() -> None:
     assert len(STATES) == 10
 
 
-def test_workflow_state_is_the_landed_persistence_enum_not_a_duplicate() -> None:
-    # Alignment strategy: reuse the persistence enum directly. The alias must
-    # BE WorkflowStatus (single source of truth), not a same-shaped copy.
-    assert WorkflowState is WorkflowStatus
-    assert states.WorkflowState is WorkflowStatus
+def test_workflow_state_is_the_persistence_alias_not_a_duplicate() -> None:
+    # Alignment strategy (SFP-147 inversion): the domain owns the enum; the
+    # persistence-side WorkflowStatus must BE WorkflowState (alias of the
+    # single source of truth), not a same-shaped copy — and the domain must
+    # not import persistence to define it.
+    assert WorkflowStatus is WorkflowState
+    assert states.WorkflowState is WorkflowState
 
 
 def test_workflow_state_is_a_plain_enum_whose_names_are_the_mas_names() -> None:

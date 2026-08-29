@@ -1,12 +1,27 @@
-"""Orchestrator domain layer (MAS §9.6; ID-061 / MAS §11.8).
+"""Orchestrator Service domain layer (MAS §8–9).
+
+Import-surface discipline: the domain is pure — pydantic and the standard
+library only. Storage, messaging and vendor SDKs live in
+:mod:`orchestrator.infrastructure`; the domain consumes them exclusively
+through Protocols declared here (the SFP-137 DecisionSink pattern, now applied
+to aggregate persistence by :mod:`orchestrator.domain.aggregate_manager`).
 
 Exposes the workflow domain (:mod:`orchestrator.domain.workflow`) — states,
-transition table, per-stage drivers, and the pure policy engine — and the
+transition table, per-stage drivers, and the pure policy engine — the
 deterministic execution admission scheduler
-(:mod:`orchestrator.domain.scheduler`, SFP-145): the capacity + FIFO gate
-that replaces the manual N=1 serialization discipline.
+(:mod:`orchestrator.domain.scheduler`, SFP-145: the capacity + FIFO gate
+that replaces the manual N=1 serialization discipline) — and the aggregate
+persistence seam (:mod:`orchestrator.domain.aggregate_manager`, SFP-147).
 """
 
+from orchestrator.domain.aggregate_manager import (
+    FIRST_WRITE,
+    Aggregate,
+    AggregateManager,
+    AggregateRepository,
+    AggregateT,
+    StaleAggregateError,
+)
 from orchestrator.domain.scheduler import (
     CANCELLATION_COMMANDS,
     COMMUNICATION_COMMANDS,
@@ -99,4 +114,10 @@ __all__ = [
     "pr_created_fact",
     "spec_stage_fact_is_successful",
     "transition",
+    "FIRST_WRITE",
+    "Aggregate",
+    "AggregateManager",
+    "AggregateRepository",
+    "AggregateT",
+    "StaleAggregateError",
 ]
