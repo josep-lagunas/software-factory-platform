@@ -5,6 +5,14 @@
     "SFP-3",
     "SFP-4",
     "SFP-64",
+    "SFP-236",
+    "SFP-237",
+    "SFP-238",
+    "SFP-239",
+    "SFP-240",
+    "SFP-241",
+    "SFP-242",
+    "SFP-244",
     "SFP-5",
     "SFP-65",
     "SFP-67",
@@ -110,6 +118,7 @@
     "SFP-150",
     "SFP-159",
     "SFP-164",
+    "SFP-243",
     "SFP-52",
     "SFP-63",
     "SFP-102",
@@ -217,6 +226,78 @@
       "executor": "manual",
       "phase": "Platform",
       "title": "AWS account + billing (eu-west-1)"
+    },
+    {
+      "ticket": "SFP-236",
+      "wave": 0,
+      "deps": [],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Pipeline: surface readiness-gate detail on non-READY abort"
+    },
+    {
+      "ticket": "SFP-237",
+      "wave": 0,
+      "deps": [],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Align ticket_pipeline model tiers with the orchestrator harness"
+    },
+    {
+      "ticket": "SFP-238",
+      "wave": 0,
+      "deps": [],
+      "area": "AGENT",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Force reviewer rationale (all verdicts) + structured PR body"
+    },
+    {
+      "ticket": "SFP-239",
+      "wave": 0,
+      "deps": [],
+      "area": "WORKER",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Validate cached clone/worktree before reuse"
+    },
+    {
+      "ticket": "SFP-240",
+      "wave": 0,
+      "deps": [],
+      "area": "WORKER",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Sync branch base before push (stale-base conflicts)"
+    },
+    {
+      "ticket": "SFP-241",
+      "wave": 0,
+      "deps": [],
+      "area": "WORKER",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Verify/re-obtain PR review before merge"
+    },
+    {
+      "ticket": "SFP-242",
+      "wave": 0,
+      "deps": [],
+      "area": "WORKER",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Spawn/progress watchdog in ClaudeAgentRuntime"
+    },
+    {
+      "ticket": "SFP-244",
+      "wave": 0,
+      "deps": [],
+      "area": "COMM",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Slack operational command interpreter (RUN/STATUS/APPROVE/STOP/HELP, deterministic v0)"
     },
     {
       "ticket": "SFP-5",
@@ -1405,6 +1486,18 @@
       "executor": "ai-agent",
       "phase": "Platform",
       "title": "Crash mid-outbox → no duplicate business effect"
+    },
+    {
+      "ticket": "SFP-243",
+      "wave": 6,
+      "deps": [
+        "SFP-236",
+        "SFP-36"
+      ],
+      "area": "ORCH",
+      "executor": "ai-agent",
+      "phase": "Platform",
+      "title": "Ticket enrichment agent: gate ambiguities → implementation-ready spec"
     },
     {
       "ticket": "SFP-52",

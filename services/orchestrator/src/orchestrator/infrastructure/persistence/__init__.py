@@ -1,10 +1,15 @@
 """Orchestrator Service persistence layer (ID-058).
 
 Exposes the per-service ``Base`` and the ``Ticket`` table model (+ the
-``WorkflowStatus`` enum). All Orchestrator ORM tables register against
+``WorkflowStatus`` alias). All Orchestrator ORM tables register against
 ``Base.metadata``; importing ``Base`` from this package also imports the
 ``models`` submodule, so every mapped table is registered and visible to the
 Alembic ``target_metadata`` (see ``migrations/env.py``).
+
+``WorkflowStatus`` is an alias of the domain-owned
+:class:`orchestrator.domain.workflow.states.WorkflowState` (SFP-147 inverted
+the SFP-137 arrangement): the canonical definition lives in the domain, and
+this layer imports it *from* there — never the other way around.
 """
 
 from orchestrator.infrastructure.persistence.aggregate_repository import (
