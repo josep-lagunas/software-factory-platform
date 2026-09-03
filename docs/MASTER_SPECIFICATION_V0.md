@@ -13,6 +13,7 @@
 | 0.1.1   | 2026-06-29 | Josep Lagunas | Architecture review patch set: provider schema ownership, transactional outbox, query model, idempotency keys, workflow traceability, and chapter renumbering |
 | 0.1.2   | 2026-06-30 | Josep Lagunas | Review aggregate clarification: explicit aggregate boundary, single-iteration semantics, immutability, and existential dependency on CodingJob |
 | 0.1.3   | 2026-06-30 | Josep Lagunas | Orchestrator contract-list correction: Orchestrator-owned business events (TicketUpdated, PRSpecificationsUpdated, DeploymentUpdated, WorkflowUpdated) moved from Consumed to Produced Contracts |
+| 0.1.4   | 2026-09-04 | Josep Lagunas | PRSpec Packing (ID-075): a PRSpecification may satisfy N tickets under the deterministic packing guard. |
 
 ---
 
@@ -98,7 +99,7 @@ Backward-compatible architectural additions require a new minor version.
 
 Editorial improvements, clarifications, diagrams, examples, and implementation guidance require a new patch version.
 
-Current version: **0.1.3**
+Current version: **0.1.4**
 
 Status: **FROZEN (v0)**
 
@@ -1750,6 +1751,8 @@ Every CodingJob is based on exactly one locked PRSpecification.
 A Ticket may produce multiple PRSpecifications.
 
 A PRSpecification may produce at most one CodingJob in v0.
+
+PRSpecification Packing: A PRSpecification may satisfy one (1) or multiple (N) Tickets, subject to the deterministic packing guard of ID-075 (same ValidationProfile, mechanical identity, no intra-pack dependencies, size limit; fail-closed to individual PRSpecs on any check failure). When N tickets are grouped, a single CodingJob and PR are generated. Upon successful merge, the Orchestrator transitions all satisfied Tickets to COMPLETED, linked by a single WorkflowDecision.
 
 ### CodingJob
 
@@ -4945,7 +4948,7 @@ If a ticket requires an implementation decision, the Implementation Decisions do
 
 ## 12.10 Final Architecture Statement
 
-The Software Factory Platform architecture described in this specification is considered frozen for version 0.1.3.
+The Software Factory Platform architecture described in this specification is considered frozen for version 0.1.4.
 
 Future evolution must occur through controlled architectural revisions.
 

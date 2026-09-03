@@ -64,6 +64,12 @@ class PrSpec(BaseModel):
     List-typed fields hold bullet-style items (each a short string); the prose
     fields (``goal``, ``validation_profile_reason``, ``implementation_notes``)
     hold free text.
+
+    ``satisfies_tickets`` (ID-075): each entry is a ticket key the PRSpec
+    fully satisfies. Single-ticket planning sets the single ticket's key —
+    backward-compatible shape: ``len == 1`` preserves the old 1:1 semantics.
+    The field is REQUIRED, not optional — explicit beats implicit for
+    auditability, and there is no legacy data to migrate.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid")
@@ -75,6 +81,7 @@ class PrSpec(BaseModel):
     out_of_scope: list[str]
     acceptance_criteria: list[str]
     dependencies: list[str]
+    satisfies_tickets: list[str] = Field(..., min_length=1)
     validation_profile: ValidationProfile
     validation_profile_reason: str
     required_gates: list[str]
