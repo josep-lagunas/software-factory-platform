@@ -37,6 +37,15 @@ Binding resolutions (Orchestrator-decided; implemented exactly):
    no fan-out); more than one spec is a deterministic error.
 6. **Per-role** ``max_turns``: planner=5, test_designer=5, coder=50, reviewer=5.
    One runtime per role; readiness reuses the planner runtime.
+7. **Truthful checkpoints (SFP-247)** — ``code.json`` is written only after the
+   pipeline's own commit verification (``git rev-list --count <base>..<branch>
+   >= 1``, using the loop's existing ``branch_name``/``base_branch``
+   bookkeeping) — never on model-run completion. At ``--resume`` entry every
+   checkpoint is validated against reality before being trusted (same
+   validation family as SFP-239's worktree check); an invalidated checkpoint is
+   deleted with a logged reason and its stage re-runs, a trusted one logs a
+   trusted line. Checks are cheap + deterministic: one git rev-list + JSON
+   parse; no network/model calls.
 
 No retry / queue / multi-PR fan-out (fail-fast linear loop). The end-to-end
 "real ticket executed by the SFP runtime" acceptance criterion is an
@@ -49,8 +58,9 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -94,6 +104,7 @@ __all__ = [
     "effective_review_state",
     "main",
     "run_pipeline",
+    "verify_branch_commits",
 ]
 
 #: Jira transition id for "Done" (the only status transition the loop emits;
@@ -184,10 +195,179 @@ def _load_checkpoint[T: BaseModel](checkpoints_dir: Path, stage: str, model: typ
         return None
     try:
         return model.model_validate(json.loads(path.read_text()))
-    except (json.JSONDecodeError, ValidationError, OSError):
-        _log.warning("deleting corrupt checkpoint %s; stage %s will re-run", path, stage)
+    except (json.JSONDecodeError, ValidationError, OSError) as exc:
+        _log.warning(
+            "checkpoint invalidated: %s (reason: %s); deleting — stage %s will re-run",
+            path,
+            _invalid_reason(exc),
+            stage,
+        )
         path.unlink(missing_ok=True)
         return None
+
+
+def _invalid_reason(exc: Exception) -> str:
+    """Map a checkpoint load/validate failure to a short logged reason string."""
+    if isinstance(exc, json.JSONDecodeError):
+        return "unparseable JSON (truncated/corrupt)"
+    if isinstance(exc, ValidationError):
+        return "schema mismatch (missing/extra contract keys)"
+    return f"OS error: {exc}"
+
+
+#: Signature of the injectable git runner used by the checkpoint validation
+#: family (defaults to :func:`subprocess.run`; the shape matches the runners of
+#: ``repo.manager`` / ``repo.worktree`` so tests inject the same kind of fake).
+GitRunner = Callable[[list[str]], "subprocess.CompletedProcess[str]"]
+
+
+def _default_git_runner(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run git with captured output (stderr never escapes unstructured)."""
+    return subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+
+def verify_branch_commits(
+    worktree_path: Path,
+    branch: str,
+    base: str,
+    *,
+    runner: GitRunner | None = None,
+) -> int:
+    """Count the ticket branch's commits relative to ``base`` (SFP-247).
+
+    Runs exactly one ``git -C <worktree> rev-list --count <base>..<branch>``
+    — the same cheap, deterministic probe the PRSpec pins. The refs are
+    branch/base names already carried by the pipeline (``branch_name`` /
+    ``base_branch``); nothing is guessed. No network, no model calls.
+
+    Args:
+        worktree_path: The per-job worktree (the clone's object database holds
+            both refs — worktrees share the main repo's objects).
+        branch: The ticket branch name (the PR head).
+        base: The base branch name (the PR base / worktree base).
+        runner: Injectable git executor (defaults to ``subprocess.run``).
+
+    Returns:
+        The commit count. A failed probe (missing ref, git error) returns
+        ``-1`` — an *unknown* count, never a false "0 commits", so callers
+        treat it conservatively (the checkpoint is invalidated and the stage
+        re-runs; a lying "0" would wrongly discard a valid checkpoint).
+    """
+    run = runner or _default_git_runner
+    try:
+        result = run(
+            [
+                "git",
+                "-C",
+                str(worktree_path),
+                "rev-list",
+                "--count",
+                f"{base}..{branch}",
+            ]
+        )
+    except subprocess.CalledProcessError:
+        return -1
+    try:
+        return int((result.stdout or "").strip())
+    except ValueError:
+        return -1
+
+
+def _validate_checkpoints(
+    checkpoints_dir: Path,
+    *,
+    worktree_path: Path,
+    branch_name: str,
+    base_branch: str,
+    runner: GitRunner | None = None,
+) -> None:
+    """Resume-entry validation pass — prove every checkpoint against reality.
+
+    Runs once at ``--resume`` entry, in the same validation family as SFP-239's
+    worktree-existence check, BEFORE any checkpoint is trusted:
+
+    * ``code.json`` — after the pydantic round-trip (a corrupt file is already
+      deleted by :func:`_load_checkpoint`), the checkpoint's claim is checked
+      against git itself: ``git rev-list --count <base>..<branch> >= 1``. A
+      code.json with zero branch commits is the exact lie SFP-247 fixes (the
+      pre-fix pipeline wrote it on model-run completion, before any commit
+      existed). It is deleted with a logged reason and the code stage re-runs.
+      An unresolvable probe (``-1``) also invalidates — fail-closed, never a
+      false "0 commits".
+    * ``plan.json`` / ``design.json`` — parseable JSON whose top-level keys
+      match the expected contract (``pr_specs`` / ``pr_spec_id`` +
+      ``test_plan``). A truncated/corrupt file is deleted with a logged reason
+      and its stage re-runs. (Contract-key checking here is cheap and avoids
+      the full pydantic re-validation being the ONLY corruption signal.)
+
+    A **trusted** line is logged for every checkpoint that passes — every
+    validation decision (trusted / invalidated+reason) is an auditable run-log
+    fact (MAS §8.8).
+
+    Deliberately NOT validated: a *valid* checkpoint is never re-entered —
+    this pass deletes lying checkpoints so their stage re-runs; it creates no
+    re-entry path for checkpoints that hold.
+    """
+    # design.json / plan.json — parse + expected contract keys. The exact
+    # expected top-level keys come from the contracts themselves (the set of
+    # REQUIRED fields), so a truncated-but-parseable file with the wrong keys
+    # is caught here rather than surviving to a mid-resume schema failure.
+    _stage_specs: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("design", ("pr_spec_id", "test_plan")),
+        ("plan", ("pr_specs",)),
+    )
+    for stage, required_keys in _stage_specs:
+        path = checkpoints_dir / f"{stage}.json"
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text())
+            # The isinstance guard runs FIRST: a parseable-but-non-object file
+            # (e.g. `42`, `"x"`) would raise TypeError from the membership
+            # test, which this except clause does not catch.
+            if not isinstance(payload, dict):
+                raise ValueError("not a JSON object")
+            missing = [k for k in required_keys if k not in payload]
+            if missing:
+                raise ValueError(f"missing expected contract keys: {missing}")
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
+            _log.warning(
+                "checkpoint invalidated: %s (reason: %s); deleting — stage %s will re-run",
+                path,
+                exc,
+                stage,
+            )
+            path.unlink(missing_ok=True)
+            continue
+        _log.info("checkpoint trusted: %s (contract keys present, JSON parseable)", path)
+
+    # code.json — the branch-commits check. Absent file: nothing to validate.
+    code_path = checkpoints_dir / "code.json"
+    if not code_path.exists():
+        return
+    count = verify_branch_commits(worktree_path, branch_name, base_branch, runner=runner)
+    if count >= 1:
+        _log.info(
+            "checkpoint trusted: %s (branch %s has %d commit(s) vs base %s)",
+            code_path,
+            branch_name,
+            count,
+            base_branch,
+        )
+        return
+    reason = (
+        f"branch {branch_name} has 0 commits vs base {base_branch} (checkpoint written "
+        "before the Coder's commits landed)"
+        if count == 0
+        else f"could not count commits on branch {branch_name} vs base {base_branch} "
+        "(probe failed — unknown, treated as invalid)"
+    )
+    _log.warning(
+        "checkpoint invalidated: %s (reason: %s); deleting — stage code will re-run",
+        code_path,
+        reason,
+    )
+    code_path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +415,10 @@ class PipelineDeps:
     branch_name: str
     base_branch: str = "main"
     done_transition_id: str = _DONE_TRANSITION_ID
+    #: Injectable git executor for the SFP-247 checkpoint-validation family
+    #: (defaults to real ``subprocess.run``; the composition root leaves it
+    #: ``None`` — only tests inject a fake).
+    git_runner: GitRunner | None = None
     extra: Mapping[str, str] = field(default_factory=dict)
 
 
@@ -359,6 +543,7 @@ def run_pipeline(
     pr_body: str | None = None,
     resume: bool = False,
     checkpoints_dir: Path | None = None,
+    git_runner: GitRunner | None = None,
 ) -> PipelineResult:
     """Run the linear SFP pipeline for ``ticket_key`` to a merged + Done state.
 
@@ -396,12 +581,20 @@ def run_pipeline(
             stages whose checkpoint is present (``plan`` / ``design`` / ``code``),
             restarting at the first missing stage; REUSE an existing worktree
             (clone + branch + Coder commits) instead of re-creating it. Readiness
-            is never checkpointed and always re-runs. A clean run
-            (``resume=False``, the default) behaves EXACTLY as before — it still
-            WRITES checkpoints after each checkpointed stage but never reads them.
+            is never checkpointed and always re-runs. At resume entry every
+            checkpoint is first VALIDATED against reality (SFP-247): ``code.json``
+            requires >= 1 commit on the ticket branch vs base; ``plan.json`` /
+            ``design.json`` must parse as JSON with their contract keys. A lying
+            or corrupt checkpoint is deleted with a logged reason and its stage
+            re-runs. A clean run (``resume=False``, the default) behaves EXACTLY
+            as before — it still WRITES checkpoints after each checkpointed stage
+            but never reads (or validates) them.
         checkpoints_dir: Where checkpoints live (injectable for tests). Defaults
             to ``<worktree_base>/<ticket_key>/checkpoints`` — kept OUTSIDE the
             worktree so a worktree mishap cannot lose them.
+        git_runner: Injectable git executor for the checkpoint-validation family
+            (``git rev-list --count <base>..<branch>``). Defaults to
+            ``subprocess.run``; tests inject a fake so no real git spawns.
 
     Returns:
         The :class:`PipelineResult`. On success ``success=True``, ``pr_number`` is
@@ -417,6 +610,22 @@ def run_pipeline(
         if checkpoints_dir is not None
         else _checkpoint_dir(worktree_base, ticket_key)
     )
+    # Resume-entry validation pass (SFP-247): before ANY checkpoint is trusted,
+    # validate it against reality — code.json requires >=1 commit on the ticket
+    # branch vs base; plan/design require parseable JSON with their contract
+    # keys. A lying/truncated checkpoint is DELETED with a logged reason and its
+    # stage re-runs (self-healing resume); a trusted one is logged as such.
+    # Clean runs (resume=False) never read checkpoints — no validation either.
+    worktree_job_id = job_id or ticket_key
+    worktree_path = worktree_base / _sanitize_job_id(worktree_job_id)
+    if resume:
+        _validate_checkpoints(
+            ckpt_dir,
+            worktree_path=worktree_path,
+            branch_name=branch_name,
+            base_branch=base_branch,
+            runner=git_runner,
+        )
 
     # 1. Fetch the issue + parse its ADF description into a ParsedTicket.
     trace.append("jira.fetch_issue")
@@ -518,11 +727,6 @@ def run_pipeline(
     # checkpoint implies all three). We detect reuse by the worktree path's
     # existence; otherwise clone + ``worktree add -b <branch>`` as on a clean
     # run.
-    worktree_job_id = job_id or ticket_key
-    # Sanitize the SAME way WorktreeManager.add does, so the resume-reuse path
-    # matches the fresh-run worktree path for ALL job_ids (a raw job_id with a
-    # path separator would otherwise diverge from where .add created the worktree).
-    worktree_path = worktree_base / _sanitize_job_id(worktree_job_id)
     if resume and worktree_path.exists():
         _log.info("resume: reusing existing worktree %s for %s", worktree_path, ticket_key)
     else:
@@ -561,7 +765,27 @@ def run_pipeline(
             prompt_provider=prompt_provider,
             ticket_id=ticket_key,
         )
-        _write_checkpoint(ckpt_dir, "code", coder_output)
+        # SFP-247 — TRUTHFUL ORDERING: the code checkpoint is written ONLY
+        # after the pipeline's own commit step is verified — the branch must
+        # hold >= 1 commit vs base — never on model-run completion. A Coder
+        # run that returned a contract output but committed nothing (crash
+        # between run and commit, a model that skipped `git commit`) leaves NO
+        # checkpoint, so a --resume re-enters code instead of skipping it on a
+        # lie. A failed probe (git error) also leaves no checkpoint — the sync
+        # below surfaces it rather than recording a lying checkpoint.
+        commit_count = verify_branch_commits(
+            worktree_path, branch_name, base_branch, runner=git_runner
+        )
+        if commit_count >= 1:
+            _write_checkpoint(ckpt_dir, "code", coder_output)
+        else:
+            _log.warning(
+                "code stage completed but branch %s has %s commit(s) vs base %s; "
+                "code.json NOT written (checkpoint only after commits land)",
+                branch_name,
+                commit_count if commit_count >= 0 else "unknown",
+                base_branch,
+            )
     else:
         _log.info("resume: skipping code stage (checkpoint present) for %s", ticket_key)
 
@@ -854,6 +1078,7 @@ def build(
         branch_name=branch_name,
         base_branch=base_branch,
         done_transition_id=_DONE_TRANSITION_ID,
+        git_runner=None,
     )
 
 
@@ -901,6 +1126,7 @@ def main(argv: list[str] | None = None) -> int:
         base_branch=deps.base_branch,
         done_transition_id=deps.done_transition_id,
         resume=args.resume,
+        git_runner=deps.git_runner,
     )
 
     if result.success:
