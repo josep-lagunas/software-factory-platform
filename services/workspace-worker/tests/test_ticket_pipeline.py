@@ -22,6 +22,7 @@ recording fakes (no real SDK / HTTP / env parsing for the typed settings).
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
@@ -43,6 +44,7 @@ from workspace_worker.entrypoints.ticket_pipeline import (
     build,
     effective_review_state,
     run_pipeline,
+    verify_branch_commits,
 )
 from workspace_worker.infrastructure.settings import WorkspaceWorkerSettings
 from workspace_worker.repo.branch import BranchResult
@@ -474,6 +476,42 @@ def _exec_runners(
     }
 
 
+# --------------------------------------------------------------------------- #
+# SFP-247 — git runner fakes for the checkpoint-validation family
+# --------------------------------------------------------------------------- #
+
+
+class RecordingGitRunner:
+    """Fake git executor returning a canned ``rev-list --count`` stdout.
+
+    Records every argv it receives so tests can assert the exact probe
+    (``git -C <worktree> rev-list --count <base>..<branch>``) without
+    spawning real git. Raises :class:`subprocess.CalledProcessError` when the
+    canned ``count`` is negative (simulating git's failure / missing ref).
+    """
+
+    def __init__(self, count: int) -> None:
+        self.count = count
+        self.calls: list[list[str]] = []
+
+    def __call__(self, cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(cmd))
+        if self.count < 0:
+            raise subprocess.CalledProcessError(128, cmd, stderr="fatal: bad revision")
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout=f"{self.count}\n", stderr="")
+
+
+def _rev_list_argv(worktree: Path) -> list[str]:
+    """The exact rev-list probe argv the pipeline must issue (SFP-247)."""
+    return ["git", "-C", str(worktree), "rev-list", "--count", f"main..{BRANCH}"]
+
+
+#: Sentinel distinguishing "caller did not inject a git runner" from an
+#: explicit ``None`` ("use the pipeline's real default"). Resolves to the
+#: truthful branch state (count=1) so existing tests keep their meaning.
+_UNSET = object()
+
+
 def _run(
     tmp_path: Path,
     runtimes: Mapping[str, FakeRuntime],
@@ -485,8 +523,15 @@ def _run(
     exec_runners: Mapping[str, Any] | None = None,
     resume: bool = False,
     checkpoints_dir: Path | None = None,
+    git_runner: Any | None = _UNSET,
 ) -> tuple[PipelineResult, dict[str, Any]]:
-    """Wire every fake and call run_pipeline; return (result, fakes-dict)."""
+    """Wire every fake and call run_pipeline; return (result, fakes-dict).
+
+    ``git_runner`` uses a sentinel (not ``None``) because ``None`` means "use
+    the pipeline default"; the sentinel resolves to a truthful branch state
+    (the ticket branch holds its commits), which is the post-Coder reality
+    every pre-SFP-247 test implies.
+    """
     jira = jira or FakeJiraClient()
     repo_manager = repo_manager or FakeRepoManager()
     coder_adapter = coder_adapter or FakeGitAdapter()
@@ -517,6 +562,10 @@ def _run(
         branch_name=BRANCH,
         resume=resume,
         checkpoints_dir=checkpoints_dir,
+        # Default git state: the ticket branch holds its commits (the truthful
+        # post-Coder reality every pre-SFP-247 test implies). Tests for the
+        # ordering/invalidation behavior inject their own runner.
+        git_runner=(git_runner if git_runner is not _UNSET else RecordingGitRunner(count=1)),
     )
     fakes = {
         "jira": jira,
@@ -1197,6 +1246,361 @@ def test_checkpoints_are_written_on_a_normal_run(tmp_path: Path) -> None:
     PlannerOutput.model_validate(json.loads((ckpts / "plan.json").read_text()))
     TestDesignerOutput.model_validate(json.loads((ckpts / "design.json").read_text()))
     CoderOutput.model_validate(json.loads((ckpts / "code.json").read_text()))
+
+
+# --------------------------------------------------------------------------- #
+# Truthful stage checkpoints — write-after-commit + resume-time validation
+# (SFP-247; extends the SFP-230 family above, does not rewrite it)
+# --------------------------------------------------------------------------- #
+
+
+def test_code_checkpoint_not_written_when_branch_has_no_commits(
+    tmp_path: Path,
+) -> None:
+    """ORDERING (root fix): the Coder ran and returned a contract output, but
+    the branch holds 0 commits vs base — code.json must NOT be written. The
+    pre-SFP-247 pipeline wrote it on model-run completion, so a --resume would
+    then skip the code stage on a lie."""
+    ckpts = tmp_path / "ckpts"
+    runtimes, _ = _make_runtimes(approved=True)
+    git_runner = RecordingGitRunner(count=0)
+
+    result, _ = _run(tmp_path, runtimes, resume=False, checkpoints_dir=ckpts, git_runner=git_runner)
+
+    # The run itself still succeeds end to end (downstream fakes are green);
+    # only the checkpoint write is suppressed.
+    assert result.success is True
+    assert "code" in result.trace
+    # The commit verification ran with the exact probe argv.
+    assert _rev_list_argv(tmp_path / "wt" / TICKET) in git_runner.calls
+    # code.json NOT written; plan/design still are (their stages completed and
+    # their checkpoints carry no git-state claim).
+    assert not (ckpts / "code.json").exists()
+    assert (ckpts / "plan.json").exists()
+    assert (ckpts / "design.json").exists()
+
+
+def test_code_checkpoint_written_only_after_commits_land(
+    tmp_path: Path,
+) -> None:
+    """ORDERING (happy side): the branch holds >= 1 commit vs base — code.json
+    IS written after the Coder run, and the probe that gates it is the exact
+    ``git rev-list --count <base>..<branch>`` with the pipeline's own
+    branch/base bookkeeping."""
+    ckpts = tmp_path / "ckpts"
+    runtimes, handles = _make_runtimes(approved=True)
+    git_runner = RecordingGitRunner(count=2)
+
+    result, _ = _run(tmp_path, runtimes, resume=False, checkpoints_dir=ckpts, git_runner=git_runner)
+
+    assert result.success is True
+    assert len(handles["coder"].calls) == 1
+    # code.json written — and it round-trips through the contract.
+    CoderOutput.model_validate(json.loads((ckpts / "code.json").read_text()))
+    # The verification probe used the pipeline's branch/base names.
+    assert _rev_list_argv(tmp_path / "wt" / TICKET) in git_runner.calls
+
+
+def test_resume_lying_code_checkpoint_deleted_and_code_reruns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RESUME VALIDATION: code.json is present and parses, but the branch has
+    0 commits vs base — the checkpoint is DELETED with a logged reason and the
+    code stage RE-RUNS. The run then proceeds."""
+    ckpts = tmp_path / "ckpts"
+    _write_ckpt(ckpts, "plan", PlannerOutput.model_validate(_planner_output()).model_dump_json())
+    _write_ckpt(
+        ckpts,
+        "design",
+        TestDesignerOutput.model_validate(_test_designer_output()).model_dump_json(),
+    )
+    _write_ckpt(ckpts, "code", CoderOutput.model_validate(_coder_output()).model_dump_json())
+    # The worktree exists (clone + branch happened on the first run) but the
+    # branch never got the Coder's commits — code.json is lying.
+    (tmp_path / "wt" / TICKET).mkdir(parents=True)
+    git_runner = RecordingGitRunner(count=0)
+
+    with caplog.at_level(logging.WARNING, logger=pipeline_mod._log.name):
+        runtimes, handles = _make_runtimes(approved=True)
+        result, _ = _run(
+            tmp_path, runtimes, resume=True, checkpoints_dir=ckpts, git_runner=git_runner
+        )
+
+    assert result.success is True
+    # code.json was deleted...
+    assert not (ckpts / "code.json").exists()
+    # ...with a logged invalidated+reason line (auditable recovery)...
+    invalidated = [r for r in caplog.records if "checkpoint invalidated" in r.getMessage()]
+    assert len(invalidated) == 1
+    assert "0 commits" in invalidated[0].getMessage()
+    assert "code" in invalidated[0].getMessage()
+    # ...and the code stage re-ran (planner/design still skipped).
+    assert len(handles["coder"].calls) == 1
+    assert handles["planner"].calls == []
+    assert handles["test_designer"].calls == []
+    assert "code" in result.trace
+    # The re-run's code.json is NOT rewritten (the branch still has 0 commits).
+    assert not (ckpts / "code.json").exists()
+
+
+def test_resume_corrupt_design_checkpoint_reruns_design(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RESUME VALIDATION: a truncated design.json is deleted with a logged
+    reason and the design stage re-runs; the run proceeds."""
+    ckpts = tmp_path / "ckpts"
+    _write_ckpt(ckpts, "plan", PlannerOutput.model_validate(_planner_output()).model_dump_json())
+    _write_ckpt(ckpts, "design", '{"pr_spec_id": "PRSPEC-SFP-224", "test_pl')  # truncated
+
+    with caplog.at_level(logging.WARNING, logger=pipeline_mod._log.name):
+        runtimes, handles = _make_runtimes(approved=True)
+        git_runner = RecordingGitRunner(count=1)
+        result, _ = _run(
+            tmp_path, runtimes, resume=True, checkpoints_dir=ckpts, git_runner=git_runner
+        )
+
+    assert result.success is True
+    # design.json was deleted then rewritten by the re-run (and round-trips).
+    TestDesignerOutput.model_validate(json.loads((ckpts / "design.json").read_text()))
+    # A logged invalidated+reason line named the design checkpoint.
+    invalidated = [r for r in caplog.records if "checkpoint invalidated" in r.getMessage()]
+    assert len(invalidated) == 1
+    assert "design" in invalidated[0].getMessage()
+    # The design stage re-ran; plan stayed skipped; code ran for the first time.
+    assert len(handles["test_designer"].calls) == 1
+    assert handles["planner"].calls == []
+    assert len(handles["coder"].calls) == 1
+    assert "design_tests" in result.trace
+
+
+def test_resume_design_json_missing_contract_keys_is_invalidated(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RESUME VALIDATION: design.json that parses but lacks the expected
+    contract keys is invalidated — truncated files are not the only corruption
+    shape the key check catches."""
+    ckpts = tmp_path / "ckpts"
+    _write_ckpt(ckpts, "design", json.dumps({"pr_spec_id": "PRSPEC-SFP-224"}))
+
+    with caplog.at_level(logging.WARNING, logger=pipeline_mod._log.name):
+        runtimes, handles = _make_runtimes(approved=True)
+        result, _ = _run(
+            tmp_path,
+            runtimes,
+            resume=True,
+            checkpoints_dir=ckpts,
+            git_runner=RecordingGitRunner(count=1),
+        )
+
+    assert result.success is True
+    invalidated = [r for r in caplog.records if "checkpoint invalidated" in r.getMessage()]
+    assert len(invalidated) == 1
+    assert "missing expected contract keys" in invalidated[0].getMessage()
+    assert len(handles["test_designer"].calls) == 1
+
+
+def test_resume_design_json_non_object_is_invalidated(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RESUME VALIDATION: design.json that parses but is NOT a JSON object
+    (e.g. a bare ``42``) is invalidated without crashing the resume — the
+    isinstance guard precedes the contract-key membership test."""
+    ckpts = tmp_path / "ckpts"
+    _write_ckpt(ckpts, "design", "42")
+
+    with caplog.at_level(logging.WARNING, logger=pipeline_mod._log.name):
+        runtimes, handles = _make_runtimes(approved=True)
+        result, _ = _run(
+            tmp_path,
+            runtimes,
+            resume=True,
+            checkpoints_dir=ckpts,
+            git_runner=RecordingGitRunner(count=1),
+        )
+
+    assert result.success is True
+    invalidated = [r for r in caplog.records if "checkpoint invalidated" in r.getMessage()]
+    assert len(invalidated) == 1
+    assert "not a JSON object" in invalidated[0].getMessage()
+    # The re-run's checkpoint replaced the deleted one (and round-trips).
+    TestDesignerOutput.model_validate(json.loads((ckpts / "design.json").read_text()))
+    assert len(handles["test_designer"].calls) == 1
+
+
+def test_resume_truthful_checkpoints_trusted_and_stages_skipped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """PRESERVED BEHAVIOR: with truthful checkpoints (code branch commits >= 1,
+    parseable plan/design with contract keys), resume trusts them, skips their
+    stages EXACTLY as today, and logs a trusted line per checkpoint. A valid
+    checkpoint is never re-entered."""
+    ckpts = tmp_path / "ckpts"
+    _write_ckpt(ckpts, "plan", PlannerOutput.model_validate(_planner_output()).model_dump_json())
+    _write_ckpt(
+        ckpts,
+        "design",
+        TestDesignerOutput.model_validate(_test_designer_output()).model_dump_json(),
+    )
+    _write_ckpt(ckpts, "code", CoderOutput.model_validate(_coder_output()).model_dump_json())
+    (tmp_path / "wt" / TICKET).mkdir(parents=True)
+    git_runner = RecordingGitRunner(count=1)
+
+    with caplog.at_level(logging.INFO, logger=pipeline_mod._log.name):
+        runtimes, handles = _make_runtimes(approved=True)
+        result, fakes = _run(
+            tmp_path, runtimes, resume=True, checkpoints_dir=ckpts, git_runner=git_runner
+        )
+
+    assert result.success is True
+    # All three stages skipped exactly as the SFP-230 behavior prescribes.
+    assert handles["planner"].calls == []
+    assert handles["test_designer"].calls == []
+    assert handles["coder"].calls == []
+    assert len(handles["readiness"].calls) == 1
+    assert "build" in result.trace
+    assert any(c[0] == "merge_pr" for c in fakes["coder_adapter"].calls)
+    # A trusted line was logged for EVERY checkpoint validation decision.
+    trusted = [r for r in caplog.records if "checkpoint trusted" in r.getMessage()]
+    assert len(trusted) == 3
+    for name in ("plan.json", "design.json", "code.json"):
+        assert any(name in t.getMessage() for t in trusted), name
+    # No invalidation happened.
+    assert not [r for r in caplog.records if "checkpoint invalidated" in r.getMessage()]
+    # The trusted code line records the verified commit count.
+    code_trusted = next(t for t in trusted if "code.json" in t.getMessage())
+    assert "1 commit" in code_trusted.getMessage()
+
+
+def test_no_resume_does_not_validate_checkpoints(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A clean run (resume=False) never READS checkpoints — so it never
+    VALIDATES them either, even when a lying code.json is present; the clean
+    run overwrites checkpoints as it goes."""
+    ckpts = tmp_path / "ckpts"
+    _write_ckpt(ckpts, "code", CoderOutput.model_validate(_coder_output()).model_dump_json())
+    git_runner = RecordingGitRunner(count=0)
+
+    with caplog.at_level(logging.INFO, logger=pipeline_mod._log.name):
+        runtimes, _ = _make_runtimes(approved=True)
+        result, _ = _run(
+            tmp_path, runtimes, resume=False, checkpoints_dir=ckpts, git_runner=git_runner
+        )
+
+    assert result.success is True
+    # The single rev-list probe is the post-code ordering check — exactly one
+    # git call for the whole run (no validation pass).
+    assert len(git_runner.calls) == 1
+    # No trusted/invalidated lines were logged (nothing was validated).
+    msgs = [r.getMessage() for r in caplog.records]
+    assert not [m for m in msgs if "checkpoint trusted" in m or "checkpoint invalidated" in m]
+
+
+def test_resume_probe_failure_invalidates_code_fail_closed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The rev-list probe itself fails (missing ref / git error): the count is
+    unknown, and unknown is NEVER treated as '0 truthful commits' — code.json
+    is invalidated fail-closed (delete + re-run) rather than trusted."""
+    ckpts = tmp_path / "ckpts"
+    _write_ckpt(ckpts, "plan", PlannerOutput.model_validate(_planner_output()).model_dump_json())
+    _write_ckpt(
+        ckpts,
+        "design",
+        TestDesignerOutput.model_validate(_test_designer_output()).model_dump_json(),
+    )
+    _write_ckpt(ckpts, "code", CoderOutput.model_validate(_coder_output()).model_dump_json())
+    (tmp_path / "wt" / TICKET).mkdir(parents=True)
+
+    with caplog.at_level(logging.WARNING, logger=pipeline_mod._log.name):
+        runtimes, handles = _make_runtimes(approved=True)
+        result, _ = _run(
+            tmp_path,
+            runtimes,
+            resume=True,
+            checkpoints_dir=ckpts,
+            git_runner=RecordingGitRunner(count=-1),
+        )
+
+    assert result.success is True
+    assert not (ckpts / "code.json").exists()
+    assert len(handles["coder"].calls) == 1
+    invalidated = [r for r in caplog.records if "checkpoint invalidated" in r.getMessage()]
+    assert len(invalidated) == 1
+    assert "probe failed" in invalidated[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
+# verify_branch_commits — unit level (the one-shot rev-list probe)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_branch_commits_exact_argv_and_count() -> None:
+    """The probe is exactly one ``git -C <wt> rev-list --count <base>..<branch>``
+    and returns the parsed count."""
+    runner = RecordingGitRunner(count=3)
+    wt = Path("/tmp/wt/SFP-224")
+
+    assert verify_branch_commits(wt, "sfp-224-slice", "main", runner=runner) == 3
+    assert runner.calls == [["git", "-C", str(wt), "rev-list", "--count", "main..sfp-224-slice"]]
+
+
+def test_verify_branch_commits_git_failure_returns_unknown_not_zero() -> None:
+    """A failed probe (CalledProcessError) is '-1' (unknown) — never 0, so a
+    caller can distinguish 'verified: no commits' from 'could not verify'."""
+    runner = RecordingGitRunner(count=-1)
+    assert verify_branch_commits(Path("/tmp/wt"), "b", "main", runner=runner) == -1
+
+
+def test_verify_branch_commits_unparseable_stdout_returns_unknown() -> None:
+    """A stdout that is not an integer also degrades to -1 (unknown), not 0."""
+
+    def runner(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    assert verify_branch_commits(Path("/tmp/wt"), "b", "main", runner=runner) == -1
+
+
+def test_verify_branch_commits_default_runner_spawns_git(tmp_path: Path) -> None:
+    """The production default runs real git against a real throwaway repo:
+    base..branch with one commit on the branch counts 1, and the ref range the
+    probe builds resolves against the worktree's object database."""
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(tmp_path)], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "--allow-empty", "-m", "base", "-q"],
+        check=True,
+        capture_output=True,
+        env={
+            **__import__("os").environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "checkout", "-q", "-b", BRANCH],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "--allow-empty", "-m", "work", "-q"],
+        check=True,
+        capture_output=True,
+        env={
+            **__import__("os").environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+
+    assert verify_branch_commits(tmp_path, BRANCH, "main") == 1
+    # And a range that resolves to nothing counts 0.
+    assert verify_branch_commits(tmp_path, "main", BRANCH) == 0
 
 
 # --------------------------------------------------------------------------- #
