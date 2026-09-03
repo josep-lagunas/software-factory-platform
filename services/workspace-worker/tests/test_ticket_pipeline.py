@@ -168,6 +168,7 @@ def _planner_output(n_specs: int = 1) -> dict[str, Any]:
         "out_of_scope": [],
         "acceptance_criteria": ["Loop runs end to end."],
         "dependencies": [],
+        "satisfies_tickets": ["SFP-224"],
         "validation_profile": "LEVEL_1_INTERNAL",
         "validation_profile_reason": "internal infra",
         "required_gates": ["build", "test", "lint"],

@@ -5,7 +5,7 @@ Version: 1.0
 Date: 2026-07-03
 Author: Josep Lagunas
 
-This document is the canonical catalogue of SFP implementation decisions (ID-001 … ID-074). It is derived from the Master Architecture Specification and must not contradict it; where a decision and the MAS conflict, the MAS prevails. Each entry records context, decision, rationale, alternatives considered, consequences, references, and affected components. The final section lists Open Validation Items to close during implementation.
+This document is the canonical catalogue of SFP implementation decisions (ID-001 … ID-075). It is derived from the Master Architecture Specification and must not contradict it; where a decision and the MAS conflict, the MAS prevails. Each entry records context, decision, rationale, alternatives considered, consequences, references, and affected components. The final section lists Open Validation Items to close during implementation.
 
 ---
 
@@ -2697,6 +2697,65 @@ MAS §4 (durable business facts), §4.10 (idempotency), §6.9 (CodingJob), §9.6
 
 ### Affected Components
 Workspace Worker (Execution Coordinator, Repository Execution, Agent Runtime), CodingJob aggregate, Workspace Worker persistence (job stage-state).
+
+---
+
+## ID-075
+
+### Title
+PRSpec Packing for Mechanical Ticket Optimization (1 PRSpec -> N Tickets)
+
+### Status
+Accepted
+
+### Context
+Dogfood evidence (SFP-245, PR #146, 2026-08-29): the 5 remaining emitter tickets (SFP-153..157 — mechanical clones of the already-landed SFP-152 template) were manually grouped into one PRSpec / one CodingJob / one PR. Result: ~36 minutes end-to-end versus ~3 hours estimated for 5 separate pipelines, all gates passed first try, clean review. Note: the measured saving combines packing WITH effort-low (both levers ran together); packing alone removes the N × fixed-stage cost (~10-20 min per clone).
+
+The architecture until now assumed 1 Ticket = 1 PRSpec = 1 PR (MAS §6.9, ID-021), so that grouping was an off-contract manual action. This decision formalizes PRSpec Packing — documentation (this ADR, the MAS relaxation) and contract preparation (the `PrSpec.satisfies_tickets` auditability link) only; the runtime packer policy is a named future follow-up, deliberately out of scope here.
+
+### Decision
+
+**(a) Decouple the Business Unit from the Execution Unit.** The Ticket is the business unit; the PRSpecification is the execution unit. A PRSpecification may satisfy 1 or N Tickets. A single CodingJob and a single PR are generated for the pack.
+
+**(b) WHO groups.** The PLANNER performs packing: it sees all READY tickets and is the only stage positioned to judge mechanical identity against declared ticket properties. The admission layer (SFP-145) then admits the resulting job as one unit. Decided here deliberately — no ambiguity is left for later tickets.
+
+**(c) PACKING GUARD (the core safety rule).** Packing is allowed ONLY when ALL of the following hold, verified deterministically against *declared* ticket properties — never by Planner judgment:
+
+1. **Same ValidationProfile:** every ticket in the pack shares the same ValidationProfile.
+2. **Declared mechanical identity:** the tickets are mechanically identical — the same files-to-modify pattern family / the same template, as declared in their specifications. This is a declarative criterion the future packer checks, not an LLM's "these look similar."
+3. **No intra-pack or circular dependencies:** each ticket's declared dependencies exclude the other members of the pack.
+4. **Pack size within a policy limit:** v0 limit N ≤ 8. The limit is a named constant in the future packer policy, cited here.
+
+A pack failing ANY check MUST NOT be packed — the guard **fails closed** to individual PRSpecs. There is never a best-effort partial pack.
+
+**(d) Merge semantics.** Upon PR merge, the Orchestrator emits N `TicketUpdated` events (all N tickets transition to COMPLETED) and records ONE `WorkflowDecision` referencing all N tickets.
+
+**(e) Consequences.**
+- Positive: removes the N × fixed pipeline cost for clones (measured, SFP-245).
+- Negative (i) — one review covers N tickets: review quality depends on the guard above, and PR-size policies must stay strict.
+- Negative (ii) — a rework loop on a packed PR blocks all N tickets together. The cost of a bad pack is N contaminated tickets, which is exactly why the guard is deterministic and fail-closed.
+
+**(f) Precedent note.** This is the FIRST ADR that RELAXES an existing MAS invariant (the 1:1 ticket-spec rule). It sets the norm explicitly: invariant relaxations require dogfood evidence — measured, not projections. This one cites SFP-245.
+
+### Rationale
+Cloning tickets to template work multiplies fixed pipeline stages (planning, readiness, coding-job admission, review, merge bookkeeping) without adding information. Measured evidence shows the saving is real; the risk — one review and one rework loop covering N tickets — is contained by making the guard deterministic, declarative, and fail-closed, so a pack exists only when it is provably mechanical. Requiring `satisfies_tickets` on the contract keeps every PR traceable to exactly the tickets it satisfies, preserving auditability (ID-021, ID-066) after the 1:1 assumption is gone.
+
+### Alternatives Considered
+- **Keep 1:1 strictly and optimize pipeline cost per job:** rejected; the fixed per-pipeline cost dominates for clones, and the measured evidence (SFP-245) shows packing is safe under a deterministic guard.
+- **Planner packs by judgment ("these look similar"):** rejected; non-deterministic, unauditable, and impossible to gate — the guard must check declared properties.
+- **The admission layer (SFP-145) performs packing:** rejected; it sees one candidate job, not all READY tickets, and cannot judge mechanical identity across tickets.
+- **Best-effort partial packs (pack what passes, split the rest):** rejected; partial packs are unpredictable to review and rework, and contradict the fail-closed principle.
+- **Optional `satisfies_tickets` with a 1:1 fallback:** rejected; explicit beats implicit — an inferred ticket link is unauditable, and there is no legacy data to migrate.
+
+### Consequences
+Positive: removes N × fixed pipeline cost for clones (measured); one PR/branch/review per pack; the `satisfies_tickets` link keeps PR→ticket traceability exact.
+Negative: one review covers N tickets (review quality depends on the guard; PR-size policies must stay strict); a rework loop on a packed PR blocks all N tickets (the cost of a bad pack is N contaminated tickets — hence the deterministic, fail-closed guard); the future packer policy implementation (the guard checks and the named N ≤ 8 constant) is a required follow-up ticket before runtime packing goes live.
+
+### References
+SFP-245 (dogfood evidence, PR #146). Master Architecture Specification §6.9 (PRSpecification Packing rule, MAS 0.1.4). ID-021 (PRSpec contract), ID-066 (planner output).
+
+### Affected Components
+docs (this catalogue; MAS §6.9 + version 0.1.4), sfp-contracts (`PrSpec.satisfies_tickets`, SFP-246). Runtime (Orchestrator packer/admission, per-ticket completion fan-out) is a named future follow-up — untouched by this decision's implementation.
 
 ---
 
