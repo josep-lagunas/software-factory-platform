@@ -10,6 +10,12 @@ The eight emitters complete the command catalogue (ID-031 / SFP-219):
 ``EXECUTE_CODING_JOB`` (SFP-152) plus its seven siblings (SFP-245) — review,
 synchronize, merge, user-input, notify, and the two cancels.
 
+The :class:`~orchestrator.application.planner_host.PlannerHost` (SFP-150) is
+the same shape on the agent side: pure hosting glue that runs the Planner
+through the injected runtime seam, validates its output into the
+``PlannerOutput`` contract, and persists through an injected callable before
+returning.
+
 ``ReadinessGateHost`` (SFP-149) is the orchestrator-side hosting of the
 Readiness Gate: it runs the layer-2 model evaluation through the injected
 AgentRuntime seam and routes exhaustively on the verdict, ahead of planning.
@@ -31,21 +37,30 @@ from orchestrator.application.command_emitters import (
     ReviewPullRequestEmitter,
     SynchronizePullRequestEmitter,
 )
+from orchestrator.application.context_resolver_host import (
+    ContextResolverHost,
+    MissingContextError,
+)
 from orchestrator.application.decision_recorder import (
     DecisionRecorder,
     TicketWorkflowAggregate,
 )
+from orchestrator.application.planner_host import PlannerHost, PlannerOutputInvalid
 from orchestrator.application.readiness_host import ReadinessGateHost
 
 __all__ = [
     "CancelCodingJobEmitter",
     "CancelReviewJobEmitter",
+    "ContextResolverHost",
     "DecisionRecorder",
     "ExecuteCodingJobEmitter",
+    "MissingContextError",
     "NotifyUserEmitter",
+    "PlannerHost",
+    "PlannerOutputInvalid",
+    "ReadinessGateHost",
     "RequestMergeEmitter",
     "RequestUserInputEmitter",
-    "ReadinessGateHost",
     "ReviewPullRequestEmitter",
     "SynchronizePullRequestEmitter",
     "TicketWorkflowAggregate",

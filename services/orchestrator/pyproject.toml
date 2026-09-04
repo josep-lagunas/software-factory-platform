@@ -10,6 +10,7 @@ dependencies = [
     "sfp-contracts",
     "sfp-messaging",
     "sfp-agent-runtime",
+    "sfp-config",
 ]
 
 [build-system]
@@ -27,6 +28,10 @@ build-backend = "hatchling.build"
 sfp-contracts = { workspace = true }
 sfp-messaging = { workspace = true }
 sfp-agent-runtime = { workspace = true }
+# sfp-config: SecretRef (sfp_config.secrets) is the host's runtime import;
+# the structural provider-signature test imports sfp_config.LocalSecretProvider
+# (SFP-151).
+sfp-config = { workspace = true }
 
 [tool.coverage.run]
 omit = ['*/migrations/env.py']
