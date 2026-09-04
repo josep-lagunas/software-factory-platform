@@ -37,6 +37,10 @@ from orchestrator.application.command_emitters import (
     ReviewPullRequestEmitter,
     SynchronizePullRequestEmitter,
 )
+from orchestrator.application.context_resolver_host import (
+    ContextResolverHost,
+    MissingContextError,
+)
 from orchestrator.application.decision_recorder import (
     DecisionRecorder,
     TicketWorkflowAggregate,
@@ -47,8 +51,10 @@ from orchestrator.application.readiness_host import ReadinessGateHost
 __all__ = [
     "CancelCodingJobEmitter",
     "CancelReviewJobEmitter",
+    "ContextResolverHost",
     "DecisionRecorder",
     "ExecuteCodingJobEmitter",
+    "MissingContextError",
     "NotifyUserEmitter",
     "PlannerHost",
     "PlannerOutputInvalid",
