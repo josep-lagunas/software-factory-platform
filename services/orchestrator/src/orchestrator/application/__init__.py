@@ -13,6 +13,12 @@ synchronize, merge, user-input, notify, and the two cancels.
 ``ReadinessGateHost`` (SFP-149) is the orchestrator-side hosting of the
 Readiness Gate: it runs the layer-2 model evaluation through the injected
 AgentRuntime seam and routes exhaustively on the verdict, ahead of planning.
+
+The layer also owns the first concrete decision sink: the durable
+:class:`~orchestrator.application.decision_recorder.DecisionRecorder`
+(SFP-148), which persists every engine-produced
+:class:`~orchestrator.domain.workflow.state_machine.WorkflowDecision`
+append-only behind the SFP-147 aggregate boundary.
 """
 
 from orchestrator.application.command_emitters import (
@@ -25,11 +31,16 @@ from orchestrator.application.command_emitters import (
     ReviewPullRequestEmitter,
     SynchronizePullRequestEmitter,
 )
+from orchestrator.application.decision_recorder import (
+    DecisionRecorder,
+    TicketWorkflowAggregate,
+)
 from orchestrator.application.readiness_host import ReadinessGateHost
 
 __all__ = [
     "CancelCodingJobEmitter",
     "CancelReviewJobEmitter",
+    "DecisionRecorder",
     "ExecuteCodingJobEmitter",
     "NotifyUserEmitter",
     "RequestMergeEmitter",
@@ -37,4 +48,5 @@ __all__ = [
     "ReadinessGateHost",
     "ReviewPullRequestEmitter",
     "SynchronizePullRequestEmitter",
+    "TicketWorkflowAggregate",
 ]

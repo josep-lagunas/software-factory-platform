@@ -41,6 +41,7 @@ _VALID_PRSPEC: dict[str, Any] = {
     "out_of_scope": ["Reviewer agent"],
     "acceptance_criteria": ["code() returns a CoderOutput"],
     "dependencies": [],
+    "satisfies_tickets": ["SFP-72"],
     "validation_profile": ValidationProfile.LEVEL_1_INTERNAL.value,
     "validation_profile_reason": "Pure workflow code.",
     "required_gates": ["ci", "unit"],

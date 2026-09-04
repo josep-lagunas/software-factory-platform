@@ -35,6 +35,7 @@ VALID_PRSPEC_KWARGS: dict[str, object] = {
         "Rejects payloads missing required fields",
     ],
     "dependencies": ["SFP-13"],
+    "satisfies_tickets": ["SFP-14"],
     "validation_profile": ValidationProfile.LEVEL_1_INTERNAL,
     "validation_profile_reason": "Contracts-only change with no runtime impact.",
     "required_gates": ["ci", "unit"],
@@ -72,6 +73,7 @@ def test_fully_populated_prspec_validates() -> None:
         "Rejects payloads missing required fields",
     ]
     assert spec.dependencies == ["SFP-13"]
+    assert spec.satisfies_tickets == ["SFP-14"]
     assert spec.validation_profile is ValidationProfile.LEVEL_1_INTERNAL
     assert spec.validation_profile_reason == "Contracts-only change with no runtime impact."
     assert spec.required_gates == ["ci", "unit"]
@@ -273,3 +275,65 @@ def test_default_empty_list_serializes_in_round_trip() -> None:
     assert payload["pr_specs"][0]["deferred_fk_obligations"] == []
     restored = PlannerOutput.from_json(json.dumps(payload))
     assert restored.pr_specs[0].deferred_fk_obligations == []
+
+
+# --- (i) satisfies_tickets (ID-075 PRSpec Packing) -----------------------------
+#
+# The link that makes a packed PR auditable: each entry is a ticket key the
+# PRSpec fully satisfies. Required (min_length=1) — len == 1 preserves the old
+# 1:1 semantics; len == N is a pack under the ID-075 guard.
+
+
+def test_satisfies_tickets_two_ticket_pack_validates() -> None:
+    """(i) A packed PrSpec satisfying two tickets validates and round-trips."""
+    spec = make_prspec(id="PR-1", satisfies_tickets=["SFP-1", "SFP-2"])
+    output = make_output([spec])
+    assert output.pr_specs[0].satisfies_tickets == ["SFP-1", "SFP-2"]
+    restored = PlannerOutput.from_json(output.to_json())
+    assert restored == output
+    assert restored.pr_specs[0].satisfies_tickets == ["SFP-1", "SFP-2"]
+
+
+def test_satisfies_tickets_single_ticket_validates() -> None:
+    """(i) A single-ticket PrSpec (len == 1, old 1:1 semantics) validates."""
+    spec = make_prspec()
+    assert spec.satisfies_tickets == ["SFP-14"]
+    restored = PlannerOutput.from_json(make_output([spec]).to_json())
+    assert restored.pr_specs[0].satisfies_tickets == ["SFP-14"]
+
+
+def test_satisfies_tickets_missing_rejected() -> None:
+    """(i) satisfies_tickets is required — omitting it is a ValidationError."""
+    kwargs = {k: v for k, v in VALID_PRSPEC_KWARGS.items() if k != "satisfies_tickets"}
+    with pytest.raises(ValidationError):
+        PrSpec(**kwargs)
+
+
+def test_satisfies_tickets_empty_list_rejected() -> None:
+    """(i) An empty satisfies_tickets list is rejected (min_length=1)."""
+    with pytest.raises(ValidationError):
+        make_prspec(satisfies_tickets=[])
+
+
+def test_satisfies_tickets_empty_list_rejected_on_from_json() -> None:
+    """(i) An empty satisfies_tickets list is rejected on deserialize."""
+    payload = json.loads(make_output().to_json())
+    payload["pr_specs"][0]["satisfies_tickets"] = []
+    with pytest.raises(ValidationError):
+        PlannerOutput.from_json(json.dumps(payload))
+
+
+def test_satisfies_tickets_missing_rejected_on_from_json() -> None:
+    """(i) A payload omitting satisfies_tickets is rejected on deserialize."""
+    payload = json.loads(make_output().to_json())
+    del payload["pr_specs"][0]["satisfies_tickets"]
+    with pytest.raises(ValidationError):
+        PlannerOutput.from_json(json.dumps(payload))
+
+
+def test_satisfies_tickets_is_part_of_unknown_field_rejection() -> None:
+    """(i) extra='forbid' stays intact: unknown fields are still rejected."""
+    payload = json.loads(make_output().to_json())
+    payload["pr_specs"][0]["satisfies_tickets_extra"] = ["SFP-9"]
+    with pytest.raises(ValidationError):
+        PlannerOutput.from_json(json.dumps(payload))
