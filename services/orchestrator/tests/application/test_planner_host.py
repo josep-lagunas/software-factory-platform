@@ -47,6 +47,7 @@ _VALID_RAW: dict[str, Any] = {
             "out_of_scope": ["prompt design"],
             "acceptance_criteria": ["valid output returned"],
             "dependencies": ["sfp-contracts"],
+            "satisfies_tickets": ["SFP-150"],
             "validation_profile": "LEVEL_1_INTERNAL",
             "validation_profile_reason": "Internal application module.",
             "required_gates": ["pytest"],
