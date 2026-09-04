@@ -9,6 +9,12 @@ decisions.
 The eight emitters complete the command catalogue (ID-031 / SFP-219):
 ``EXECUTE_CODING_JOB`` (SFP-152) plus its seven siblings (SFP-245) — review,
 synchronize, merge, user-input, notify, and the two cancels.
+
+The :class:`~orchestrator.application.planner_host.PlannerHost` (SFP-150) is
+the same shape on the agent side: pure hosting glue that runs the Planner
+through the injected runtime seam, validates its output into the
+``PlannerOutput`` contract, and persists through an injected callable before
+returning.
 """
 
 from orchestrator.application.command_emitters import (
@@ -21,12 +27,15 @@ from orchestrator.application.command_emitters import (
     ReviewPullRequestEmitter,
     SynchronizePullRequestEmitter,
 )
+from orchestrator.application.planner_host import PlannerHost, PlannerOutputInvalid
 
 __all__ = [
     "CancelCodingJobEmitter",
     "CancelReviewJobEmitter",
     "ExecuteCodingJobEmitter",
     "NotifyUserEmitter",
+    "PlannerHost",
+    "PlannerOutputInvalid",
     "RequestMergeEmitter",
     "RequestUserInputEmitter",
     "ReviewPullRequestEmitter",
