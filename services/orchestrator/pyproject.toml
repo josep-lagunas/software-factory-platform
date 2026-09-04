@@ -9,6 +9,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "sfp-contracts",
     "sfp-messaging",
+    "sfp-agent-runtime",
 ]
 
 [build-system]
@@ -19,9 +20,13 @@ build-backend = "hatchling.build"
 # sfp-contracts: WorkflowUpdated event + envelopes (SFP-137 publishing wrapper).
 # sfp-messaging: the MessageBus interface seam (DOC#42; in-memory transport
 # today per the software-first owner decision, SFP-101 re-plumbs later).
+# sfp-agent-runtime: the vendor-neutral AgentRuntime / PromptProvider Protocol
+# seam (SFP-149 — the ReadinessGateHost runs the L2 model through it; the
+# orchestrator never imports a vendor SDK above this seam, AP-010 / MAS §9.6).
 [tool.uv.sources]
 sfp-contracts = { workspace = true }
 sfp-messaging = { workspace = true }
+sfp-agent-runtime = { workspace = true }
 
 [tool.coverage.run]
 omit = ['*/migrations/env.py']
