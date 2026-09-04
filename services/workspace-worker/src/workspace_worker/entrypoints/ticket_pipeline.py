@@ -83,6 +83,16 @@ from workspace_worker.agents.coder import code
 from workspace_worker.agents.planner import plan
 from workspace_worker.agents.reviewer import review
 from workspace_worker.agents.test_designer import design_tests
+
+# SFP-248 — deterministic diff-surface test scoping for the Coder's INTERNAL
+# cycles. Re-exported from this entrypoint so the Coder prompt can point at ONE
+# import site (the pipeline module it already knows); the rule lives as
+# data + code in the helper — never as prompt prose. Thin path per PRSpec.
+from workspace_worker.entrypoints.test_scoping import (  # noqa: E402 — one documented import block after the workspace_worker.* block
+    IMPORTER_MAP,
+    TestScope,
+    compute_test_scope,
+)
 from workspace_worker.exec.build import Runner
 from workspace_worker.exec.build import build as _run_build
 from workspace_worker.exec.lint import lint as _run_lint
@@ -98,9 +108,12 @@ from workspace_worker.workflow.frontier import compute_at_frontier
 from workspace_worker.workflow.readiness_gate import evaluate_readiness
 
 __all__ = [
+    "IMPORTER_MAP",
     "PipelineDeps",
     "PipelineResult",
+    "TestScope",
     "build",
+    "compute_test_scope",
     "effective_review_state",
     "main",
     "run_pipeline",
