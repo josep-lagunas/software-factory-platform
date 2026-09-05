@@ -1026,6 +1026,11 @@ def run_pipeline(
     #     malformed twice raises ReviewerMalfunctionError, an infra abort
     #     distinct from a code verdict.
     trace.append("review")
+
+    def _comment_malfunction(body: str) -> None:
+        trace.append("reviewer_adapter.add_pr_comment")
+        reviewer_adapter.add_pr_comment(owner, repo_name, pr.number, body=body)
+
     review_output: ReviewerOutput = _review_with_malfunction_guard(
         pr_spec=pr_spec,
         coder_output=coder_output,
@@ -1033,10 +1038,7 @@ def run_pipeline(
         runtime=runtimes["reviewer"],
         prompt_provider=prompt_provider,
         ticket_key=ticket_key,
-        on_malfunction=lambda body: (
-            trace.append("reviewer_adapter.add_pr_comment"),
-            reviewer_adapter.add_pr_comment(owner, repo_name, pr.number, body=body),
-        ),
+        on_malfunction=_comment_malfunction,
     )
 
     # RESOLUTION 1: branch on review_status (no `event` field on ReviewerOutput).
@@ -1089,10 +1091,7 @@ def run_pipeline(
             runtime=runtimes["reviewer"],
             prompt_provider=prompt_provider,
             ticket_key=ticket_key,
-            on_malfunction=lambda body: (
-                trace.append("reviewer_adapter.add_pr_comment"),
-                reviewer_adapter.add_pr_comment(owner, repo_name, pr.number, body=body),
-            ),
+            on_malfunction=_comment_malfunction,
         )
         event = (
             "APPROVE" if review_output.review_status is ReviewStatus.APPROVED else "REQUEST_CHANGES"
