@@ -81,7 +81,7 @@ from workspace_worker.agent_runtime.model_config import AgentModelConfig
 from workspace_worker.agent_runtime.runtime import ClaudeAgentRuntime
 from workspace_worker.agents.coder import code
 from workspace_worker.agents.planner import plan
-from workspace_worker.agents.reviewer import review
+from workspace_worker.agents.reviewer import review_with_text
 from workspace_worker.agents.test_designer import design_tests
 
 # SFP-248 — deterministic diff-surface test scoping for the Coder's INTERNAL
@@ -111,10 +111,13 @@ __all__ = [
     "IMPORTER_MAP",
     "PipelineDeps",
     "PipelineResult",
+    "REVIEWER_MALFUNCTION_COMMENT",
+    "REVIEWER_MALFUNCTION_ERROR",
     "TestScope",
     "build",
     "compute_test_scope",
     "effective_review_state",
+    "is_malformed_rationale",
     "main",
     "run_pipeline",
     "verify_branch_commits",
@@ -531,6 +534,250 @@ def effective_review_state(reviews: Sequence[PullRequestReview], head_sha: str) 
     return effective
 
 
+# ---------------------------------------------------------------------------
+# Reviewer rationale surfacing + REVIEWER_MALFUNCTION guard (SFP-249)
+# ---------------------------------------------------------------------------
+
+#: SFP-249 — the differentiated abort message for a double reviewer
+#: malfunction. Deliberately distinct from the ``"review not approved: ..."``
+#: family (tests assert the difference) so an operator reading a failed run
+#: can never misread an infrastructure failure as a code rejection (the
+#: SFP-248/PR #153 pattern, automated; MAS §8.8: a malfunction is a recorded
+#: fact, not a silent skip).
+REVIEWER_MALFUNCTION_ERROR = (
+    "reviewer malfunction: verdict without rationale twice (infra issue, not code issue)"
+)
+
+#: SFP-249 — the body of the conversation comment posted when a verdict comes
+#: back malformed. Notes the malfunction AND that the review was retried — it
+#: is a PR conversation comment, never a review verdict.
+REVIEWER_MALFUNCTION_COMMENT = (
+    "⚠️ Reviewer malfunction: the reviewer returned a verdict without a textual "
+    "rationale (an infra issue with the reviewer, NOT a code verdict). The review "
+    "was re-run once and came back malformed again."
+)
+
+
+def is_malformed_rationale(rationale_source: str | None) -> bool:
+    """Whether a review verdict's rationale is a REVIEWER_MALFUNCTION (SFP-249).
+
+    The rationale is the reviewer's ``final_text`` — the textual rationale the
+    runtime transports alongside the structured verdict. A rationale that is
+    empty after strip is a malfunction on EVERY status — including
+    ``APPROVED``: an empty-rationale approval is exactly as untrustworthy as an
+    empty-rationale rejection, and both mean the reviewer itself malfunctioned
+    rather than judged the code.
+
+    Pure/deterministic: a function of the rationale text alone (no network, no
+    clock, no verdict dependency — the same empty text classifies as malformed
+    for every status).
+
+    Args:
+        rationale_source: The reviewer's final textual rationale
+            (``AgentRunResult.final_text``), or ``None`` when the runtime
+            captured no final text.
+
+    Returns:
+        ``True`` when the rationale strips to empty (malfunction).
+    """
+    return not (rationale_source or "").strip()
+
+
+def _review_body(review_status: ReviewStatus, final_text: str | None) -> str:
+    """Compose the GitHub review body: status-word prefix + rationale (SFP-249).
+
+    Deterministic — no model prose beyond the reviewer's own recorded final
+    text, no clock. The status word is the verdict prefix; the rationale is the
+    reviewer's final text. Falls back to the BARE status word ONLY when the
+    final text is empty/``None`` (the malformed case never reaches a verdict
+    submission — the guard re-runs or aborts first — so in practice a submitted
+    body always carries both).
+
+    Args:
+        review_status: The verdict whose status word prefixes the body.
+        final_text: The reviewer's final textual rationale (may be ``None``).
+
+    Returns:
+        ``"<STATUS>: <rationale>"`` when a rationale exists; the bare status
+        word otherwise.
+    """
+    status = review_status.value
+    text = (final_text or "").strip()
+    if not text:
+        return status
+    return f"{status}: {text}"
+
+
+def _guarded_review(
+    *,
+    pr_spec: PrSpec,
+    coder_output: CoderOutput,
+    resolved: ResolvedContext,
+    runtime: AgentRuntime,
+    prompt_provider: PromptProvider,
+    ticket_key: str,
+    on_malfunction: Callable[[str], None] | None = None,
+) -> tuple[ReviewerOutput, str | None]:
+    """Run a review; re-run it ONCE if the verdict's rationale is malformed.
+
+    SFP-249 guard around the reviewer seam, shared by BOTH review sites (the
+    primary review ~step 15 and the SFP-241 pre-merge re-review):
+
+    * first verdict malformed (empty rationale after strip on ANY status,
+      including ``APPROVED``) → re-run the SAME review call once — same seam
+      (``runtime``), same inputs (``pr_spec`` / ``coder_output`` /
+      ``resolved`` / prompt / ticket), so the reviewer's ``max_turns`` ceiling
+      applies exactly as on the first attempt (MAS §12.7 determinism — the
+      retry re-prompts with identical inputs, never fresh ones);
+    * a valid retry verdict is returned and acts normally downstream
+      (``APPROVED`` proceeds toward the merge path;
+      ``CHANGES_REQUESTED``/``BLOCKED``-with-rationale aborts as a standard
+      code rejection — a real rejection) — no comment is posted for a
+      successful retry;
+    * malformed twice → notify via ``on_malfunction`` (the pipeline posts a
+      PR conversation COMMENT — never a review verdict) and raise
+      :class:`ReviewerMalfunctionError` carrying
+      :data:`REVIEWER_MALFUNCTION_ERROR` — a differentiated infra abort,
+      distinct from the ``"review not approved"`` code-verdict abort.
+
+    Exactly ONE retry — bounded and deterministic; no loops, no backoff.
+
+    The rationale is read from ``AgentRunResult.final_text`` — the runtime
+    transports the reviewer's final text alongside the structured verdict
+    (ID-021: contracts carry structured judgments only; the rationale lives on
+    GitHub, never in ``ReviewerOutput``).
+
+    Args:
+        on_malfunction: Optional sink invoked with
+            :data:`REVIEWER_MALFUNCTION_COMMENT` only when the verdict is
+            malformed TWICE — the pipeline uses it to post the conversation
+            comment alongside the differentiated abort. A valid retry posts
+            nothing: the retry's own verdict submission carries the outcome.
+
+    Returns:
+        ``(review_output, final_text)`` — the VALID verdict and its textual
+        rationale (``None`` only in the degenerate non-malformed-``None`` case
+        above).
+
+    Raises:
+        ReviewerMalfunctionError: when both attempts yield a malformed verdict.
+    """
+
+    def _run_once() -> tuple[ReviewerOutput, str | None]:
+        """One reviewer seam call: run + validate the output + capture the text.
+
+        The rationale check reads ``AgentRunResult.final_text`` BEFORE any
+        verdict is submitted to GitHub (the implementer's pre-submit option —
+        the validated fact is identical: the review carries non-empty textual
+        rationale). A run whose result carries NO final-text attribute at all
+        (a test fake predating SFP-249, or a non-Claude runtime) is treated as
+        ``None`` — malformed — which the guard then handles.
+        """
+        output, result_text = review_with_text(
+            pr_spec,
+            coder_output,
+            resolved,
+            runtime=runtime,
+            prompt_provider=prompt_provider,
+            ticket_id=ticket_key,
+        )
+        return output, result_text
+
+    review_output, final_text = _run_once()
+    if not is_malformed_rationale(final_text):
+        return review_output, final_text
+
+    _log.warning(
+        "reviewer returned a verdict without rationale (status=%s) — retrying review once",
+        review_output.review_status.value,
+    )
+    retry_output, retry_text = _run_once()
+    if not is_malformed_rationale(retry_text):
+        return retry_output, retry_text
+
+    _log.error("reviewer malfunction: verdict without rationale twice (infra issue)")
+    if on_malfunction is not None:
+        on_malfunction(REVIEWER_MALFUNCTION_COMMENT)
+    raise ReviewerMalfunctionError(REVIEWER_MALFUNCTION_ERROR)
+
+
+class ReviewerMalfunctionError(Exception):
+    """Raised when the reviewer returns a verdict without rationale TWICE (SFP-249).
+
+    A verdict whose textual rationale is empty on ANY status is a
+    REVIEWER_MALFUNCTION — an infrastructure issue with the reviewer itself,
+    never a judgment about the code. The pipeline re-runs the review once; a
+    second malformed verdict aborts with :data:`REVIEWER_MALFUNCTION_ERROR`,
+    whose message is deliberately distinct from the ``"review not approved"``
+    code-verdict abort so the two failure families cannot be confused
+    (MAS §8.8).
+    """
+
+
+def _review_or_abort(
+    *,
+    pr_spec: PrSpec,
+    coder_output: CoderOutput,
+    resolved: ResolvedContext,
+    runtime: AgentRuntime,
+    prompt_provider: PromptProvider,
+    ticket_key: str,
+    trace: list[str],
+    pr_number: int,
+    on_malfunction: Callable[[str], None] | None = None,
+) -> tuple[ReviewerOutput, str | None]:
+    """Run the guarded review, converting a double malfunction into an abort.
+
+    Thin loop-side wrapper over :func:`_guarded_review` (both call sites share
+    it): a double malfunction — which the guard signals by raising
+    :class:`ReviewerMalfunctionError` (the comment is posted by the guard just
+    before raising) — must surface as the pipeline's standard fail-fast abort
+    carrying the
+    DIFFERENTIATED error string, never as an escaped exception and never as a
+    ``"review not approved"`` code verdict.
+
+    Args:
+        trace: The run's trace (appended-to by ``on_malfunction``).
+        pr_number: The PR the review runs against (carried into the abort).
+        on_malfunction: Sinks the malfunction comment (posts the PR comment).
+
+    Returns:
+        ``(review_output, final_text)`` — the valid verdict + its rationale.
+
+    Raises:
+        _PipelineMalfunctionAbort: When the review comes back malformed twice —
+            the caller converts it into the pipeline's fail-fast abort.
+    """
+    try:
+        return _guarded_review(
+            pr_spec=pr_spec,
+            coder_output=coder_output,
+            resolved=resolved,
+            runtime=runtime,
+            prompt_provider=prompt_provider,
+            ticket_key=ticket_key,
+            on_malfunction=on_malfunction,
+        )
+    except ReviewerMalfunctionError as exc:
+        raise _PipelineMalfunctionAbort(trace, pr_number, str(exc)) from exc
+
+
+class _PipelineMalfunctionAbort(Exception):
+    """Internal control-flow signal: the loop must abort with this result.
+
+    Carries the partially-built abort (trace + pr_number + the differentiated
+    error). Raised by :func:`_review_or_abort`; caught exactly once at the top
+    of :func:`run_pipeline`'s review section boundary. Never escapes the module.
+    """
+
+    def __init__(self, trace: list[str], pr_number: int, error: str) -> None:
+        super().__init__(error)
+        self.trace = trace
+        self.pr_number = pr_number
+        self.error = error
+        self.result = _abort(trace, pr_number, error)
+
+
 def run_pipeline(
     ticket_key: str,
     *,
@@ -878,20 +1125,38 @@ def run_pipeline(
         body=body,
     )
 
-    # 15. Reviewer judges the PR.
-    trace.append("review")
-    review_output: ReviewerOutput = review(
-        pr_spec,
-        coder_output,
-        resolved,
-        runtime=runtimes["reviewer"],
-        prompt_provider=prompt_provider,
-        ticket_id=ticket_key,
-    )
+    # 15. Reviewer judges the PR. SFP-249: the seam is wrapped by the
+    #     malfunction guard — a malformed verdict (empty rationale on ANY
+    #     status, including APPROVED) triggers a PR conversation comment
+    #     (never a verdict) and the review is re-run ONCE; malformed twice
+    #     aborts with the differentiated REVIEWER_MALFUNCTION_ERROR (an infra
+    #     issue, never a code verdict).
+    def _comment_malfunction(body: str) -> None:
+        trace.append("reviewer_adapter.add_pr_comment")
+        reviewer_adapter.add_pr_comment(owner, repo_name, pr.number, body=body)
+
+    try:
+        review_output, reviewer_text = _review_or_abort(
+            pr_spec=pr_spec,
+            coder_output=coder_output,
+            resolved=resolved,
+            runtime=runtimes["reviewer"],
+            prompt_provider=prompt_provider,
+            ticket_key=ticket_key,
+            trace=trace,
+            pr_number=pr.number,
+            on_malfunction=_comment_malfunction,
+        )
+    except _PipelineMalfunctionAbort as abort:
+        # The differentiated infra abort (comment already posted by the guard).
+        return abort.result
 
     # RESOLUTION 1: branch on review_status (no `event` field on ReviewerOutput).
     # Map the verdict to the GitHub `event` string for submit_review, then merge
-    # + transition Done ONLY on APPROVED.
+    # + transition Done ONLY on APPROVED. SFP-249: the body carries the status
+    # word PLUS the reviewer's final text (rationale) — never the bare status
+    # word when a rationale exists.
+    trace.append("review")
     event = "APPROVE" if review_output.review_status is ReviewStatus.APPROVED else "REQUEST_CHANGES"
     trace.append("reviewer_adapter.submit_review")
     reviewer_adapter.submit_review(
@@ -899,7 +1164,7 @@ def run_pipeline(
         repo_name,
         pr.number,
         event=event,
-        body=review_output.review_status.value,
+        body=_review_body(review_output.review_status, reviewer_text),
     )
 
     if review_output.review_status is not ReviewStatus.APPROVED:
@@ -930,15 +1195,24 @@ def run_pipeline(
             state or "ABSENT",
             pr.head_sha,
         )
+        # SFP-249: the re-review site is guarded by the SAME malfunction guard
+        # as the primary review — same seam, same inputs, exactly one retry.
+        try:
+            review_output, reviewer_text = _review_or_abort(
+                pr_spec=pr_spec,
+                coder_output=coder_output,
+                resolved=resolved,
+                runtime=runtimes["reviewer"],
+                prompt_provider=prompt_provider,
+                ticket_key=ticket_key,
+                trace=trace,
+                pr_number=pr.number,
+                on_malfunction=_comment_malfunction,
+            )
+        except _PipelineMalfunctionAbort as abort:
+            # The differentiated infra abort (comment already posted).
+            return abort.result
         trace.append("review")
-        review_output = review(
-            pr_spec,
-            coder_output,
-            resolved,
-            runtime=runtimes["reviewer"],
-            prompt_provider=prompt_provider,
-            ticket_id=ticket_key,
-        )
         event = (
             "APPROVE" if review_output.review_status is ReviewStatus.APPROVED else "REQUEST_CHANGES"
         )
@@ -948,7 +1222,7 @@ def run_pipeline(
             repo_name,
             pr.number,
             event=event,
-            body=review_output.review_status.value,
+            body=_review_body(review_output.review_status, reviewer_text),
         )
 
         if review_output.review_status is not ReviewStatus.APPROVED:

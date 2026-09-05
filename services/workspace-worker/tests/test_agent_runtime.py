@@ -56,7 +56,8 @@ class FakeMessage:
     """Minimal stand-in for ``claude_agent_sdk.ResultMessage``.
 
     The adapter only inspects ``result``/``is_error``/``errors``/
-    ``api_error_status``, so a stand-in is sufficient and keeps this test module
+    ``api_error_status`` (plus ``structured_output`` for the SDK-enforced
+    output_format path), so a stand-in is sufficient and keeps this test module
     free of any ``claude_agent_sdk`` import (preserving the laziness invariant).
     """
 
@@ -64,6 +65,7 @@ class FakeMessage:
     is_error: bool = False
     errors: list[str] | None = None
     api_error_status: int | None = None
+    structured_output: Any = None
 
 
 @dataclass
@@ -228,6 +230,66 @@ def test_agent_and_ticket_id_come_from_request_not_output() -> None:
     assert res.agent == "planner"  # from request, NOT parsed "evil"
     assert res.ticket_id == "SFP-99"
     assert res.output == {"answer": "x", "agent": "evil"}
+
+
+# --------------------------------------------------------------------------- #
+# SFP-249 — final_text population / passthrough
+# --------------------------------------------------------------------------- #
+
+
+def test_final_text_populated_from_result_message_text() -> None:
+    """SFP-249: on the text path the runtime populates ``final_text`` verbatim
+    from the captured ``ResultMessage.result`` string."""
+    raw = '```json\n{"answer": "x"}\n```'
+    qfn = FakeQuery(outcomes=[[FakeMessage(result=raw)]])
+    rt = make_runtime(qfn)
+
+    res = rt.run(request(agent="reviewer"))
+
+    assert res.success is True
+    assert res.output == {"answer": "x"}
+    assert res.final_text == raw
+
+
+def test_final_text_preserved_verbatim_not_json_stripped() -> None:
+    """SFP-249: ``final_text`` is the RAW result text — the fence-stripping the
+    runtime applies to parse JSON must NOT leak into the transport field."""
+    raw = '```json\n{"answer": "x"}\n```'
+    qfn = FakeQuery(outcomes=[[FakeMessage(result=raw)]])
+    rt = make_runtime(qfn)
+
+    res = rt.run(request())
+
+    assert res.success is True
+    assert res.output == {"answer": "x"}  # parsed (fences stripped) …
+    assert res.final_text == raw  # … but the transport text is untouched
+
+
+def test_final_text_none_when_structured_output_only() -> None:
+    """SFP-249: when the SDK enforced output_format (``structured_output``
+    present, ``result`` absent/None) the runtime keeps ``final_text`` None —
+    None-preserving, never coerced to an empty string."""
+    qfn = FakeQuery(
+        outcomes=[[FakeMessage(result=None, structured_output={"answer": "structured"})]]
+    )
+    rt = make_runtime(qfn)
+
+    res = rt.run(request())
+
+    assert res.success is True
+    assert res.output == {"answer": "structured"}
+    assert res.final_text is None
+
+
+def test_final_text_none_on_failure() -> None:
+    """SFP-249: a failed run never carries a final_text."""
+    qfn = FakeQuery(outcomes=[[FakeMessage(result='{"unexpected": 1}')]])
+    rt = make_runtime(qfn)
+
+    res = rt.run(request())
+
+    assert res.success is False
+    assert res.final_text is None
 
 
 # --------------------------------------------------------------------------- #

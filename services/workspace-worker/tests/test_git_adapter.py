@@ -21,6 +21,7 @@ from workspace_worker.repo.git.adapter import (
     GitProviderAdapterError,
     GitPushResult,
     GitSyncResult,
+    PrCommentResult,
     PullRequestResult,
     PullRequestReview,
     ReviewResult,
@@ -1423,6 +1424,106 @@ def test_submit_review_result_fields_come_from_response() -> None:
 
     assert result.review_id == 12345
     assert result.state == "CHANGES_REQUESTED"
+
+
+# ---------------------------------------------------------------------------
+# add_pr_comment (SFP-249) — PR conversation comment via the ISSUE-comment
+# endpoint (POST /repos/{owner}/{repo}/issues/{number}/comments) — never a
+# review verdict.
+# ---------------------------------------------------------------------------
+
+COMMENT_ID = 4242
+COMMENT_BODY = "⚠️ Reviewer malfunction: verdict without rationale twice."
+
+
+def test_add_pr_comment_posts_to_issue_comment_endpoint_with_bearer() -> None:
+    # POST /repos/{owner}/{repo}/issues/{n}/comments with {body} + bearer; the
+    # result is parsed from the response JSON (parse-not-echo).
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.method == "POST"
+        assert request.url.path == f"/repos/{OWNER}/{REPO}/issues/{PR_NUMBER}/comments"
+        assert request.headers.get("authorization") == f"Bearer {TOKEN}"
+        assert json.loads(request.content) == {"body": COMMENT_BODY}
+        return httpx.Response(201, json={"id": COMMENT_ID})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.add_pr_comment(OWNER, REPO, PR_NUMBER, body=COMMENT_BODY)
+
+    assert result == PrCommentResult(
+        owner=OWNER, repo=REPO, number=PR_NUMBER, comment_id=COMMENT_ID
+    )
+    assert len(seen) == 1
+
+
+def test_add_pr_comment_result_fields_come_from_response() -> None:
+    # Parse-not-echo: comment_id comes from the response JSON, not inferred
+    # from the inputs (the response id deliberately differs).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json={"id": 987654})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.add_pr_comment(OWNER, REPO, PR_NUMBER, body=COMMENT_BODY)
+
+    assert result.comment_id == 987654
+    assert result.owner == OWNER
+    assert result.repo == REPO
+    assert result.number == PR_NUMBER
+
+
+def test_add_pr_comment_retries_transient_500_then_succeeds() -> None:
+    # The tenacity retry covers {429,500,502,503,504} + network errors — the
+    # issue-comment POST retries exactly like every adapter method.
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries < 3:
+            return httpx.Response(500, json={"message": "server error"})
+        return httpx.Response(201, json={"id": COMMENT_ID})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    adapter.add_pr_comment(OWNER, REPO, PR_NUMBER, body=COMMENT_BODY)
+
+    assert tries == 3
+
+
+def test_add_pr_comment_no_retry_on_404_raises_adapter_error() -> None:
+    # 404 is not in the retry set — a single attempt, then a redacted
+    # GitProviderAdapterError.
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="add PR comment"):
+        adapter.add_pr_comment(OWNER, REPO, PR_NUMBER, body=COMMENT_BODY)
+
+    assert tries == 1
+
+
+def test_add_pr_comment_validates_inputs_before_any_network_call() -> None:
+    # ValueError for empty owner/repo/body or number < 1 — raised BEFORE any
+    # request is issued.
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("no request may be issued on invalid inputs")
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    for kwargs in (
+        {"owner": "", "repo": REPO, "body": "x"},
+        {"owner": OWNER, "repo": "", "body": "x"},
+        {"owner": OWNER, "repo": REPO, "body": ""},
+    ):
+        with pytest.raises(ValueError):
+            adapter.add_pr_comment(kwargs["owner"], kwargs["repo"], PR_NUMBER, body=kwargs["body"])
+    with pytest.raises(ValueError):
+        adapter.add_pr_comment(OWNER, REPO, 0, body="x")
 
 
 # ---------------------------------------------------------------------------
