@@ -345,11 +345,16 @@ class ClaudeAgentRuntime:
 
         # 7. Success — agent/ticket_id come from the REQUEST, never parsed
         #    output (anti-spoof). ``output`` is the raw parsed JSON.
+        #    SFP-249: ``final_text`` transports the captured ResultMessage
+        #    result text (None-preserving when absent/None) for
+        #    human-readable surfaces; ``output`` stays the only decision field.
+        final_text = result_text if isinstance(result_text, str) else None
         return AgentRunResult(
             agent=request.agent,
             ticket_id=request.ticket_id,
             success=True,
             output=parsed,
+            final_text=final_text,
         )
 
     async def _consume_stream(
