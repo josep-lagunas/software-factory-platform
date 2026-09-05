@@ -17,12 +17,30 @@ Security model — the token never lands on disk:
   token to disk" on every code path.
 * The token is redacted from any error message surfaced by this module.
 
-Idempotent: a second call against an existing, *valid* clone is a no-op and
-returns ``cloned=False``. The reuse path validates the cache entry with
-``git rev-parse --git-dir`` (SFP-239): a hollow/corrupt cached clone (directory
-present, ``.git`` purged or unusable) is treated as a cache miss — removed and
-re-cloned — instead of failing downstream with git's raw ``fatal: not a git
-repository``.
+Idempotent: a second call against an existing, *valid* clone returns
+``cloned=False`` — but no longer blindly. The reuse path first validates the
+cache entry with ``git rev-parse --git-dir`` (SFP-239): a hollow/corrupt cached
+clone (directory present, ``.git`` purged or unusable) is treated as a cache
+miss — removed and re-cloned — instead of failing downstream with git's raw
+``fatal: not a git repository``.
+
+Cache refresh on the fast-path (SFP-250): a healthy cache entry is not
+necessarily a *fresh* one. The cached clone is only ever advanced at the
+tip the last run fetched — if origin has moved on since, every worktree cut
+from the cache starts from a stale base (the 2026-09-04 SFP-149/150 stale-base
+incident). So the fast-path refreshes the cache from origin before returning
+``cloned=False``:
+
+* one-shot authenticated ``git fetch <authed_url>`` — the token lives only on
+  the argv (mirrors :meth:`push`/:meth:`sync_base`); the on-disk ``origin`` is
+  never rewritten and stays token-free;
+* ``git merge --ff-only FETCH_HEAD`` advances the checked-out branch to the
+  remote tip. Fast-forward-only: a diverged cache HEAD is never merged — it
+  routes to the SFP-239 corrupt-entry policy (remove + re-clone);
+* fetch failure is FAIL-OPEN by design: a warning naming the cached HEAD sha
+  is logged and the run proceeds on the stale cache. ``sync_base`` (SFP-240)
+  remains the definitive conflict gate, so a stale cache degrades freshness,
+  never correctness.
 
 This is the *clone* + *push* + *base-sync* slice. Worktree lifecycle (SFP-39)
 and cleanup live in sibling modules. The token reaches this module already
@@ -43,6 +61,7 @@ from urllib.parse import urlsplit, urlunsplit
 __all__ = [
     "BaseSyncConflictError",
     "BaseSyncResult",
+    "CacheRefreshDiverged",
     "CloneResult",
     "PushResult",
     "RepoManager",
@@ -50,8 +69,6 @@ __all__ = [
 ]
 
 from workspace_worker.repo._validation import is_valid_git_repo, remove_path
-
-__all__ = ["CloneResult", "PushResult", "RepoManager", "RepoManagerError"]
 
 #: Module logger — cache-recovery events land here for ops observability.
 _log = logging.getLogger(__name__)
@@ -85,6 +102,23 @@ class RepoManagerError(RuntimeError):
 
     The token is guaranteed absent from the message (see :func:`_redact`).
     """
+
+
+class CacheRefreshDiverged(Exception):
+    """Signalled by the cache refresh when the cached HEAD is not a
+    fast-forward from origin's tip (SFP-250).
+
+    Not a user-facing error — an internal control-flow token between
+    :meth:`RepoManager._refresh_cached_clone` and :meth:`RepoManager.clone`.
+    The cache is worker-owned and nothing ever commits on it, so a diverged
+    HEAD means the entry's history no longer matches origin — exactly the
+    SFP-239 corrupt-entry contract. The clone fast-path catches this, removes
+    the entry, and re-clones; the condition is already logged by the raiser.
+    """
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"clone cache HEAD diverged at {path}")
+        self.path = path
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,13 +272,31 @@ class RepoManager:
     def clone(self, repo_url: str, dest: Path) -> CloneResult:
         """Clone ``repo_url`` into ``dest``, authenticating via the token.
 
-        Idempotent: if ``dest`` already holds a valid clone, returns
-        immediately with ``cloned=False``. A ``dest`` that exists but fails the
-        validity probe (``git rev-parse --git-dir``) — a hollow clone whose
-        ``.git`` was purged — is treated as a cache miss: it is removed and
-        re-cloned (SFP-239). This no longer refuses on "exists but is not a
-        repo"; the cache location is worker-owned and the entry is rebuilt
-        rather than treated as untouchable caller data.
+        Idempotent with refresh (SFP-250): if ``dest`` already holds a valid
+        clone, it is first refreshed from origin (fetch + ff-only advance — see
+        below) and then returns with ``cloned=False``. A ``dest`` that exists
+        but fails the validity probe (``git rev-parse --git-dir``) — a hollow
+        clone whose ``.git`` was purged — is treated as a cache miss: it is
+        removed and re-cloned (SFP-239). This no longer refuses on "exists but
+        is not a repo"; the cache location is worker-owned and the entry is
+        rebuilt rather than treated as untouchable caller data.
+
+        Cache-hit refresh (SFP-250) — the fast-path is no longer a blind reuse:
+
+        1. one-shot authenticated ``git -C <dest> fetch <authed_url>``. The
+           token lives only on the argv; no ``remote set-url`` is issued, so
+           the on-disk ``origin`` stays token-free exactly as the cold-clone
+           path left it;
+        2. ``git -C <dest> merge --ff-only FETCH_HEAD`` advances the checked-out
+           branch to the remote tip. Fast-forward-only — no merge commit is
+           ever created on the cache, and a diverged HEAD is never silently
+           reconciled: it routes to the SFP-239 corrupt-entry policy (remove +
+           re-clone);
+        3. fetch failure is fail-open: a warning naming the cached HEAD sha
+           (token-free — a sha carries no credential) is logged and the run
+           proceeds on the stale cache, still returning ``cloned=False``.
+           ``sync_base`` (SFP-240) is the definitive conflict gate, so this
+           degrades freshness, never correctness.
 
         Args:
             repo_url: Remote URL (HTTPS for token auth; file:// for local).
@@ -259,27 +311,40 @@ class RepoManager:
                 token-bearing URL would otherwise surface. The token is
                 redacted from the message.
         """
-        # Idempotent fast-path: an existing VALID clone is a no-op (SFP-239).
-        # Existence alone is not enough — the cache under SFP_WORKTREE_BASE can
-        # be hollowed out (/tmp cleanup, partial disk, crashed run), and a
-        # hollow entry must not poison the run with a raw
-        # "fatal: not a git repository" from some downstream git call. Probe
-        # with git's cheapest repository check; a miss means remove + re-clone.
+        # Idempotent fast-path: an existing VALID clone is refreshed from
+        # origin, then reused (SFP-239 validity + SFP-250 freshness). Existence
+        # alone is not enough — the cache under SFP_WORKTREE_BASE can be
+        # hollowed out (/tmp cleanup, partial disk, crashed run), and a hollow
+        # entry must not poison the run with a raw "fatal: not a git
+        # repository" from some downstream git call. Probe with git's cheapest
+        # repository check; a miss means remove + re-clone. A VALID entry is
+        # then refreshed (fetch + ff-only): fetch failure is fail-open (stale
+        # cache is still returned, cloned=False); a diverged HEAD routes to the
+        # same remove + re-clone recovery as a hollow entry (SFP-239 policy).
         if (dest / ".git").exists() or dest.exists():
+            reused = False
             if is_valid_git_repo(dest, self._runner):
+                try:
+                    self._refresh_cached_clone(dest, repo_url)
+                except CacheRefreshDiverged:
+                    # Diverged cache HEAD → same recovery as a hollow entry
+                    # (SFP-239 policy): remove + re-clone from scratch. The
+                    # divergence itself was already logged by the raiser; this
+                    # path deliberately does NOT log the hollow-entry line
+                    # below — the entry was valid, it was just diverged.
+                    self._remove_cache_entry_for_reclone(dest)
+                else:
+                    reused = True
+            else:
+                # Corrupt cache entry → treat as a cache miss: remove the hollow
+                # tree and fall through to the existing clone logic below.
+                # Removal failure (permissions/partial state) must surface as
+                # a clear, actionable error naming the path, not a crash
+                # mid-recovery.
+                _log.warning("clone cache entry %s is not a valid git repo; re-cloning", dest)
+                self._remove_cache_entry_for_reclone(dest)
+            if reused:
                 return CloneResult(path=dest, cloned=False)
-            # Corrupt cache entry → treat as a cache miss: remove the hollow
-            # tree and fall through to the existing clone logic below. Removal
-            # failure (permissions/partial state) must surface as a clear,
-            # actionable error naming the path, not a crash mid-recovery.
-            _log.warning("clone cache entry %s is not a valid git repo; re-cloning", dest)
-            try:
-                remove_path(dest)
-            except OSError as exc:
-                raise RepoManagerError(
-                    f"corrupt clone cache entry at {dest} could not be removed "
-                    f"for re-clone (remove it manually): {exc}"
-                ) from exc
 
         authed_url = _inject_token(repo_url, self._token)
         clean_url = _strip_userinfo(repo_url)
@@ -556,6 +621,93 @@ class RepoManager:
             ),
             tuple(conflicted),
         )
+
+    def _refresh_cached_clone(self, dest: Path, repo_url: str) -> None:
+        """Refresh the cached clone from origin before it is reused (SFP-250).
+
+        A healthy cache entry is not necessarily a *fresh* one: the cached
+        checkout only ever sits at the tip the last successful run fetched, so
+        every worktree cut from a stale cache starts from a stale base (the
+        2026-09-04 SFP-149/150 stale-base incident). This method advances the
+        cache to origin's tip before ``clone`` returns ``cloned=False``:
+
+        * ``git -C <dest> fetch <authed_url>`` — one-shot authenticated fetch,
+          exactly :meth:`push`/:meth:`sync_base`'s pattern: the token lives only
+          on the argv and the on-disk token-free ``origin`` is never rewritten;
+        * ``git -C <dest> merge --ff-only FETCH_HEAD`` — fast-forward-only
+          advance of the checked-out branch to the fetched tip. No merge commit
+          is ever created on the cache and a diverged HEAD is never reconciled.
+
+        Failure policy:
+
+        * FETCH failure → FAIL-OPEN: a warning naming the cached HEAD sha
+          (token-free — a sha carries no credential; stderr is redacted) is
+          logged and the run proceeds on the stale cache. ``sync_base`` (SFP-240)
+          is the definitive conflict gate, so staleness degrades freshness,
+          never correctness.
+        * ff-only failure → the cache HEAD has diverged from origin's tip. That
+          "should never happen" (the cache is worker-owned and nothing commits
+          on it), which is exactly the SFP-239 corrupt-entry contract: remove
+          the entry and let the caller re-clone from scratch.
+
+        Args:
+            dest: The cached clone directory (already validated as a git repo).
+            repo_url: Remote URL to fetch from. Token is injected into a
+                throwaway authed URL for this one fetch only.
+
+        Raises:
+            RepoManagerError: only when the diverged entry cannot be REMOVED for
+                re-clone (the SFP-239 removal-failure path). Divergence itself
+                signals via :data:`CacheRefreshDiverged` — never by raising —
+                so the fail-open fetch path and the re-clone path stay distinct.
+        """
+        authed_url = _inject_token(repo_url, self._token)
+        cached_head = self._rev_parse(dest, "HEAD")
+
+        try:
+            self._runner(["git", "-C", str(dest), "fetch", authed_url])
+        except subprocess.CalledProcessError as exc:
+            # FAIL-OPEN (deliberate): the run proceeds on the stale cache. The
+            # warning names the cached HEAD sha so ops can see exactly how stale
+            # the base is; the fetch stderr is redacted before it is logged —
+            # a token-bearing URL never reaches the log line (SFP-250).
+            _log.warning(
+                "clone cache refresh failed for %s: proceeding on stale cache (cached HEAD %s): %s",
+                dest,
+                cached_head,
+                _redact(str(exc.stderr or exc), self._token),
+            )
+            return
+
+        try:
+            self._runner(["git", "-C", str(dest), "merge", "--ff-only", "FETCH_HEAD"])
+        except subprocess.CalledProcessError as exc:
+            # ff-only refused → the cache HEAD has diverged from the fetched
+            # tip (not a fast-forward). SFP-239 corrupt-entry policy: remove +
+            # re-clone. `from None`: the merge argv carries no token, but the
+            # chained exception's stderr is unrelated to the message below.
+            _log.warning(
+                "clone cache HEAD diverged from origin (%s); treating entry as "
+                "corrupt and re-cloning: %s",
+                cached_head,
+                _redact(str(exc.stderr or exc), self._token),
+            )
+            raise CacheRefreshDiverged(dest) from None
+
+    def _remove_cache_entry_for_reclone(self, dest: Path) -> None:
+        """Remove the (already-logged) cache entry so the caller can re-clone.
+
+        Shared by the SFP-239 hollow-entry path and the SFP-250 diverged-HEAD
+        path. Removal failure (permissions/partial state) surfaces as a clear,
+        actionable error naming the path — never a crash mid-recovery.
+        """
+        try:
+            remove_path(dest)
+        except OSError as exc:
+            raise RepoManagerError(
+                f"corrupt clone cache entry at {dest} could not be removed "
+                f"for re-clone (remove it manually): {exc}"
+            ) from exc
 
     def _rev_parse(self, path: Path, ref: str) -> str:
         """Resolve ``ref`` to a commit SHA (empty string when unresolvable).

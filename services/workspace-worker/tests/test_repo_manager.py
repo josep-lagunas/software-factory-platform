@@ -11,8 +11,10 @@ Two layers:
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -148,9 +150,21 @@ def test_clone_is_idempotent_when_dest_is_a_repo(tmp_path: Path) -> None:
     result = mgr.clone(HTTPS_URL, dest)
 
     assert result == CloneResult(path=dest, cloned=False)
-    # Reuse only: the single git invocation is the validity probe — no clone,
-    # no set-url, no removal of the healthy cache entry.
-    assert runner.calls == [["git", "-C", str(dest), "rev-parse", "--git-dir"]]
+    # Reuse only — but WITH the SFP-250 refresh: validity probe, cached-HEAD
+    # rev-parse, authed fetch, ff-only advance. NO clone, NO set-url, NO
+    # removal of the healthy cache entry.
+    assert runner.calls == [
+        ["git", "-C", str(dest), "rev-parse", "--git-dir"],
+        ["git", "-C", str(dest), "rev-parse", "HEAD"],
+        [
+            "git",
+            "-C",
+            str(dest),
+            "fetch",
+            f"https://x-access-token:{TOKEN}@github.com/arconta/some-repo.git",
+        ],
+        ["git", "-C", str(dest), "merge", "--ff-only", "FETCH_HEAD"],
+    ]
     assert dest.exists()  # healthy cache left untouched
 
 
@@ -962,8 +976,14 @@ def test_clone_healthy_cache_is_reused_no_reclone_unit(tmp_path: Path) -> None:
     result = mgr.clone(HTTPS_URL, dest)
 
     assert result == CloneResult(path=dest, cloned=False)
-    # The ONE allowed invocation is the validity probe — no clone, no set-url.
-    assert runner.calls == [["git", "-C", str(dest), "rev-parse", "--git-dir"]]
+    # Reuse only: the validity probe + the SFP-250 refresh (cached-HEAD
+    # rev-parse, authed fetch, ff-only advance) — NO clone, NO set-url.
+    assert [c[3] if c[:2] == ["git", "-C"] else c[1] for c in runner.calls] == [
+        "rev-parse",  # --git-dir validity probe
+        "rev-parse",  # cached HEAD sha (for the fail-open warning)
+        "fetch",  # one-shot authed refresh fetch
+        "merge",  # --ff-only FETCH_HEAD advance
+    ]
 
 
 def test_clone_missing_dest_skips_probe_unit(tmp_path: Path) -> None:
@@ -1043,7 +1063,12 @@ def test_integration_hollow_cache_recovers_and_run_proceeds(tmp_path: Path) -> N
 
 @requires_git
 def test_integration_healthy_cache_is_reused_no_forced_reclone(tmp_path: Path) -> None:
-    """Healthy cache stays reused: no re-clone, and HEAD is left untouched."""
+    """Healthy cache stays reused: no re-clone, and HEAD is only ever advanced.
+
+    With the remote tip UNCHANGED since the first clone, the refresh fetch +
+    ff-only merge advance to the SAME commit — HEAD is byte-identical after the
+    second call and the entry is never torn down or rebuilt.
+    """
 
     remote = _seed_bare_remote(tmp_path / "remote.git")
     shutil.rmtree(tmp_path / "seed-work")
@@ -1068,3 +1093,299 @@ def test_integration_healthy_cache_is_reused_no_forced_reclone(tmp_path: Path) -
         text=True,
     ).stdout
     assert head_before == head_after  # nothing was torn down or rebuilt
+
+
+# ---------------------------------------------------------------------------
+# clone — cache refresh on the fast-path (SFP-250). Unit layer: scripted/fake
+# runners assert the exact git argv (probe → cached-HEAD rev-parse → authed
+# fetch → ff-only advance), the fail-open fetch-failure warning (with the
+# cached HEAD sha, without the token), and divergence routing to the SFP-239
+# remove + re-clone recovery — no real network (MAS §12.7 determinism).
+# ---------------------------------------------------------------------------
+
+
+def _scripted_clone_runner(
+    tmp_path: Path,
+    *,
+    fetch_error: Exception | None = None,
+    ff_error: Exception | None = None,
+    head_shas: list[str] | None = None,
+) -> tuple[list[list[str]], Callable[[list[str]], subprocess.CompletedProcess[str]]]:
+    """A runner scripted for the clone fast-path, recording every argv.
+
+    ``rev-parse HEAD`` answers from ``head_shas`` (falling back to the last
+    value, so multiple probes stay deterministic); the refresh ``fetch`` and
+    ``merge --ff-only`` raise ``fetch_error`` / ``ff_error`` when set. Every
+    other command succeeds silently. Returns ``(calls, runner)``.
+    """
+    calls: list[list[str]] = []
+    heads = iter(head_shas or ["cccc3333"])
+    last_head = ["cccc3333"]
+
+    def scripted(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        args = _args(cmd)
+        if args[:2] == ["rev-parse", "HEAD"]:
+            last_head[0] = next(heads, last_head[0])
+            return _cp(last_head[0])
+        if args[:1] == ["fetch"] and fetch_error is not None:
+            raise fetch_error
+        if args[:2] == ["merge", "--ff-only"] and ff_error is not None:
+            raise ff_error
+        return _cp()
+
+    return calls, scripted
+
+
+def test_clone_cache_hit_refresh_fetches_then_ff_only_before_reuse(
+    tmp_path: Path,
+) -> None:
+    """Cache-hit with a newer remote tip: refresh runs BEFORE cloned=False.
+
+    The exact command order — validity probe, cached-HEAD rev-parse, one-shot
+    AUTHED fetch (token on the argv only), then the ff-only advance — is the
+    SFP-250 contract; worktree creation downstream only ever sees a cache that
+    was refreshed first. No clone/set-url/removal may run on this path.
+    """
+    calls, scripted = _scripted_clone_runner(tmp_path)
+    dest = tmp_path / "repo"
+    (dest / ".git").mkdir(parents=True)
+    mgr = RepoManager(TOKEN, runner=scripted)
+
+    result = mgr.clone(HTTPS_URL, dest)
+
+    assert result == CloneResult(path=dest, cloned=False)
+    assert calls == [
+        ["git", "-C", str(dest), "rev-parse", "--git-dir"],  # validity probe
+        ["git", "-C", str(dest), "rev-parse", "HEAD"],  # cached HEAD sha
+        [  # one-shot authed refresh fetch (no refspec — full remote sync)
+            "git",
+            "-C",
+            str(dest),
+            "fetch",
+            f"https://x-access-token:{TOKEN}@github.com/arconta/some-repo.git",
+        ],
+        ["git", "-C", str(dest), "merge", "--ff-only", "FETCH_HEAD"],
+    ]
+    # The origin remote is NEVER rewritten on the refresh path.
+    assert all("set-url" not in " ".join(c) for c in calls)
+
+
+def test_clone_cache_hit_fetch_failure_fails_open_with_cached_head_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Fetch failure is FAIL-OPEN: a warning names the cached HEAD sha and the
+    token never appears; the run returns cloned=False on the stale cache."""
+    fetch_err = subprocess.CalledProcessError(
+        returncode=128,
+        cmd=["git", "fetch", f"https://x-access-token:{TOKEN}@github.com/o/r.git"],
+        stderr=f"fatal: could not read from remote repository ({TOKEN} leaked?)",
+    )
+    calls, scripted = _scripted_clone_runner(tmp_path, fetch_error=fetch_err)
+    dest = tmp_path / "repo"
+    (dest / ".git").mkdir(parents=True)
+    mgr = RepoManager(TOKEN, runner=scripted)
+
+    with caplog.at_level(logging.WARNING, logger="workspace_worker.repo.manager"):
+        result = mgr.clone(HTTPS_URL, dest)
+
+    # No abort: the stale cache is returned for reuse.
+    assert result == CloneResult(path=dest, cloned=False)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    msg = warnings[0].getMessage()
+    assert "stale cache" in msg
+    assert "cccc3333" in msg  # the cached HEAD sha is named
+    assert TOKEN not in msg  # …and the token never is
+    assert "***" in msg  # the fetch stderr was redacted
+    # The ff-only advance never ran (no fetch → nothing to advance to).
+    assert all(c[3:5] != ["merge", "--ff-only"] for c in calls if len(c) > 4)
+    assert dest.exists()  # cache left in place
+
+
+def test_clone_cache_hit_diverged_head_is_removed_and_recloned(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Diverged cache HEAD (ff-only refuses) → SFP-239 corrupt policy: remove +
+    re-clone. The token never surfaces although the ff failure stderr carries it."""
+    ff_err = subprocess.CalledProcessError(
+        returncode=128,
+        cmd=["git", "merge", "--ff-only", "FETCH_HEAD"],
+        stderr=f"fatal: Not possible to fast-forward, aborting. ({TOKEN})",
+    )
+    calls, scripted = _scripted_clone_runner(tmp_path, ff_error=ff_err)
+    dest = tmp_path / "repo"
+    (dest / ".git").mkdir(parents=True)
+    mgr = RepoManager(TOKEN, runner=scripted)
+
+    with caplog.at_level(logging.WARNING, logger="workspace_worker.repo.manager"):
+        result = mgr.clone(HTTPS_URL, dest)
+
+    # Rebuilt from scratch after the diverged entry was removed.
+    assert result == CloneResult(path=dest, cloned=True)
+    assert dest.exists() is False  # removed before the re-clone
+    # ONE warning: the divergence notice. The entry WAS a valid repo — the
+    # hollow-entry "not a valid git repo" line must NOT fire on this path.
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "diverged" in warnings[0].getMessage()
+    assert "re-cloning" in warnings[0].getMessage()
+    assert TOKEN not in warnings[0].getMessage()
+    assert "***" in warnings[0].getMessage()  # the ff stderr was redacted
+    # Probe → cached HEAD → fetch → ff-only (fails) → clone → set-url.
+    assert [c[3] if c[:2] == ["git", "-C"] else c[1] for c in calls] == [
+        "rev-parse",  # validity probe
+        "rev-parse",  # cached HEAD sha
+        "fetch",
+        "merge",  # --ff-only FETCH_HEAD — refused
+        "clone",  # the re-clone
+        "remote",  # set-url origin <clean url>
+    ]
+    assert calls[4][1:3] == [
+        "clone",
+        f"https://x-access-token:{TOKEN}@github.com/arconta/some-repo.git",
+    ]
+    assert calls[5][3:6] == ["remote", "set-url", "origin"]
+    assert calls[5][6] == HTTPS_URL  # clean URL — no token on the strip argv
+
+
+def test_clone_diverged_cache_unremovable_surfaces_actionable_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A diverged entry that cannot be REMOVED crashes with the same actionable
+    SFP-239 error as an unremovable hollow entry — never mid-recovery silence."""
+    ff_err = subprocess.CalledProcessError(
+        returncode=128, cmd=["git", "merge", "--ff-only"], stderr="diverged"
+    )
+    _calls, scripted = _scripted_clone_runner(tmp_path, ff_error=ff_err)
+    dest = tmp_path / "repo"
+    (dest / ".git").mkdir(parents=True)
+    mgr = RepoManager(TOKEN, runner=scripted)
+
+    def _boom(path: object) -> None:
+        raise PermissionError("EACCES")
+
+    monkeypatch.setattr("workspace_worker.repo.manager.remove_path", _boom)
+
+    with pytest.raises(RepoManagerError, match=r"could not be removed.*remove it manually"):
+        mgr.clone(HTTPS_URL, dest)
+
+
+def test_clone_refresh_uses_token_free_url_for_non_https_remotes(
+    tmp_path: Path,
+) -> None:
+    """file:// remotes get no token injected anywhere on the refresh path —
+    matching the cold-clone behavior for non-HTTPS transports."""
+    calls, scripted = _scripted_clone_runner(tmp_path)
+    dest = tmp_path / "repo"
+    (dest / ".git").mkdir(parents=True)
+    mgr = RepoManager(TOKEN, runner=scripted)
+    file_url = "file:///srv/repos/r.git"
+
+    result = mgr.clone(file_url, dest)
+
+    assert result == CloneResult(path=dest, cloned=False)
+    fetch_cmds = [c for c in calls if len(c) > 4 and c[3] == "fetch"]
+    assert len(fetch_cmds) == 1
+    assert fetch_cmds[0][4] == file_url  # unchanged — no userinfo added
+    assert TOKEN not in " ".join(calls[-1])
+
+
+# ---------------------------------------------------------------------------
+# clone — cache refresh (SFP-250). Integration layer: real git against a local
+# file:// bare remote — the fast-path genuinely advances the cached checkout to
+# the moved remote tip, fail-opens on an unreachable origin, and rebuilds a
+# diverged entry. No real network (file:// transport, MAS §12.7).
+# ---------------------------------------------------------------------------
+
+
+@requires_git
+def test_integration_cache_hit_advances_to_moved_remote_tip(tmp_path: Path) -> None:
+    """The stale-base bug: origin moves AFTER the cache was cloned; a second
+    clone() call must fast-forward the cached checkout to the new tip before
+    returning cloned=False — the worktree cut next starts on CURRENT main."""
+    remote = _seed_bare_remote(tmp_path / "remote.git")
+    shutil.rmtree(tmp_path / "seed-work")
+    dest = tmp_path / "clone"
+    mgr = RepoManager("")
+
+    mgr.clone(f"file://{remote}", dest)  # cache seeded at the OLD tip
+    old_head = _git("rev-parse", "HEAD", cwd=dest)
+
+    # Origin moves on: a second commit lands on the remote's main.
+    mover = tmp_path / "mover"
+    subprocess.run(
+        ["git", "clone", f"file://{remote}", str(mover)], check=True, capture_output=True
+    )
+    _commit_all(mover, "REMOTE-ADVANCE.txt", "advanced\n", "remote advance")
+    _git("push", "origin", "main", cwd=mover)
+    new_tip = _git("rev-parse", "origin/main", cwd=mover)
+
+    second = mgr.clone(f"file://{remote}", dest)
+
+    assert second.cloned is False
+    assert new_tip != old_head  # the remote genuinely moved
+    assert _git("rev-parse", "HEAD", cwd=dest) == new_tip  # cache advanced
+    assert (dest / "REMOTE-ADVANCE.txt").read_text() == "advanced\n"
+    # Clean tree — the advance left no merge state behind.
+    assert _git("status", "--porcelain", cwd=dest) == ""
+    assert _git("log", "-1", "--format=%s", cwd=dest) == "remote advance"
+
+
+@requires_git
+def test_integration_fetch_failure_proceeds_on_stale_cache(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Unreachable origin on the fast-path: warning (naming the cached HEAD sha)
+    + cloned=False on the stale cache — the run is not aborted (fail-open)."""
+    remote = _seed_bare_remote(tmp_path / "remote.git")
+    shutil.rmtree(tmp_path / "seed-work")
+    dest = tmp_path / "clone"
+    mgr = RepoManager("")
+
+    mgr.clone(f"file://{remote}", dest)
+    stale_head = _git("rev-parse", "HEAD", cwd=dest)
+
+    with caplog.at_level(logging.WARNING, logger="workspace_worker.repo.manager"):
+        second = mgr.clone("file:///nonexistent/remote.git", dest)
+
+    assert second == CloneResult(path=dest, cloned=False)  # stale cache returned
+    assert _git("rev-parse", "HEAD", cwd=dest) == stale_head  # cache untouched
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "stale cache" in warnings[0].getMessage()
+    assert stale_head in warnings[0].getMessage()  # the cached HEAD sha is named
+    assert (dest / "README").exists()  # still a working clone
+
+
+@requires_git
+def test_integration_diverged_cache_head_is_recloned(tmp_path: Path) -> None:
+    """A genuinely diverged cache HEAD cannot fast-forward: both sides have
+    unique commits (a stray local commit AND a remote that moved on). ff-only
+    refuses, the entry is removed and rebuilt from origin — the checkout ends
+    exactly at origin's history, stray commit gone (SFP-239 policy)."""
+    remote = _seed_bare_remote(tmp_path / "remote.git")
+    shutil.rmtree(tmp_path / "seed-work")
+    dest = tmp_path / "clone"
+    mgr = RepoManager("")
+
+    mgr.clone(f"file://{remote}", dest)
+    # Diverge BOTH sides: a stray local commit…
+    _commit_all(dest, "LOCAL-ONLY.txt", "stray\n", "stray local commit")
+    diverged_head = _git("rev-parse", "HEAD", cwd=dest)
+    # …and an origin that moved on independently.
+    mover = tmp_path / "mover"
+    subprocess.run(
+        ["git", "clone", f"file://{remote}", str(mover)], check=True, capture_output=True
+    )
+    _commit_all(mover, "REMOTE-MOVE.txt", "moved\n", "remote move")
+    _git("push", "origin", "main", cwd=mover)
+    origin_tip = _git("rev-parse", "HEAD", cwd=remote)
+
+    second = mgr.clone(f"file://{remote}", dest)
+
+    assert second.cloned is True  # treated as corrupt → re-cloned
+    assert _git("rev-parse", "HEAD", cwd=dest) == origin_tip  # rebuilt at tip
+    assert not (dest / "LOCAL-ONLY.txt").exists()  # the stray commit is gone
+    assert (dest / "REMOTE-MOVE.txt").exists()  # origin's new commit IS there
+    assert diverged_head != origin_tip
