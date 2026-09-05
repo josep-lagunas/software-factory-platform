@@ -132,6 +132,37 @@ def test_agent_run_result_failure_carries_error() -> None:
     assert result.error == "boom"
 
 
+# --- SFP-249 — final_text transport field ----------------------------------
+
+
+def test_agent_run_result_final_text_defaults_to_none() -> None:
+    """SFP-249: ``final_text`` defaults to ``None`` — additive and
+    backward-compatible; every pre-existing constructor site (runtime,
+    fakes, stubs) keeps constructing without the field."""
+    result = AgentRunResult(agent="reviewer", ticket_id="SFP-249", success=True)
+    assert result.final_text is None
+
+
+def test_agent_run_result_final_text_carries_supplied_text() -> None:
+    """SFP-249: a supplied ``final_text`` round-trips verbatim (transport for
+    human-readable surfaces; ``output`` stays the only decision field)."""
+    result = AgentRunResult(
+        agent="reviewer",
+        ticket_id="SFP-249",
+        success=True,
+        output={"review_status": "APPROVED"},
+        final_text="Approving: the diff matches the spec.",
+    )
+    assert result.final_text == "Approving: the diff matches the spec."
+    assert result.output == {"review_status": "APPROVED"}
+
+
+def test_agent_run_result_final_text_explicit_none_round_trips() -> None:
+    """SFP-249: ``final_text=None`` is None-preserving (no coercion to '')."""
+    result = AgentRunResult(agent="reviewer", ticket_id="SFP-249", success=True, final_text=None)
+    assert result.final_text is None
+
+
 def test_io_models_are_dataclasses() -> None:
     """(c) The IO models are dataclasses."""
     assert dataclasses.is_dataclass(AgentRunRequest)
