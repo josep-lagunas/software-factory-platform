@@ -1,4 +1,4 @@
-"""Tests for the :class:`ReviewerOutput` schema (SFP-33 / SFP-16).
+"""Tests for the :class:`ReviewerOutput` schema (SFP-33 / SFP-16 / SFP-249).
 
 Covers the acceptance criteria:
 - (a) conformant payload round-trips through ``to_json``/``from_json``;
@@ -9,7 +9,9 @@ Covers the acceptance criteria:
 - (e) ``quality_gates`` accepts all six booleans (parametrized per-field);
 - (f) ``quality_gates`` rejects non-boolean values;
 - (g) status string values equal the enum member names exactly;
-- (h) malformed JSON is rejected.
+- (h) malformed JSON is rejected;
+- (i) SFP-249: ``rationale`` is required, non-empty after strip, on every
+  status (including APPROVED).
 """
 
 from typing import Any
@@ -33,6 +35,7 @@ VALID_KWARGS: dict[str, Any] = {
         maintainability_acceptable=True,
         security_acceptable=True,
     ),
+    "rationale": "All six quality gates pass; the change matches the PRSpec.",
 }
 
 REQUIRED_FIELDS = list(VALID_KWARGS.keys())
@@ -199,3 +202,51 @@ def test_quality_gates_rejects_missing_field() -> None:
             # maintainability_acceptable missing
             security_acceptable=True,
         )
+
+
+# --------------------------------------------------------------------------- #
+# SFP-249 — rationale (required, non-empty after strip, on every status)
+# --------------------------------------------------------------------------- #
+
+
+def test_rationale_round_trips() -> None:
+    """(i) A conformant rationale survives to_json/from_json untouched."""
+    original = make_output(rationale="Approves: gates green, spec satisfied.")
+    restored = ReviewerOutput.from_json(original.to_json())
+    assert restored == original
+    assert restored.rationale == "Approves: gates green, spec satisfied."
+
+
+def test_missing_rationale_raises() -> None:
+    """(i) Omitting the rationale field is a ValidationError (required)."""
+    kwargs = {k: v for k, v in VALID_KWARGS.items() if k != "rationale"}
+    with pytest.raises(ValidationError):
+        ReviewerOutput(**kwargs)
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "\t\n "])
+def test_empty_or_whitespace_rationale_rejected_on_construction(bad: str) -> None:
+    """(i) Empty and whitespace-only rationales are rejected (strip-then-check)."""
+    with pytest.raises(ValidationError):
+        make_output(rationale=bad)
+
+
+def test_whitespace_rationale_rejected_on_from_json() -> None:
+    """(i) A whitespace-only rationale in serialized JSON is rejected."""
+    import json
+
+    payload = json.loads(make_output().to_json())
+    payload["rationale"] = "  \n "
+    with pytest.raises(ValidationError):
+        ReviewerOutput.from_json(json.dumps(payload))
+
+
+@pytest.mark.parametrize("status", list(ReviewStatus))
+def test_rationale_required_on_every_status(status: ReviewStatus) -> None:
+    """(i) A non-empty rationale is accepted on ALL four statuses — the
+    requirement binds APPROVED just as tightly as the rejecting statuses."""
+    output = make_output(review_status=status, rationale="Why this verdict.")
+    assert output.review_status is status
+    assert output.rationale == "Why this verdict."
+    with pytest.raises(ValidationError):
+        make_output(review_status=status, rationale="")

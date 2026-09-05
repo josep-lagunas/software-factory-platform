@@ -46,6 +46,7 @@ __all__ = [
     "GitProviderAdapterError",
     "GitPushResult",
     "GitSyncResult",
+    "PrCommentResult",
     "PullRequestResult",
     "PullRequestReview",
     "ReviewResult",
@@ -198,6 +199,24 @@ class ReviewResult:
     number: int
     review_id: int
     state: str
+
+
+@dataclass(frozen=True, slots=True)
+class PrCommentResult:
+    """Outcome of :meth:`GitProviderAdapter.add_pr_comment` (SFP-249).
+
+    Attributes:
+        owner: Repository owner (account or organization).
+        repo: Repository name.
+        number: The pull request (issue) number the comment was posted to.
+        comment_id: The comment id, parsed from the GitHub response ``id``
+            field.
+    """
+
+    owner: str
+    repo: str
+    number: int
+    comment_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -695,6 +714,65 @@ class GitProviderAdapter:
             number=number,
             review_id=data["id"],
             state=data["state"],
+        )
+
+    def add_pr_comment(
+        self,
+        owner: str,
+        repo: str,
+        number: int,
+        *,
+        body: str,
+    ) -> PrCommentResult:
+        """Post a PR conversation comment via ``POST /repos/{...}/issues/{n}/comments``.
+
+        SFP-249: the malformed-verdict surface. A verdict without a rationale
+        is an infrastructure malfunction, NOT a code verdict — so it must never
+        be submitted as a review ``event`` (``APPROVE`` /
+        ``REQUEST_CHANGES``). This method posts to the *issue-comment* endpoint
+        (a PR conversation comment, no verdict semantics) via :meth:`_request`
+        (bearer auth + tenacity retry on ``{429,500,502,503,504}`` and the
+        network errors, no retry on other ``4xx``) and
+        :meth:`_raise_for_status` (a redacted
+        :class:`GitProviderAdapterError` on any non-success).
+
+        Format-agnostic like every adapter method: ``body`` passes through
+        verbatim; the caller composes the malfunction note.
+
+        Args:
+            owner: Repository owner (account or organization).
+            repo: Repository name.
+            number: The pull request number. Must be ``>= 1``.
+            body: The comment body (caller-composed, non-empty).
+
+        Returns:
+            The :class:`PrCommentResult` parsed from the response JSON
+            (``id`` -> ``comment_id``).
+
+        Raises:
+            ValueError: if ``owner`` / ``repo`` / ``body`` is empty or
+                ``number < 1`` (before any network call).
+            GitProviderAdapterError: if the request ultimately fails after
+                retries, or a non-retryable error is returned. The token is
+                redacted from the message.
+        """
+        if not owner:
+            raise ValueError("owner must not be empty")
+        if not repo:
+            raise ValueError("repo must not be empty")
+        if number < 1:
+            raise ValueError("number must be >= 1")
+        if not body:
+            raise ValueError("body must not be empty")
+        url = f"{self._base}/repos/{owner}/{repo}/issues/{number}/comments"
+        response = self._request("POST", url, json={"body": body})
+        self._raise_for_status("add PR comment", response, url)
+        data = response.json()
+        return PrCommentResult(
+            owner=owner,
+            repo=repo,
+            number=number,
+            comment_id=data["id"],
         )
 
     def list_pr_reviews(
