@@ -70,7 +70,9 @@ def _coder_output() -> CoderOutput:
     )
 
 
-def _reviewer_output(status: str = "APPROVED", rationale: str = "All gates pass.") -> dict[str, Any]:
+def _reviewer_output(
+    status: str = "APPROVED", rationale: str = "All gates pass."
+) -> dict[str, Any]:
     return {
         "pr_spec_id": "PR-1",
         "review_status": status,

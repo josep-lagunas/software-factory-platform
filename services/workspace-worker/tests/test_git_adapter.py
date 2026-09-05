@@ -21,6 +21,7 @@ from workspace_worker.repo.git.adapter import (
     GitProviderAdapterError,
     GitPushResult,
     GitSyncResult,
+    PrCommentResult,
     PullRequestResult,
     PullRequestReview,
     ReviewResult,
@@ -53,6 +54,12 @@ REVIEW_ID = 9999
 REVIEW_STATE = "APPROVED"
 REVIEW_EVENT = "APPROVE"
 REVIEW_BODY = "LGTM — looks good to merge."
+
+# add-PR-comment (SFP-249) — COMMENT_ID deliberately differs from any input so
+# parse-not-echo is observable; COMMENT_BODY is the malfunction note the
+# pipeline composes (never a review verdict).
+COMMENT_ID = 4242
+COMMENT_BODY = "Reviewer malfunction: verdict without rationale — retrying once."
 
 
 def _client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.Client:
@@ -1956,5 +1963,154 @@ def test_list_pr_reviews_invalid_number_raises_value_error_before_any_http() -> 
     adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
     with pytest.raises(ValueError, match="number"):
         adapter.list_pr_reviews(OWNER, REPO, 0)
+
+    assert called == []
+
+
+# ---------------------------------------------------------------------------
+# add_pr_comment (SFP-249) — the malformed-verdict surface
+#
+# A verdict without a rationale is an infra malfunction, NEVER a code verdict,
+# so it must surface as an issue-comment (POST /issues/{n}/comments) — not a
+# review `event`. These tests pin the request shape, parse-not-echo, retry and
+# fail-closed behaviors.
+# ---------------------------------------------------------------------------
+
+
+def _comment_response(*, comment_id: int = COMMENT_ID) -> dict[str, object]:
+    return {"id": comment_id, "body": COMMENT_BODY}
+
+
+def test_add_pr_comment_issues_post_with_bearer_header() -> None:
+    # POST /repos/{owner}/{repo}/issues/{number}/comments with {body} +
+    # bearer; the comment id is parsed from the response.
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.method == "POST"
+        assert request.url.path == f"/repos/{OWNER}/{REPO}/issues/{PR_NUMBER}/comments"
+        assert request.headers.get("authorization") == f"Bearer {TOKEN}"
+        assert json.loads(request.content) == {"body": COMMENT_BODY}
+        return httpx.Response(201, json=_comment_response())
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.add_pr_comment(OWNER, REPO, PR_NUMBER, body=COMMENT_BODY)
+
+    assert result == PrCommentResult(
+        owner=OWNER, repo=REPO, number=PR_NUMBER, comment_id=COMMENT_ID
+    )
+    assert len(seen) == 1
+
+
+def test_add_pr_comment_id_comes_from_response_not_inferred() -> None:
+    # Parse-not-echo: comment_id comes from the response JSON, not echoed from
+    # any input (the response id deliberately differs from every constant).
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=_comment_response(comment_id=777))
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    result = adapter.add_pr_comment(OWNER, REPO, PR_NUMBER, body=COMMENT_BODY)
+
+    assert result.comment_id == 777
+    assert result.number == PR_NUMBER
+
+
+def test_add_pr_comment_retry_then_succeed_on_500() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries < 3:
+            return httpx.Response(500, json={"message": "server error"})
+        return httpx.Response(201, json=_comment_response())
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    adapter.add_pr_comment(OWNER, REPO, PR_NUMBER, body=COMMENT_BODY)
+
+    assert tries == 3  # retried twice, succeeded on the 3rd attempt
+
+
+def test_add_pr_comment_retry_exhaust_on_503_raises_adapter_error() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(503, json={"message": "unavailable"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        adapter.add_pr_comment(OWNER, REPO, PR_NUMBER, body=COMMENT_BODY)
+
+    msg = str(exc_info.value)
+    assert "503" in msg
+    assert "3 attempts" in msg
+    assert TOKEN not in msg
+    assert tries == 3
+
+
+def test_add_pr_comment_no_retry_on_422() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(422, json={"message": "validation failed"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="422"):
+        adapter.add_pr_comment(OWNER, REPO, PR_NUMBER, body=COMMENT_BODY)
+    assert tries == 1
+
+
+def test_add_pr_comment_token_redacted_from_error_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, text=f"validation error: bad token {TOKEN}")
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        adapter.add_pr_comment(OWNER, REPO, PR_NUMBER, body=COMMENT_BODY)
+
+    msg = str(exc_info.value)
+    assert TOKEN not in msg
+    assert "***" in msg
+
+
+@pytest.mark.parametrize("which", ["owner", "repo"])
+def test_add_pr_comment_empty_owner_repo_or_body_raises_value_error_before_any_http(
+    which: str,
+) -> None:
+    called: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request)
+        return httpx.Response(201, json=_comment_response())
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    if which == "owner":
+        with pytest.raises(ValueError, match="owner"):
+            adapter.add_pr_comment("", REPO, PR_NUMBER, body=COMMENT_BODY)
+    elif which == "repo":
+        with pytest.raises(ValueError, match="repo"):
+            adapter.add_pr_comment(OWNER, "", PR_NUMBER, body=COMMENT_BODY)
+    else:
+        with pytest.raises(ValueError, match="body"):
+            adapter.add_pr_comment(OWNER, REPO, PR_NUMBER, body="")
+
+    assert called == []
+
+
+def test_add_pr_comment_invalid_number_raises_value_error_before_any_http() -> None:
+    called: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request)
+        return httpx.Response(201, json=_comment_response())
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(ValueError, match="number"):
+        adapter.add_pr_comment(OWNER, REPO, 0, body=COMMENT_BODY)
 
     assert called == []

@@ -34,7 +34,7 @@ from sfp_config import LocalSecretProvider, SecretRef
 from sfp_contracts.agents.coder import CoderOutput
 from sfp_contracts.agents.planner import PlannerOutput, PrSpec
 from sfp_contracts.agents.readiness import ParsedTicket
-from sfp_contracts.agents.reviewer import QualityGates, ReviewStatus, ReviewerOutput
+from sfp_contracts.agents.reviewer import QualityGates, ReviewerOutput, ReviewStatus
 from sfp_contracts.agents.test_designer import TestDesignerOutput
 from workspace_worker.entrypoints import ticket_pipeline as pipeline_mod
 from workspace_worker.entrypoints.ticket_pipeline import (
@@ -2131,30 +2131,16 @@ def test_premerge_gate_resumed_pr_with_preexisting_approval_no_rereview(
 # --------------------------------------------------------------------------- #
 
 
-class _SequenceReviewerRuntime(FakeRuntime):
-    """Reviewer runtime serving a scripted sequence of verdicts.
+def _malformed_reviewer_output(status: ReviewStatus) -> ReviewerOutput:
+    """Build a verdict whose rationale is empty (model_construct: no validation).
 
     SFP-249 driveability: the malfunction guard can only ever see a malformed
     verdict through a seam that bypasses the contract validator (the contract
-    itself rejects an empty rationale at parse time), so the sequence is served
-    as pre-built :class:`ReviewerOutput` objects — bypassing the JSON parse —
-    by stubbing the module-level ``review`` function, or as raw dicts when the
-    verdicts are valid. Valid dicts keep exercising the real seam end to end.
-    """
-
-    def __init__(self, outputs: list[dict[str, Any]]) -> None:
-        super().__init__({"reviewer": outputs[0] if outputs else None})
-        self._sequence: list[dict[str, Any]] = list(outputs)
-
-    def run(self, request: AgentRunRequest) -> AgentRunResult:
-        index = len(self.calls)
-        if index < len(self._sequence):
-            self._outputs = {"reviewer": self._sequence[index]}
-        return super().run(request)
-
-
-def _malformed_reviewer_output(status: ReviewStatus) -> ReviewerOutput:
-    """Build a verdict whose rationale is empty (model_construct: no validation).
+    itself rejects an empty rationale at parse time), so the scripted sequences
+    serve pre-built :class:`ReviewerOutput` objects via ``model_construct`` —
+    bypassing the JSON parse by stubbing the module-level ``review`` function.
+    Valid verdicts are given as raw dicts and validated through the real
+    contract, keeping the seam end to end.
 
     Only for driving the guard — the contract validator would reject it, which
     is exactly the belt-and-braces point of :func:`is_malformed_review`.
@@ -2208,15 +2194,20 @@ def _stub_review_sequence(monkeypatch: pytest.MonkeyPatch, verdicts: list[Any]) 
 
     Returns the per-call counter so tests can assert the number of review
     invocations (1 for a valid first verdict, 2 once the retry ran).
-    ``model_construct`` verdicts in the sequence are returned verbatim — the
-    only way a malformed verdict can reach the guard (the contract's own
-    validator rejects it at parse time; the guard is belt-and-braces).
+    Valid verdicts may be given as raw dicts — they are validated through the
+    real contract (keeping the seam end-to-end) — while ``model_construct``
+    verdicts in the sequence are returned verbatim, the only way a malformed
+    verdict can reach the guard (the contract's own validator rejects it at
+    parse time; the guard is belt-and-braces).
     """
     calls: list[int] = []
 
     def _fake_review(*args: Any, **kwargs: Any) -> Any:
         calls.append(len(calls))
-        return verdicts[len(calls) - 1]
+        verdict = verdicts[len(calls) - 1]
+        if isinstance(verdict, dict):
+            return ReviewerOutput.model_validate(verdict)
+        return verdict
 
     monkeypatch.setattr(pipeline_mod, "review", _fake_review)
     return calls
