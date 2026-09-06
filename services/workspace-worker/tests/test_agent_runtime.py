@@ -686,7 +686,12 @@ def test_settings_reject_non_secret_ref() -> None:
         )
 
 
-def test_settings_missing_required_field_rejected() -> None:
+def test_settings_missing_required_field_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The settings are env-backed (env_prefix "SFP_"), so the developer shell
+    # may export SFP_LLM_PROVIDER_SECRET_REF — which would satisfy the missing
+    # required field via env and silently un-miss it. Pin the env clean first
+    # (determinism, MAS §12.7); the constructor kwargs alone must be too few.
+    monkeypatch.delenv("SFP_LLM_PROVIDER_SECRET_REF", raising=False)
     with pytest.raises(ValidationError):
         WorkspaceWorkerSettings(  # type: ignore[call-arg]
             anthropic_base_url="https://api.example.com",
