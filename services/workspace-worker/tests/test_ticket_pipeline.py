@@ -25,6 +25,7 @@ import json
 import logging
 import subprocess
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +35,9 @@ from sfp_config import LocalSecretProvider, SecretRef
 from sfp_contracts.agents.coder import CoderOutput
 from sfp_contracts.agents.planner import PlannerOutput, PrSpec
 from sfp_contracts.agents.readiness import ParsedTicket
-from sfp_contracts.agents.reviewer import ReviewStatus
+from sfp_contracts.agents.reviewer import ReviewerOutput, ReviewStatus
 from sfp_contracts.agents.test_designer import TestDesignerOutput
+from workspace_worker.agent_runtime.runtime import ClaudeAgentRuntime
 from workspace_worker.entrypoints import ticket_pipeline as pipeline_mod
 from workspace_worker.entrypoints.ticket_pipeline import (
     REVIEWER_MALFUNCTION_COMMENT,
@@ -308,6 +310,37 @@ class FakeRuntime:
             output=out,
             final_text=final_text,
         )
+
+
+@dataclass
+class _StructuredOnlyMessage:
+    """Final-message stand-in for the SDK-enforced ``output_format`` path.
+
+    What the SDK produces under ``enforce_schema=True`` on a first-class
+    success: ``structured_output`` populated (parsed, schema-valid) and
+    ``result`` None — the exact shape whose transport gap caused review F1.
+    """
+
+    result: str | None = None
+    is_error: bool = False
+    errors: list[str] | None = None
+    api_error_status: int | None = None
+    structured_output: Any = None
+
+
+class _StructuredOnlyQueryFn:
+    """``query_fn`` yielding one :class:`_StructuredOnlyMessage` per attempt."""
+
+    def __init__(self, structured: Mapping[str, Any]) -> None:
+        self._structured = structured
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, *, prompt: str, options: Any) -> Any:
+        self.calls.append({"prompt": prompt, "options": options})
+        return self._stream()
+
+    async def _stream(self):  # noqa: ANN202 - async gen
+        yield _StructuredOnlyMessage(result=None, structured_output=dict(self._structured))
 
 
 def _make_runtimes(
@@ -2424,3 +2457,54 @@ def test_whitespace_only_rationale_is_malfunction_and_retries(
         "APPROVE",
         f"APPROVED: {_RATIONALE}",
     ) in fakes["reviewer_adapter"].calls
+
+
+def test_structured_only_review_rationale_reaches_body_and_merges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SFP-249 review F1 (pinned AC): a review from the structured-only path —
+    the REAL ``ClaudeAgentRuntime`` with ``enforce_schema=True`` whose
+    ``ResultMessage`` carries ``structured_output`` and ``result=None``, exactly
+    what the SDK's output_format enforcement produces — submits a GitHub body
+    carrying the verdict + gates (the runtime's deterministic rendering, NEVER
+    the bare status word) and does NOT classify as REVIEWER_MALFUNCTION: the
+    pipeline merges and transitions Done."""
+    monkeypatch.setenv("LLM_TOKEN", "test-token")
+    # The REAL reviewer runtime (same wiring as the composition root), fed by a
+    # fake query_fn yielding the output_format-shaped final message.
+    structured = _reviewer_output(approved=True)
+    qfn = _StructuredOnlyQueryFn(structured)
+    reviewer_runtime = ClaudeAgentRuntime(
+        WorkspaceWorkerSettings(
+            anthropic_base_url="https://api.example.com",
+            default_model="claude-sonnet-4",
+            llm_provider_secret_ref=SecretRef(name="LLM_TOKEN"),
+        ),
+        LocalSecretProvider(secrets_file=None),
+        ReviewerOutput,
+        query_fn=qfn,
+        max_retries=0,
+    )
+    runtimes, _ = _make_runtimes(approved=True)
+    runtimes["reviewer"] = reviewer_runtime
+
+    result, fakes = _run(tmp_path, runtimes)
+
+    # NOT a REVIEWER_MALFUNCTION: exactly ONE reviewer run (no retry, no
+    # comment) and the run went all the way to merge + Done.
+    assert result.success is True
+    assert len(qfn.calls) == 1
+    assert all(c[0] != "add_pr_comment" for c in fakes["reviewer_adapter"].calls)
+    assert ("merge_pr", OWNER, REPO, PR_NUMBER, "squash") in fakes["coder_adapter"].calls
+    assert fakes["jira"].transitions == [(TICKET, "51")]
+    # The body carries the verdict + gates — the deterministic rendering with
+    # sorted keys, NOT the bare status word. (Tuple shape: name, owner, repo,
+    # number, event, body — the body is element 5.)
+    expected = "APPROVED: " + json.dumps(structured, sort_keys=True)
+    submitted = [c for c in fakes["reviewer_adapter"].calls if c[0] == "submit_review"]
+    assert len(submitted) == 1
+    assert submitted[0][5] == expected
+    assert submitted[0][5] != "APPROVED"
+    # Every gate boolean is present in the submitted body.
+    for gate in ("blueprint_compliance", "acceptance_criteria_satisfied"):
+        assert gate in submitted[0][5]

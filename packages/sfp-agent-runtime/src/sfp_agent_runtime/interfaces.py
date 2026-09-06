@@ -68,12 +68,16 @@ class AgentRunResult:
         success: ``True`` iff the run produced a usable result.
         output: The opaque parsed-JSON result on success; ``None`` on failure.
         error: A provider-supplied error message on failure; ``None`` on success.
-        final_text: The agent's final textual message (SFP-249), when the
-            provider surfaces one — transport for human-readable surfaces
-            (e.g. the GitHub review body). It is NOT a decision field:
-            ``output`` alone carries the structured judgment; this stays
-            ``None`` when the provider captured no final text (additive,
-            default-``None``, backward-compatible).
+        final_text: Human-readable transport text (SFP-249) for surfaces like
+            the GitHub review body, from one of two sources in precedence
+            order: the agent's final textual message when the provider
+            surfaces a non-empty one; otherwise, on the structured-only path
+            (``output_format`` enforced, empty final text), a deterministic
+            rendering of the structured verdict — so it is never ``None`` on
+            a success that produced ``output``. It is NOT a decision field:
+            ``output`` alone carries the structured judgment. Stays ``None``
+            on failure / when no output exists (additive, default-``None``,
+            backward-compatible).
     """
 
     agent: str

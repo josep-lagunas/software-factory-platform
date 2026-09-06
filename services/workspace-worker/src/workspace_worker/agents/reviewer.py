@@ -68,9 +68,12 @@ def _run_model_with_text(
     """Run the Reviewer model; return ``(validated output, final_text)``.
 
     Fail-closed (ID-067) exactly as the original seam; the only addition is
-    capturing the run result's ``final_text`` (SFP-249) — ``None`` when the
-    runtime supplied none (e.g. a fake or non-Claude runtime predating the
-    field).
+    capturing the run result's ``final_text`` (SFP-249) — the reviewer's final
+    textual message when the runtime surfaced one, else (the SDK-enforced
+    ``output_format`` path: empty text, populated structured output) the
+    runtime's deterministic rendering of the structured verdict. ``None`` only
+    when the runtime supplied neither (e.g. a fake or non-Claude runtime
+    predating the field).
     """
     try:
         result: AgentRunResult = runtime.run(request)
@@ -151,18 +154,22 @@ def review_with_text(
     """Judge a PR-spec and return ``(verdict, final_text)`` (SFP-249).
 
     Identical seam, inputs, and fail-closed semantics as :func:`review`; the
-    only addition is that the run result's ``final_text`` (the reviewer's final
-    textual message, transported by
-    :attr:`~sfp_agent_runtime.interfaces.AgentRunResult.final_text`) is captured
-    and returned alongside the verdict. The verdict remains the ONLY decision
-    field — the text is transport for the GitHub review body surface (ID-021:
-    contracts carry structured judgments only; rationale lives on GitHub, never
-    in ``ReviewerOutput``). ``final_text`` is ``None`` when the runtime
-    captured no final text.
+    only addition is that the run result's ``final_text`` (transported by
+    :attr:`~sfp_agent_runtime.interfaces.AgentRunResult.final_text`) is
+    captured and returned alongside the verdict. That text has two possible
+    sources in precedence order: the reviewer's final textual message when the
+    runtime surfaced one; else (the SDK-enforced ``output_format`` path: empty
+    text, populated structured output) the runtime's deterministic rendering
+    of the structured verdict — so it is never empty when a verdict exists and
+    the REVIEWER_MALFUNCTION guard sees a non-empty source on both paths. The
+    verdict remains the ONLY decision field — the text is transport for the
+    GitHub review body surface (ID-021: contracts carry structured judgments
+    only; rationale lives on GitHub, never in ``ReviewerOutput``).
+    ``final_text`` is ``None`` when the runtime captured neither source.
 
     Returns:
         ``(ReviewerOutput, final_text)`` — the validated verdict and the
-        reviewer's final text (``None`` when absent).
+        reviewer's rationale text (``None`` when absent).
 
     Raises:
         ReviewerError: On any failure mode of the model run (ID-067).

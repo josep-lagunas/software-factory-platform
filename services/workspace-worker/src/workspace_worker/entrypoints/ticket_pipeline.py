@@ -562,7 +562,10 @@ def is_malformed_rationale(rationale_source: str | None) -> bool:
     """Whether a review verdict's rationale is a REVIEWER_MALFUNCTION (SFP-249).
 
     The rationale is the reviewer's ``final_text`` — the textual rationale the
-    runtime transports alongside the structured verdict. A rationale that is
+    runtime transports alongside the structured verdict: the reviewer's final
+    agent message, or (the SDK-enforced ``output_format`` path, where that
+    message is empty) the runtime's deterministic rendering of the structured
+    verdict. A rationale that is
     empty after strip is a malfunction on EVERY status — including
     ``APPROVED``: an empty-rationale approval is exactly as untrustworthy as an
     empty-rationale rejection, and both mean the reviewer itself malfunctioned
@@ -588,14 +591,17 @@ def _review_body(review_status: ReviewStatus, final_text: str | None) -> str:
 
     Deterministic — no model prose beyond the reviewer's own recorded final
     text, no clock. The status word is the verdict prefix; the rationale is the
-    reviewer's final text. Falls back to the BARE status word ONLY when the
-    final text is empty/``None`` (the malformed case never reaches a verdict
-    submission — the guard re-runs or aborts first — so in practice a submitted
-    body always carries both).
+    reviewer's final text (the agent message, or the runtime's deterministic
+    structured-verdict rendering on the structured-only path). Falls back to
+    the BARE status word ONLY when the final text is empty/``None`` — kept as
+    belt-and-braces: unreachable while the malfunction guard is on (the guard
+    re-runs or aborts before any submission, and on the structured-only path
+    the runtime itself guarantees a non-empty rendering), so in practice a
+    submitted body always carries both.
 
     Args:
         review_status: The verdict whose status word prefixes the body.
-        final_text: The reviewer's final textual rationale (may be ``None``).
+        final_text: The reviewer's rationale text (may be ``None``).
 
     Returns:
         ``"<STATUS>: <rationale>"`` when a rationale exists; the bare status
@@ -643,9 +649,11 @@ def _guarded_review(
     Exactly ONE retry — bounded and deterministic; no loops, no backoff.
 
     The rationale is read from ``AgentRunResult.final_text`` — the runtime
-    transports the reviewer's final text alongside the structured verdict
-    (ID-021: contracts carry structured judgments only; the rationale lives on
-    GitHub, never in ``ReviewerOutput``).
+    transports the reviewer's rationale alongside the structured verdict: the
+    reviewer's final agent message, or (the SDK-enforced ``output_format``
+    path, where that message is empty) a deterministic rendering of the
+    structured verdict (ID-021: contracts carry structured judgments only;
+    the rationale lives on GitHub, never in ``ReviewerOutput``).
 
     Args:
         on_malfunction: Optional sink invoked with
