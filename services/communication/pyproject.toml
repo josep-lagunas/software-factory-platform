@@ -7,6 +7,9 @@ dependencies = [
     "alembic>=1.13.0",
     "httpx",
     "sfp-config",
+    "sfp-contracts",
+    "sfp-messaging",
+    "uvicorn>=0.52.0",
 ]
 
 [build-system]
@@ -17,9 +20,13 @@ build-backend = "hatchling.build"
 # local workspace rather than a registry (SFP-75 precedent). The Slack
 # outbound adapter (SFP-133) resolves SecretRef(name="SLACK_BOT_TOKEN")
 # through the injected SecretProvider (ID-016) and drives chat.postMessage
-# with httpx (ID-051).
+# with httpx (ID-051). SFP-132 adds the inbound half: the Slack Events
+# receiver publishes ExternalEventReceived envelopes (sfp-contracts) onto the
+# MessageBus (sfp-messaging), and the dev runner serves it via uvicorn.
 [tool.uv.sources]
 sfp-config = { workspace = true }
+sfp-contracts = { workspace = true }
+sfp-messaging = { workspace = true }
 
 [tool.coverage.run]
 source = ["src/communication"]
