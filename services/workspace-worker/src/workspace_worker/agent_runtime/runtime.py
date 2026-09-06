@@ -345,11 +345,30 @@ class ClaudeAgentRuntime:
 
         # 7. Success — agent/ticket_id come from the REQUEST, never parsed
         #    output (anti-spoof). ``output`` is the raw parsed JSON.
+        #    SFP-249: ``final_text`` transports the human-readable judgment:
+        #    the captured ResultMessage result text when the agent produced
+        #    one; otherwise (SFP-249 review F1 — the SDK-enforced
+        #    output_format path leaves ``result`` None while
+        #    ``structured_output`` carries the verdict) a DETERMINISTIC
+        #    rendering of the structured verdict, so the field is never
+        #    empty on a success and the REVIEWER_MALFUNCTION guard has a
+        #    non-empty source on BOTH paths. ``output`` stays the only
+        #    decision field.
+        final_text: str | None
+        if isinstance(result_text, str) and result_text.strip():
+            final_text = result_text
+        elif parsed is not None:
+            # Deterministic: sorted keys, no ambient formatting/clock — the
+            # same verdict always renders to the same text (MAS §12.7).
+            final_text = json.dumps(parsed, sort_keys=True)
+        else:  # pragma: no cover — defensive: step 4 rejects no-output results
+            final_text = None
         return AgentRunResult(
             agent=request.agent,
             ticket_id=request.ticket_id,
             success=True,
             output=parsed,
+            final_text=final_text,
         )
 
     async def _consume_stream(

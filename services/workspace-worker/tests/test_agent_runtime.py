@@ -56,7 +56,8 @@ class FakeMessage:
     """Minimal stand-in for ``claude_agent_sdk.ResultMessage``.
 
     The adapter only inspects ``result``/``is_error``/``errors``/
-    ``api_error_status``, so a stand-in is sufficient and keeps this test module
+    ``api_error_status`` (plus ``structured_output`` for the SDK-enforced
+    output_format path), so a stand-in is sufficient and keeps this test module
     free of any ``claude_agent_sdk`` import (preserving the laziness invariant).
     """
 
@@ -64,6 +65,7 @@ class FakeMessage:
     is_error: bool = False
     errors: list[str] | None = None
     api_error_status: int | None = None
+    structured_output: Any = None
 
 
 @dataclass
@@ -228,6 +230,125 @@ def test_agent_and_ticket_id_come_from_request_not_output() -> None:
     assert res.agent == "planner"  # from request, NOT parsed "evil"
     assert res.ticket_id == "SFP-99"
     assert res.output == {"answer": "x", "agent": "evil"}
+
+
+# --------------------------------------------------------------------------- #
+# SFP-249 — final_text population / passthrough
+# --------------------------------------------------------------------------- #
+
+
+def test_final_text_populated_from_result_message_text() -> None:
+    """SFP-249: on the text path the runtime populates ``final_text`` verbatim
+    from the captured ``ResultMessage.result`` string."""
+    raw = '```json\n{"answer": "x"}\n```'
+    qfn = FakeQuery(outcomes=[[FakeMessage(result=raw)]])
+    rt = make_runtime(qfn)
+
+    res = rt.run(request(agent="reviewer"))
+
+    assert res.success is True
+    assert res.output == {"answer": "x"}
+    assert res.final_text == raw
+
+
+def test_final_text_preserved_verbatim_not_json_stripped() -> None:
+    """SFP-249: ``final_text`` is the RAW result text — the fence-stripping the
+    runtime applies to parse JSON must NOT leak into the transport field."""
+    raw = '```json\n{"answer": "x"}\n```'
+    qfn = FakeQuery(outcomes=[[FakeMessage(result=raw)]])
+    rt = make_runtime(qfn)
+
+    res = rt.run(request())
+
+    assert res.success is True
+    assert res.output == {"answer": "x"}  # parsed (fences stripped) …
+    assert res.final_text == raw  # … but the transport text is untouched
+
+
+def test_final_text_fallback_deterministic_rendering_on_structured_only_path() -> None:
+    """SFP-249 review F1: on the structured-only path (SDK enforced
+    output_format — ``structured_output`` populated, ``result`` None) the
+    runtime populates ``final_text`` with a DETERMINISTIC rendering of the
+    structured verdict — asserted EXACTLY so the rendering cannot drift.
+    Without this fallback the REVIEWER_MALFUNCTION guard would deterministically
+    fire on every structured-output review (empty rationale) and stop all
+    merges."""
+    qfn = FakeQuery(
+        outcomes=[[FakeMessage(result=None, structured_output={"answer": "structured"})]]
+    )
+    rt = make_runtime(qfn)
+
+    res = rt.run(request())
+
+    assert res.success is True
+    assert res.output == {"answer": "structured"}
+    # Exact rendering pin: sorted keys, default separators — the same verdict
+    # always renders to the same text (MAS §12.7 determinism).
+    assert res.final_text == '{"answer": "structured"}'
+
+
+def test_final_text_fallback_rendering_is_key_sorted() -> None:
+    """SFP-249 review F1: the fallback rendering sorts keys — a multi-field
+    verdict renders independently of the model's field emission order."""
+    structured = {"zebra": "last", "alpha": "first"}
+    qfn = FakeQuery(outcomes=[[FakeMessage(result=None, structured_output=structured)]])
+
+    class TwoFieldContract(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        zebra: str
+        alpha: str
+
+    rt = ClaudeAgentRuntime(
+        make_settings(),
+        FakeSecretProvider(),
+        TwoFieldContract,
+        query_fn=qfn,
+        max_retries=2,
+        sleep=_noop_sleep,
+    )
+
+    res = rt.run(request())
+
+    assert res.success is True
+    assert res.final_text == '{"alpha": "first", "zebra": "last"}'
+
+
+def test_final_text_whitespace_only_result_falls_back_to_structured() -> None:
+    """SFP-249 review F1: a whitespace-only ``result`` string is NOT a usable
+    rationale — the fallback kicks in exactly as for ``None`` (the guard would
+    otherwise classify the stripped-empty text as a malfunction)."""
+    qfn = FakeQuery(outcomes=[[FakeMessage(result="   \n\t ", structured_output={"answer": "s"})]])
+    rt = make_runtime(qfn)
+
+    res = rt.run(request())
+
+    assert res.success is True
+    assert res.final_text == '{"answer": "s"}'
+
+
+def test_final_text_none_preserved_when_neither_source() -> None:
+    """SFP-249 review F1: ``None``-preservation when NEITHER source exists. A
+    result with no text and no structured output is transient-retried and then
+    fails (step 4 never lets it reach the success path) — a failed run carries
+    no ``final_text``, never a coerced empty string."""
+    qfn = FakeQuery(outcomes=[[FakeMessage(result=None)]])
+    rt = make_runtime(qfn, max_retries=1)
+
+    res = rt.run(request())
+
+    assert res.success is False
+    assert res.final_text is None
+
+
+def test_final_text_none_on_failure() -> None:
+    """SFP-249: a failed run never carries a final_text."""
+    qfn = FakeQuery(outcomes=[[FakeMessage(result='{"unexpected": 1}')]])
+    rt = make_runtime(qfn)
+
+    res = rt.run(request())
+
+    assert res.success is False
+    assert res.final_text is None
 
 
 # --------------------------------------------------------------------------- #

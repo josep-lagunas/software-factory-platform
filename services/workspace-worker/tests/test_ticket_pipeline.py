@@ -24,7 +24,8 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -34,15 +35,21 @@ from sfp_config import LocalSecretProvider, SecretRef
 from sfp_contracts.agents.coder import CoderOutput
 from sfp_contracts.agents.planner import PlannerOutput, PrSpec
 from sfp_contracts.agents.readiness import ParsedTicket
+from sfp_contracts.agents.reviewer import ReviewerOutput, ReviewStatus
 from sfp_contracts.agents.test_designer import TestDesignerOutput
+from workspace_worker.agent_runtime.runtime import ClaudeAgentRuntime
 from workspace_worker.entrypoints import ticket_pipeline as pipeline_mod
 from workspace_worker.entrypoints.ticket_pipeline import (
+    REVIEWER_MALFUNCTION_COMMENT,
+    REVIEWER_MALFUNCTION_ERROR,
     PipelineDeps,
     PipelineResult,
     _build_pr_body,
     _checkpoint_dir,
+    _review_body,
     build,
     effective_review_state,
+    is_malformed_rationale,
     run_pipeline,
     verify_branch_commits,
 )
@@ -51,6 +58,7 @@ from workspace_worker.repo.branch import BranchResult
 from workspace_worker.repo.git.adapter import (
     GitMergeResult,
     GitProviderAdapterError,
+    PrCommentResult,
     PullRequestResult,
     PullRequestReview,
     ReviewResult,
@@ -256,10 +264,19 @@ class FakeRuntime:
 
     Exposes ``_cwd`` (the attribute the loop rebinds at code time, RESOLUTION 3)
     and records the value it sees when ``.run()`` is invoked.
+
+    SFP-249: ``final_texts`` optionally serves a per-call reviewer rationale
+    (``AgentRunResult.final_text``); the default is ``None`` — the malformed
+    case the REVIEWER_MALFUNCTION guard must catch deterministically.
     """
 
-    def __init__(self, outputs: Mapping[str, dict[str, Any] | None]) -> None:
+    def __init__(
+        self,
+        outputs: Mapping[str, dict[str, Any] | None],
+        final_texts: Sequence[str | None] | None = None,
+    ) -> None:
         self._outputs = outputs
+        self._final_texts = list(final_texts) if final_texts is not None else None
         self._cwd: str | None = None
         self.calls: list[dict[str, Any]] = []
 
@@ -269,6 +286,7 @@ class FakeRuntime:
                 "agent": request.agent,
                 "ticket_id": request.ticket_id,
                 "cwd": self._cwd,
+                "prompt": request.prompt,
             }
         )
         out = self._outputs.get(request.agent)
@@ -279,9 +297,50 @@ class FakeRuntime:
                 success=False,
                 error=f"no canned output for agent={request.agent!r}",
             )
+        final_text: str | None = None
+        if self._final_texts is not None:
+            idx = len(self.calls) - 1
+            final_text = (
+                self._final_texts[idx] if idx < len(self._final_texts) else self._final_texts[-1]
+            )
         return AgentRunResult(
-            agent=request.agent, ticket_id=request.ticket_id, success=True, output=out
+            agent=request.agent,
+            ticket_id=request.ticket_id,
+            success=True,
+            output=out,
+            final_text=final_text,
         )
+
+
+@dataclass
+class _StructuredOnlyMessage:
+    """Final-message stand-in for the SDK-enforced ``output_format`` path.
+
+    What the SDK produces under ``enforce_schema=True`` on a first-class
+    success: ``structured_output`` populated (parsed, schema-valid) and
+    ``result`` None — the exact shape whose transport gap caused review F1.
+    """
+
+    result: str | None = None
+    is_error: bool = False
+    errors: list[str] | None = None
+    api_error_status: int | None = None
+    structured_output: Any = None
+
+
+class _StructuredOnlyQueryFn:
+    """``query_fn`` yielding one :class:`_StructuredOnlyMessage` per attempt."""
+
+    def __init__(self, structured: Mapping[str, Any]) -> None:
+        self._structured = structured
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, *, prompt: str, options: Any) -> Any:
+        self.calls.append({"prompt": prompt, "options": options})
+        return self._stream()
+
+    async def _stream(self):  # noqa: ANN202 - async gen
+        yield _StructuredOnlyMessage(result=None, structured_output=dict(self._structured))
 
 
 def _make_runtimes(
@@ -289,6 +348,7 @@ def _make_runtimes(
     readiness: dict[str, Any] | None = None,
     planner_specs: int = 1,
     approved: bool = True,
+    reviewer_final_texts: Sequence[str | None] | None = None,
 ) -> tuple[dict[str, FakeRuntime], dict[str, FakeRuntime]]:
     """Build the 5 per-role runtimes + return (runtimes_dict, handles).
 
@@ -296,12 +356,22 @@ def _make_runtimes(
     the ReadinessOutput contract) — the slice's readiness gate reads that key
     directly rather than reusing the planner runtime (whose PlannerOutput
     contract made the gate fail-closed). Each role serves only its own agent name.
+
+    SFP-249: ``reviewer_final_texts`` optionally serves per-call reviewer
+    rationales on the reviewer runtime; the default is a VALID one (so
+    pre-existing tests exercise the healthy body-composition path — the bare
+    status word is never submitted when a rationale exists).
     """
     readiness_rt = FakeRuntime({"readiness": readiness or _readiness_ready()})
     planner = FakeRuntime({"planner": _planner_output(planner_specs)})
     test_designer = FakeRuntime({"test_designer": _test_designer_output()})
     coder = FakeRuntime({"coder": _coder_output()})
-    reviewer = FakeRuntime({"reviewer": _reviewer_output(approved)})
+    reviewer = FakeRuntime(
+        {"reviewer": _reviewer_output(approved)},
+        final_texts=reviewer_final_texts
+        if reviewer_final_texts is not None
+        else ["Solid: matches the spec; gates all pass."],
+    )
     runtimes = {
         "readiness": readiness_rt,
         "planner": planner,
@@ -401,6 +471,11 @@ class FakeGitAdapter:
     ) -> ReviewResult:
         self.calls.append(("submit_review", owner, repo, number, event, body))
         return ReviewResult(owner=owner, repo=repo, number=number, review_id=1, state=event)
+
+    def add_pr_comment(self, owner: str, repo: str, number: int, *, body: str) -> PrCommentResult:
+        """SFP-249: record the PR conversation comment (never a verdict)."""
+        self.calls.append(("add_pr_comment", owner, repo, number, body))
+        return PrCommentResult(owner=owner, repo=repo, number=number, comment_id=1)
 
     def merge_pr(
         self, owner: str, repo: str, number: int, *, merge_method: str = "squash"
@@ -596,10 +671,16 @@ def test_happy_path_runs_full_pipeline_and_transitions_done(tmp_path: Path) -> N
     # The PR was created on the coder adapter, merged via squash.
     assert any(c[0] == "create_pr" for c in fakes["coder_adapter"].calls)
     assert ("merge_pr", OWNER, REPO, PR_NUMBER, "squash") in fakes["coder_adapter"].calls
-    # The reviewer adapter submitted APPROVE (not the coder adapter).
-    assert ("submit_review", OWNER, REPO, PR_NUMBER, "APPROVE", "APPROVED") in fakes[
-        "reviewer_adapter"
-    ].calls
+    # The reviewer adapter submitted APPROVE (not the coder adapter). SFP-249:
+    # the body carries the status word PLUS the reviewer's final text.
+    assert (
+        "submit_review",
+        OWNER,
+        REPO,
+        PR_NUMBER,
+        "APPROVE",
+        "APPROVED: Solid: matches the spec; gates all pass.",
+    ) in fakes["reviewer_adapter"].calls
     # Object upload went through RepoManager.push (never the adapter).
     assert any(c[0] == "push" for c in fakes["repo_manager"].calls)
     assert all(
@@ -905,14 +986,15 @@ def test_review_request_changes_does_not_merge_and_does_not_transition(
     assert result.success is False
     assert result.pr_number == PR_NUMBER
     assert "review not approved" in (result.error or "")
-    # Reviewer submitted REQUEST_CHANGES.
+    # Reviewer submitted REQUEST_CHANGES. SFP-249: the body carries the status
+    # word PLUS the reviewer's final text.
     assert (
         "submit_review",
         OWNER,
         REPO,
         PR_NUMBER,
         "REQUEST_CHANGES",
-        "CHANGES_REQUESTED",
+        "CHANGES_REQUESTED: Solid: matches the spec; gates all pass.",
     ) in fakes["reviewer_adapter"].calls
     # No merge, no Done transition.
     assert all(c[0] != "merge_pr" for c in fakes["coder_adapter"].calls)
@@ -1957,11 +2039,26 @@ def test_premerge_gate_dismissed_review_triggers_rereview_then_merges(
     # pre-merge re-run, both under the reviewer runtime (sfp-reviewer-bot seam).
     assert len(handles["reviewer"].calls) == 2
     assert all(c["agent"] == "reviewer" for c in handles["reviewer"].calls)
-    # The re-run's APPROVE was submitted via the REVIEWER adapter.
+    # The re-run's APPROVE was submitted via the REVIEWER adapter. SFP-249: each
+    # body carries the status word PLUS the reviewer's final text.
     submit_calls = [c for c in fakes["reviewer_adapter"].calls if c[0] == "submit_review"]
     assert submit_calls == [
-        ("submit_review", OWNER, REPO, PR_NUMBER, "APPROVE", "APPROVED"),
-        ("submit_review", OWNER, REPO, PR_NUMBER, "APPROVE", "APPROVED"),
+        (
+            "submit_review",
+            OWNER,
+            REPO,
+            PR_NUMBER,
+            "APPROVE",
+            "APPROVED: Solid: matches the spec; gates all pass.",
+        ),
+        (
+            "submit_review",
+            OWNER,
+            REPO,
+            PR_NUMBER,
+            "APPROVE",
+            "APPROVED: Solid: matches the spec; gates all pass.",
+        ),
     ]
     # Then the merge proceeded.
     assert ("merge_pr", OWNER, REPO, PR_NUMBER, "squash") in coder_adapter.calls
@@ -2016,7 +2113,12 @@ def test_premerge_gate_rereview_changes_requested_aborts_without_merge(
             return super().run(request)
 
     runtimes, handles = _make_runtimes(approved=True)
-    seq = _ApproveThenReject({"reviewer": _reviewer_output(True)})
+    # SFP-249: both verdicts carry a VALID rationale (FakeRuntime repeats the
+    # last element) so the SFP-249 guard lets each through untouched.
+    seq = _ApproveThenReject(
+        {"reviewer": _reviewer_output(True)},
+        final_texts=["Solid: matches the spec; gates all pass."],
+    )
     runtimes["reviewer"] = seq
     handles["reviewer"] = seq
     coder_adapter = FakeGitAdapter()
@@ -2029,10 +2131,25 @@ def test_premerge_gate_rereview_changes_requested_aborts_without_merge(
     assert "review not approved: CHANGES_REQUESTED" in (result.error or "")
     # Both verdicts were submitted, in order: the normal stage APPROVE, then
     # the pre-merge re-run's REQUEST_CHANGES (the one that fails the merge).
+    # SFP-249: each body carries the status word PLUS the reviewer's final text.
     submit_calls = [c for c in fakes["reviewer_adapter"].calls if c[0] == "submit_review"]
     assert submit_calls == [
-        ("submit_review", OWNER, REPO, PR_NUMBER, "APPROVE", "APPROVED"),
-        ("submit_review", OWNER, REPO, PR_NUMBER, "REQUEST_CHANGES", "CHANGES_REQUESTED"),
+        (
+            "submit_review",
+            OWNER,
+            REPO,
+            PR_NUMBER,
+            "APPROVE",
+            "APPROVED: Solid: matches the spec; gates all pass.",
+        ),
+        (
+            "submit_review",
+            OWNER,
+            REPO,
+            PR_NUMBER,
+            "REQUEST_CHANGES",
+            "CHANGES_REQUESTED: Solid: matches the spec; gates all pass.",
+        ),
     ]
     # NO merge, NO Done transition.
     assert all(c[0] != "merge_pr" for c in fakes["coder_adapter"].calls)
@@ -2098,3 +2215,296 @@ def test_premerge_gate_resumed_pr_with_preexisting_approval_no_rereview(
     # And the merge + Done transition happened.
     assert ("merge_pr", OWNER, REPO, PR_NUMBER, "squash") in coder_adapter.calls
     assert fakes["jira"].transitions == [(TICKET, "51")]
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer rationale surfacing + REVIEWER_MALFUNCTION guard (SFP-249)
+# --------------------------------------------------------------------------- #
+
+
+_RATIONALE = "Solid: matches the spec; gates all pass."
+
+
+def test_is_malformed_rationale_rows_per_status_including_approved() -> None:
+    """Row-test the pure validator: an EMPTY (post-strip) rationale is a
+    REVIEWER_MALFUNCTION on EVERY status — including APPROVED. A non-empty
+    rationale is never malformed, regardless of status."""
+    for status in (
+        ReviewStatus.APPROVED,
+        ReviewStatus.CHANGES_REQUESTED,
+        ReviewStatus.BLOCKED,
+        ReviewStatus.NEEDS_HUMAN_DECISION,
+    ):
+        # Malformed inputs: None (no final text), "", and whitespace-only.
+        assert is_malformed_rationale(None) is True, status
+        assert is_malformed_rationale("") is True, status
+        assert is_malformed_rationale("   \n\t ") is True, status
+        # Valid inputs: any non-empty post-strip text.
+        assert is_malformed_rationale(_RATIONALE) is False, status
+        assert is_malformed_rationale(f"  {_RATIONALE} \n") is False, status
+
+
+def test_review_body_carries_status_word_plus_rationale() -> None:
+    """AC: the submitted body is the status-word prefix followed by the
+    reviewer's final text; the BARE status word only when the text is
+    empty/None (which the guard prevents from ever being submitted)."""
+    assert _review_body(ReviewStatus.APPROVED, "Looks good.") == "APPROVED: Looks good."
+    assert (
+        _review_body(ReviewStatus.CHANGES_REQUESTED, "  Needs tests for the abort path.  ")
+        == "CHANGES_REQUESTED: Needs tests for the abort path."
+    )
+    assert _review_body(ReviewStatus.BLOCKED, None) == "BLOCKED"
+    assert _review_body(ReviewStatus.APPROVED, "") == "APPROVED"
+    assert _review_body(ReviewStatus.APPROVED, "   ") == "APPROVED"
+
+
+def test_pipeline_submits_review_body_with_status_and_reviewer_text(
+    tmp_path: Path,
+) -> None:
+    """AC: the GitHub review body submitted by the pipeline carries the status
+    word PLUS the reviewer's final text — never the bare word when a rationale
+    exists (pinned end-to-end through run_pipeline)."""
+    runtimes, _ = _make_runtimes(
+        approved=True, reviewer_final_texts=["Matches the PRSpec end to end."]
+    )
+    result, fakes = _run(tmp_path, runtimes)
+
+    assert result.success is True
+    assert (
+        "submit_review",
+        OWNER,
+        REPO,
+        PR_NUMBER,
+        "APPROVE",
+        "APPROVED: Matches the PRSpec end to end.",
+    ) in fakes["reviewer_adapter"].calls
+
+
+def test_malfunction_then_valid_retry_proceeds_to_merge(tmp_path: Path) -> None:
+    """AC: a malformed first verdict triggers EXACTLY one retry; the retry's
+    valid APPROVED verdict is acted on normally (merge + Done). No PR comment
+    is posted — the malfunction self-healed."""
+    runtimes, handles = _make_runtimes(approved=True, reviewer_final_texts=[None, _RATIONALE])
+
+    result, fakes = _run(tmp_path, runtimes)
+
+    assert result.success is True
+    assert result.pr_number == PR_NUMBER
+    # Exactly 2 reviewer runs: the malformed first attempt + the one retry.
+    assert len(handles["reviewer"].calls) == 2
+    # NO malfunction comment — the retry succeeded.
+    assert all(c[0] != "add_pr_comment" for c in fakes["reviewer_adapter"].calls)
+    # The retry re-used the SAME seam inputs (prompt identical, MAS §12.7).
+    first, retry = handles["reviewer"].calls[0], handles["reviewer"].calls[1]
+    assert first["prompt"] == retry["prompt"]
+    assert first["ticket_id"] == retry["ticket_id"]
+    # The submitted verdict carries the retry's rationale.
+    assert (
+        "submit_review",
+        OWNER,
+        REPO,
+        PR_NUMBER,
+        "APPROVE",
+        f"APPROVED: {_RATIONALE}",
+    ) in fakes["reviewer_adapter"].calls
+    # And the pipeline still merged + transitioned Done.
+    assert ("merge_pr", OWNER, REPO, PR_NUMBER, "squash") in fakes["coder_adapter"].calls
+    assert fakes["jira"].transitions == [(TICKET, "51")]
+
+
+def test_malformed_twice_aborts_with_differentiated_error_and_comment(
+    tmp_path: Path,
+) -> None:
+    """AC: malformed twice → abort carrying the DIFFERENTIATED error string
+    (asserted to differ from the 'review not approved' family) + a GitHub
+    COMMENT (not a review verdict) noting the malfunction and the retry."""
+    runtimes, handles = _make_runtimes(approved=True, reviewer_final_texts=[None, None])
+
+    result, fakes = _run(tmp_path, runtimes)
+
+    assert result.success is False
+    assert result.pr_number == PR_NUMBER
+    assert result.error == REVIEWER_MALFUNCTION_ERROR
+    # The differentiated message must be distinguishable from a code verdict.
+    assert result.error != "review not approved: APPROVED"
+    assert "review not approved" not in result.error
+    # Exactly 2 reviewer runs — the single retry, never a third.
+    assert len(handles["reviewer"].calls) == 2
+    # A PR conversation COMMENT was posted on the REVIEWER adapter …
+    comment_calls = [c for c in fakes["reviewer_adapter"].calls if c[0] == "add_pr_comment"]
+    assert comment_calls == [
+        ("add_pr_comment", OWNER, REPO, PR_NUMBER, REVIEWER_MALFUNCTION_COMMENT)
+    ]
+    # … and NO review verdict was ever submitted (a malfunction is not a
+    # judgment about the code).
+    assert all(c[0] != "submit_review" for c in fakes["reviewer_adapter"].calls)
+    # No merge, no Done transition.
+    assert all(c[0] != "merge_pr" for c in fakes["coder_adapter"].calls)
+    assert fakes["jira"].transitions == []
+    # Trace records the comment, then stops — no submit_review after it.
+    assert result.trace[-1] == "reviewer_adapter.add_pr_comment"
+
+
+def test_malformed_twice_on_premerge_rereview_site_aborts_differently(
+    tmp_path: Path,
+) -> None:
+    """AC: BOTH review sites are guarded — the SFP-241 pre-merge re-review
+    (a DISMISSED approval for the current head) aborts with the same
+    differentiated error and comment, never a 'review not approved' verdict."""
+    runtimes, handles = _make_runtimes(
+        approved=True,
+        # normal review: valid → verdict submitted; re-review: malformed twice.
+        reviewer_final_texts=[_RATIONALE, None, None],
+    )
+    coder_adapter = FakeGitAdapter()
+    coder_adapter.reviews = [_review("DISMISSED", HEAD_SHA, review_id=1)]
+
+    result, fakes = _run(tmp_path, runtimes, coder_adapter=coder_adapter)
+
+    assert result.success is False
+    assert result.error == REVIEWER_MALFUNCTION_ERROR
+    assert "review not approved" not in result.error
+    # 3 reviewer runs: the valid normal review + malformed re-review twice.
+    assert len(handles["reviewer"].calls) == 3
+    # The normal stage's verdict WAS submitted (with its rationale) …
+    assert (
+        "submit_review",
+        OWNER,
+        REPO,
+        PR_NUMBER,
+        "APPROVE",
+        f"APPROVED: {_RATIONALE}",
+    ) in fakes["reviewer_adapter"].calls
+    # … then the malfunction comment, and no second verdict.
+    comment_calls = [c for c in fakes["reviewer_adapter"].calls if c[0] == "add_pr_comment"]
+    assert len(comment_calls) == 1
+    assert comment_calls[0][4] == REVIEWER_MALFUNCTION_COMMENT
+    assert len([c for c in fakes["reviewer_adapter"].calls if c[0] == "submit_review"]) == 1
+    assert all(c[0] != "merge_pr" for c in fakes["coder_adapter"].calls)
+    assert fakes["jira"].transitions == []
+
+
+def test_malfunction_then_valid_retry_on_premerge_rereview_site_merges(
+    tmp_path: Path,
+) -> None:
+    """AC: the pre-merge re-review site's retry is acted on normally too — a
+    malformed re-review followed by a valid APPROVED retry merges + Done."""
+    runtimes, handles = _make_runtimes(
+        approved=True,
+        # normal review: valid; re-review: malformed, then valid.
+        reviewer_final_texts=[_RATIONALE, None, _RATIONALE],
+    )
+    coder_adapter = FakeGitAdapter()
+    coder_adapter.reviews = [_review("DISMISSED", HEAD_SHA, review_id=1)]
+
+    result, fakes = _run(tmp_path, runtimes, coder_adapter=coder_adapter)
+
+    assert result.success is True
+    assert len(handles["reviewer"].calls) == 3
+    assert all(c[0] != "add_pr_comment" for c in fakes["reviewer_adapter"].calls)
+    assert ("merge_pr", OWNER, REPO, PR_NUMBER, "squash") in fakes["coder_adapter"].calls
+    assert fakes["jira"].transitions == [(TICKET, "51")]
+
+
+def test_real_rejection_with_rationale_aborts_standard(tmp_path: Path) -> None:
+    """AC: a real rejection (CHANGES_REQUESTED WITH a rationale) is NOT a
+    malfunction — it aborts exactly as today, with the standard
+    'review not approved' error, no retry, no comment."""
+    runtimes, handles = _make_runtimes(
+        approved=False, reviewer_final_texts=["The abort path lacks tests."]
+    )
+
+    result, fakes = _run(tmp_path, runtimes)
+
+    assert result.success is False
+    assert result.error == "review not approved: CHANGES_REQUESTED"
+    assert result.error != REVIEWER_MALFUNCTION_ERROR
+    # Exactly ONE reviewer run — a valid verdict is never retried.
+    assert len(handles["reviewer"].calls) == 1
+    # The rejection was submitted as a review verdict carrying its rationale …
+    assert (
+        "submit_review",
+        OWNER,
+        REPO,
+        PR_NUMBER,
+        "REQUEST_CHANGES",
+        "CHANGES_REQUESTED: The abort path lacks tests.",
+    ) in fakes["reviewer_adapter"].calls
+    # … and no malfunction comment was posted.
+    assert all(c[0] != "add_pr_comment" for c in fakes["reviewer_adapter"].calls)
+    assert all(c[0] != "merge_pr" for c in fakes["coder_adapter"].calls)
+    assert fakes["jira"].transitions == []
+
+
+def test_whitespace_only_rationale_is_malfunction_and_retries(
+    tmp_path: Path,
+) -> None:
+    """A whitespace-only rationale strips to empty → REVIEWER_MALFUNCTION
+    (deterministic edge of the validator, driven end-to-end)."""
+    runtimes, handles = _make_runtimes(
+        approved=True, reviewer_final_texts=["   \n\t  ", _RATIONALE]
+    )
+
+    result, fakes = _run(tmp_path, runtimes)
+
+    assert result.success is True
+    assert len(handles["reviewer"].calls) == 2
+    assert (
+        "submit_review",
+        OWNER,
+        REPO,
+        PR_NUMBER,
+        "APPROVE",
+        f"APPROVED: {_RATIONALE}",
+    ) in fakes["reviewer_adapter"].calls
+
+
+def test_structured_only_review_rationale_reaches_body_and_merges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SFP-249 review F1 (pinned AC): a review from the structured-only path —
+    the REAL ``ClaudeAgentRuntime`` with ``enforce_schema=True`` whose
+    ``ResultMessage`` carries ``structured_output`` and ``result=None``, exactly
+    what the SDK's output_format enforcement produces — submits a GitHub body
+    carrying the verdict + gates (the runtime's deterministic rendering, NEVER
+    the bare status word) and does NOT classify as REVIEWER_MALFUNCTION: the
+    pipeline merges and transitions Done."""
+    monkeypatch.setenv("LLM_TOKEN", "test-token")
+    # The REAL reviewer runtime (same wiring as the composition root), fed by a
+    # fake query_fn yielding the output_format-shaped final message.
+    structured = _reviewer_output(approved=True)
+    qfn = _StructuredOnlyQueryFn(structured)
+    reviewer_runtime = ClaudeAgentRuntime(
+        WorkspaceWorkerSettings(
+            anthropic_base_url="https://api.example.com",
+            default_model="claude-sonnet-4",
+            llm_provider_secret_ref=SecretRef(name="LLM_TOKEN"),
+        ),
+        LocalSecretProvider(secrets_file=None),
+        ReviewerOutput,
+        query_fn=qfn,
+        max_retries=0,
+    )
+    runtimes, _ = _make_runtimes(approved=True)
+    runtimes["reviewer"] = reviewer_runtime
+
+    result, fakes = _run(tmp_path, runtimes)
+
+    # NOT a REVIEWER_MALFUNCTION: exactly ONE reviewer run (no retry, no
+    # comment) and the run went all the way to merge + Done.
+    assert result.success is True
+    assert len(qfn.calls) == 1
+    assert all(c[0] != "add_pr_comment" for c in fakes["reviewer_adapter"].calls)
+    assert ("merge_pr", OWNER, REPO, PR_NUMBER, "squash") in fakes["coder_adapter"].calls
+    assert fakes["jira"].transitions == [(TICKET, "51")]
+    # The body carries the verdict + gates — the deterministic rendering with
+    # sorted keys, NOT the bare status word. (Tuple shape: name, owner, repo,
+    # number, event, body — the body is element 5.)
+    expected = "APPROVED: " + json.dumps(structured, sort_keys=True)
+    submitted = [c for c in fakes["reviewer_adapter"].calls if c[0] == "submit_review"]
+    assert len(submitted) == 1
+    assert submitted[0][5] == expected
+    assert submitted[0][5] != "APPROVED"
+    # Every gate boolean is present in the submitted body.
+    for gate in ("blueprint_compliance", "acceptance_criteria_satisfied"):
+        assert gate in submitted[0][5]

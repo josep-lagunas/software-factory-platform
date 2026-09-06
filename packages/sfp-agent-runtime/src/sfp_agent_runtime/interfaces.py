@@ -68,6 +68,16 @@ class AgentRunResult:
         success: ``True`` iff the run produced a usable result.
         output: The opaque parsed-JSON result on success; ``None`` on failure.
         error: A provider-supplied error message on failure; ``None`` on success.
+        final_text: Human-readable transport text (SFP-249) for surfaces like
+            the GitHub review body, from one of two sources in precedence
+            order: the agent's final textual message when the provider
+            surfaces a non-empty one; otherwise, on the structured-only path
+            (``output_format`` enforced, empty final text), a deterministic
+            rendering of the structured verdict — so it is never ``None`` on
+            a success that produced ``output``. It is NOT a decision field:
+            ``output`` alone carries the structured judgment. Stays ``None``
+            on failure / when no output exists (additive, default-``None``,
+            backward-compatible).
     """
 
     agent: str
@@ -75,6 +85,7 @@ class AgentRunResult:
     success: bool
     output: Mapping[str, Any] | None = None
     error: str | None = None
+    final_text: str | None = None
 
 
 @runtime_checkable

@@ -44,7 +44,7 @@ from sfp_contracts.agents.planner import PrSpec
 from sfp_contracts.agents.reviewer import ReviewerOutput
 from sfp_contracts.context.bindings import ResolvedContext
 
-__all__ = ["ReviewerError", "review"]
+__all__ = ["ReviewerError", "review", "review_with_text"]
 
 _AGENT = "reviewer"
 _TASK = "review"
@@ -62,8 +62,19 @@ class ReviewerError(Exception):
     """
 
 
-def _run_model(runtime: AgentRuntime, request: AgentRunRequest) -> ReviewerOutput:
-    """Run the Reviewer model and validate its output (fail-closed, ID-067)."""
+def _run_model_with_text(
+    runtime: AgentRuntime, request: AgentRunRequest
+) -> tuple[ReviewerOutput, str | None]:
+    """Run the Reviewer model; return ``(validated output, final_text)``.
+
+    Fail-closed (ID-067) exactly as the original seam; the only addition is
+    capturing the run result's ``final_text`` (SFP-249) — the reviewer's final
+    textual message when the runtime surfaced one, else (the SDK-enforced
+    ``output_format`` path: empty text, populated structured output) the
+    runtime's deterministic rendering of the structured verdict. ``None`` only
+    when the runtime supplied neither (e.g. a fake or non-Claude runtime
+    predating the field).
+    """
     try:
         result: AgentRunResult = runtime.run(request)
     except Exception as exc:  # noqa: BLE001 - fail-closed: catch broadly (ID-067)
@@ -77,9 +88,10 @@ def _run_model(runtime: AgentRuntime, request: AgentRunRequest) -> ReviewerOutpu
         raise ReviewerError("Reviewer model returned no output")
 
     try:
-        return ReviewerOutput.model_validate(result.output)
+        output = ReviewerOutput.model_validate(result.output)
     except ValidationError as exc:
         raise ReviewerError(f"Reviewer model output invalid: {exc}") from exc
+    return output, result.final_text
 
 
 def review(
@@ -119,6 +131,49 @@ def review(
     Raises:
         ReviewerError: On any failure mode of the model run (ID-067).
     """
+    output, _final_text = review_with_text(
+        pr_spec,
+        coder_output,
+        resolved,
+        runtime=runtime,
+        prompt_provider=prompt_provider,
+        ticket_id=ticket_id,
+    )
+    return output
+
+
+def review_with_text(
+    pr_spec: PrSpec,
+    coder_output: CoderOutput,
+    resolved: ResolvedContext,
+    *,
+    runtime: AgentRuntime,
+    prompt_provider: PromptProvider | None = None,
+    ticket_id: str,
+) -> tuple[ReviewerOutput, str | None]:
+    """Judge a PR-spec and return ``(verdict, final_text)`` (SFP-249).
+
+    Identical seam, inputs, and fail-closed semantics as :func:`review`; the
+    only addition is that the run result's ``final_text`` (transported by
+    :attr:`~sfp_agent_runtime.interfaces.AgentRunResult.final_text`) is
+    captured and returned alongside the verdict. That text has two possible
+    sources in precedence order: the reviewer's final textual message when the
+    runtime surfaced one; else (the SDK-enforced ``output_format`` path: empty
+    text, populated structured output) the runtime's deterministic rendering
+    of the structured verdict — so it is never empty when a verdict exists and
+    the REVIEWER_MALFUNCTION guard sees a non-empty source on both paths. The
+    verdict remains the ONLY decision field — the text is transport for the
+    GitHub review body surface (ID-021: contracts carry structured judgments
+    only; rationale lives on GitHub, never in ``ReviewerOutput``).
+    ``final_text`` is ``None`` when the runtime captured neither source.
+
+    Returns:
+        ``(ReviewerOutput, final_text)`` — the validated verdict and the
+        reviewer's rationale text (``None`` when absent).
+
+    Raises:
+        ReviewerError: On any failure mode of the model run (ID-067).
+    """
     if prompt_provider is not None:
         prompt = prompt_provider.get_prompt(_AGENT, _TASK)
     else:
@@ -137,4 +192,5 @@ def review(
         context=context,
     )
 
-    return _run_model(runtime, request)
+    output, final_text = _run_model_with_text(runtime, request)
+    return output, final_text
