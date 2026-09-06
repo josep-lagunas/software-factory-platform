@@ -184,7 +184,10 @@ dependencies = [
     { name = "alembic" },
     { name = "httpx" },
     { name = "sfp-config" },
+    { name = "sfp-contracts" },
+    { name = "sfp-messaging" },
     { name = "sqlalchemy" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
@@ -192,7 +195,10 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.13.0" },
     { name = "httpx" },
     { name = "sfp-config", editable = "packages/sfp-config" },
+    { name = "sfp-contracts", editable = "packages/sfp-contracts" },
+    { name = "sfp-messaging", editable = "packages/sfp-messaging" },
     { name = "sqlalchemy", specifier = ">=2.0.0" },
+    { name = "uvicorn", specifier = ">=0.52.0" },
 ]
 
 [[package]]
