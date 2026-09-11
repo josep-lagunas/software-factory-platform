@@ -5,11 +5,17 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "sqlalchemy>=2.0.0",
     "alembic>=1.13.0",
+    "sfp-config",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv.sources]
+# sfp-config: the SFP-86 SecretProvider seam + SecretRef are the auth
+# factory's runtime imports (SFP-122).
+sfp-config = { workspace = true }
 
 [tool.coverage.run]
 source = ["src/external_events"]
