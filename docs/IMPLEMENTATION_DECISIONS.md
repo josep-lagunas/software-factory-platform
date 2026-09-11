@@ -2759,6 +2759,47 @@ docs (this catalogue; MAS §6.9 + version 0.1.4), sfp-contracts (`PrSpec.satisfi
 
 ---
 
+## ID-076
+
+### Title
+Slack Operational-Command Layer Not Ratified — Communication Stays Platform-Initiated (MAS-pure)
+
+### Status
+Accepted (owner decision 2026-09-12)
+
+### Context
+During Slack dogfooding, an operational-command layer grew outside the spec: SFP-244 (created ad-hoc 2026-08-28, labeled `dogfood`; grammar RUN_TICKET/STATUS/APPROVE_PR/STOP_RUN/HELP) plus consumer-side reply requirements ("the bot answers any message") — none of it grounded in the MAS. In parallel, the inbound receiver drifted into the Communication service (SFP-132 / PR #163) although MAS §9.2 places all ingress in the External Events service. The MAS communication model is platform-initiated only: `RequestUserInput`/`NotifyUser` → `UserInteraction` → user reply → `UserInputReceived`/`UserQueryReceived` → the owning service acts. Nowhere does the MAS let a user proactively command the platform from Slack.
+
+### Decision
+
+**(a) Not ratified.** The operational-command layer is NOT part of the platform. The SFP-244 interpreter stays landed but unconsumed — no consumer, no execution wiring, no reply-anything fallback.
+
+**(b) Communication's inbound scope is MAS §9.4 exactly:** `ExternalEventReceived` → local Slack provider schema → `UserInteraction` update → publish `UserInputReceived`/`UserQueryReceived` (re-scoped SFP-132). The bot posts nothing unless a platform-initiated interaction asks it to.
+
+**(c) Any future Slack control-plane** (user-initiated commands) follows the full spec process FIRST — MAS amendment → ID → Blueprint tickets → pipeline. The ID-075 norm applies: no invariant or surface extension without spec change preceding code.
+
+**(d) Inbound routing rule (grounded):** input arriving in an interaction with `response_required=true` → `UserQueryReceived`; input in an interaction without an open question → `UserInputReceived`. The discriminator is the SFP-112 model's `response_required` column.
+
+### Rationale
+The platform's value is a deterministic, spec-controlled, auditable flow. An unratified control surface (user-initiated execution from chat) bypasses the ticket pipeline's gates and undermines the auditability the platform exists to enforce. Keeping the interpreter unconsumed (rather than deleting it) preserves the parse-layer investment with zero behavioral surface.
+
+### Alternatives Considered
+- **Ratify the command layer as a v0 extension:** rejected — owner decision; no control surface without the full spec process.
+- **Delete SFP-244's module now:** rejected — landed, tested, deterministic; inert while unconsumed. Revisit only if it rots.
+- **Command acks without execution (parse + acknowledge):** rejected — even acknowledgements present an unratified interface to users.
+
+### Consequences
+Positive: Communication matches MAS §9.4 exactly; the only human steering surfaces are Jira (tickets) and platform-initiated interactions.
+Negative: the Slack bot stays silent until SFP-135/136 (`NotifyUser`/`RequestUserInput` emitters) land — an accepted dogfood cost; the notify-run ops glue (PR #137) remains the interim narrating channel.
+
+### References
+Owner decision 2026-09-12 (Slack drift review session). MAS §9.2, §9.4. SFP-244 (unratified layer), SFP-132 (re-scoped consumer), PR #137/#163/#164. ID-027, ID-031, ID-075 (norm precedent).
+
+### Affected Components
+docs (this catalogue), SFP-132 (re-scoped), SFP-244 (landed-unconsumed status), Communication service inbound scope.
+
+---
+
 # Resolved Known Gaps (provenance)
 
 All originally-listed known gaps have been resolved as Implementation Decisions:
