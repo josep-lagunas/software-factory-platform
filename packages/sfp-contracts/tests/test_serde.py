@@ -108,7 +108,7 @@ EVENT_SPECS: list[tuple[EventType, type[EventPayload], dict[str, Any]]] = [
     (
         EventType.EXTERNAL_EVENT_RECEIVED,
         ExternalEventReceived,
-        {"source": "github", "external_id": "wh-9"},
+        {"source": "github", "external_id": "wh-9", "payload": {"action": "opened"}},
     ),
     (EventType.TICKET_UPDATED, TicketUpdated, {"ticket_id": "SFP-45", "status": "In Progress"}),
     (

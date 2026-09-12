@@ -10,7 +10,8 @@ Partitions, per the PRSpec's acceptance criteria:
    (never an error — Slack retries non-2xx indefinitely).
 3. **Publishing** — ``app_mention`` and ``message`` events each produce
    exactly one ``ExternalEventReceived`` envelope with ``source="slack"`` /
-   ``external_id=ts`` and identity supplied by the injected factory (the
+   ``external_id=ts`` / the checked fields carried verbatim as ``payload``
+   (SFP-124) and identity supplied by the injected factory (the
    endpoint never invents identity).
 4. **Idempotency** — duplicate delivery of the same ``ts`` maps to the same
    ``idempotency_key`` (by construction; the endpoint is stateless).
@@ -395,6 +396,13 @@ async def test_app_mention_publishes_one_external_event_received() -> None:
     assert isinstance(payload, ExternalEventReceived)
     assert payload.source == "slack"
     assert payload.external_id == "1712345678.123456"
+    # SFP-124: the carried dict — the checked identity/preview fields verbatim
+    # (no ``thread_ts`` key on a non-thread event; everything else left behind).
+    assert payload.payload == {
+        "text": "<@U0001> what is the status?",
+        "channel": "C0001",
+        "ts": "1712345678.123456",
+    }
 
 
 async def test_message_event_publishes_one_external_event_received() -> None:
@@ -410,6 +418,13 @@ async def test_message_event_publishes_one_external_event_received() -> None:
     assert isinstance(payload, ExternalEventReceived)
     assert payload.source == "slack"
     assert payload.external_id == "1712345999.654321"
+    # SFP-124: a thread reply carries ``thread_ts`` in the carried dict.
+    assert payload.payload == {
+        "text": "ship it",
+        "channel": "C0002",
+        "ts": "1712345999.654321",
+        "thread_ts": "1712345998.000000",
+    }
 
 
 async def test_identity_comes_from_injected_factory_not_endpoint() -> None:
@@ -436,6 +451,12 @@ async def test_identity_comes_from_injected_factory_not_endpoint() -> None:
     await call_app(app, body=body, headers=headers)
 
     assert len(factory_calls) == 1
+    # The factory receives the built event with the carried dict (SFP-124).
+    assert factory_calls[0].payload == {
+        "text": "<@U0001> what is the status?",
+        "channel": "C0001",
+        "ts": "1712345678.123456",
+    }
     envelope = bus.published[0]
     assert envelope.message_id == "fixed-message-id"
     assert envelope.idempotency_key == "fixed-idem-key"
@@ -446,7 +467,11 @@ async def test_identity_comes_from_injected_factory_not_endpoint() -> None:
 
 async def test_default_factory_derives_idempotency_from_external_id() -> None:
     """The reference factory keys idempotency on source+external_id."""
-    event = ExternalEventReceived(source="slack", external_id="1712345678.123456")
+    event = ExternalEventReceived(
+        source="slack",
+        external_id="1712345678.123456",
+        payload={"text": "hi", "channel": "C0001", "ts": "1712345678.123456"},
+    )
     envelope = make_external_event_envelope(event)
 
     assert envelope.idempotency_key == "slack:1712345678.123456"

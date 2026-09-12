@@ -254,14 +254,15 @@ class SlackEventsEndpoint:
         non-2xx would make Slack retry forever, and a partial event cannot
         be identified.
         """
-        external_id = _extract_event_fields(event)
-        if external_id is None:
+        fields = _extract_event_fields(event)
+        if fields is None:
             await self._send_json(send, 200, {"ok": True})
             return
 
         external = ExternalEventReceived(
             source=_EXTERNAL_SOURCE,
-            external_id=external_id,
+            external_id=fields["ts"],
+            payload=fields,
         )
         await self._bus.publish(self._envelope_factory(external))
         await self._send_json(send, 200, {"ok": True})
@@ -382,20 +383,23 @@ def _parse_json(raw_body: bytes) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _extract_event_fields(event: object) -> str | None:
-    """Extract the external id (``ts``) from a Slack ``event`` object.
+def _extract_event_fields(event: object) -> dict[str, str] | None:
+    """Extract the identity/preview fields from a Slack ``event`` object.
 
     Returns ``None`` unless the event is a dict of a handled type
     (``app_mention`` / ``message``) carrying non-empty string ``text``,
     ``channel`` and ``ts`` — the field set the PRSpec names as the handled
     shape. ``thread_ts`` is part of that shape check (a thread reply carries
-    it) but carries no identity: the published
-    :class:`~sfp_contracts.events.payloads.ExternalEventReceived` holds only
-    ``source`` + ``external_id`` (its contract, ``extra='forbid'``), with
-    the raw body interpretation deferred to SFP-244 (ID-026 / ID-041).
+    it) and is included in the carried dict only when present.
 
-    Everything Slack adds beyond the checked fields (user ids, edited flags,
-    file attachments, …) is left behind.
+    On success returns the carried dict — the checked fields verbatim
+    (``text`` / ``channel`` / ``ts`` / optional ``thread_ts``) — which the
+    published :class:`~sfp_contracts.events.payloads.ExternalEventReceived`
+    now carries as its ``payload`` (SFP-124); ``ts`` doubles as the
+    ``external_id``. Everything Slack adds beyond the checked fields (user
+    ids, edited flags, file attachments, …) is left behind, and deeper
+    interpretation of the body remains the owning service's (SFP-244;
+    ID-026 / ID-041).
     """
     if not isinstance(event, dict):
         return None
@@ -416,4 +420,7 @@ def _extract_event_fields(event: object) -> str | None:
         and ts
     ):
         return None
-    return ts
+    fields: dict[str, str] = {"text": text, "channel": channel, "ts": ts}
+    if thread_ts is not None:
+        fields["thread_ts"] = thread_ts
+    return fields
