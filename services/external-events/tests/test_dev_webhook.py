@@ -31,7 +31,7 @@ from external_events.entrypoints.dev_webhook import (
     build_dev_app,
 )
 from external_events.infrastructure.persistence import EndpointStatus
-from external_events.interfaces.webhook import WebhookIngressEndpoint
+from external_events.interfaces import ChallengeEchoMiddleware, WebhookIngressEndpoint
 from sfp_messaging.transport.in_memory import InMemoryTransport
 
 # --------------------------------------------------------------------------- #
@@ -43,7 +43,11 @@ class TestBuildDevApp:
     def test_wires_the_real_stack_over_a_seeded_dev_database(self) -> None:
         app, bus, resolver = build_dev_app()
 
-        assert isinstance(app, WebhookIngressEndpoint)
+        # SFP-254: the served app is the challenge-echo middleware AROUND
+        # the real SFP-120 endpoint (tunnel dogfooding passes Slack's
+        # save-time url_verification).
+        assert isinstance(app, ChallengeEchoMiddleware)
+        assert isinstance(app.app, WebhookIngressEndpoint)
         assert isinstance(bus, InMemoryTransport)
         assert isinstance(resolver, EndpointConfigResolver)
         assert bus.published_messages == []
@@ -136,7 +140,8 @@ class TestMain:
         dev_webhook.main(["--port", "9911", "--endpoint-id", "slack-ops"])
 
         assert len(calls) == 1
-        assert isinstance(calls[0]["app"], WebhookIngressEndpoint)
+        assert isinstance(calls[0]["app"], ChallengeEchoMiddleware)
+        assert isinstance(calls[0]["app"].app, WebhookIngressEndpoint)
         assert calls[0]["port"] == 9911
         assert calls[0]["host"] == "127.0.0.1"
 
