@@ -33,6 +33,7 @@ while construction keeps the typed payload instance for field-by-field checks.
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -62,7 +63,7 @@ EVENT_SPECS: list[tuple[EventType, type[EventPayload], dict[str, Any]]] = [
     (
         EventType.EXTERNAL_EVENT_RECEIVED,
         ExternalEventReceived,
-        {"source": "github", "external_id": "wh-9"},
+        {"source": "github", "external_id": "wh-9", "payload": {"action": "opened"}},
     ),
     (EventType.TICKET_UPDATED, TicketUpdated, {"ticket_id": "SFP-39", "status": "In Progress"}),
     (
@@ -396,3 +397,38 @@ def test_external_ingress_event_external_event_id_unchanged() -> None:
     assert "external_event_id" in ExternalIngressEvent.model_fields
     assert "external_event_id" not in EventEnvelope.model_fields
     assert not issubclass(ExternalIngressEvent, EventEnvelope)
+
+
+# --------------------------------------------------------------------------- #
+# SFP-124: ExternalEventReceived carries the payload dict verbatim
+# --------------------------------------------------------------------------- #
+
+
+def test_external_event_payload_carried_verbatim() -> None:
+    """(SFP-124) The payload dict is stored verbatim — opaque, unmodified."""
+    body: dict[str, Any] = {
+        "action": "opened",
+        "nested": {"user": {"id": "U1"}, "labels": ["x", "y"]},
+        "count": 3,
+        "ok": True,
+        "none": None,
+        "text": "¿qué pasa? 🚀",
+    }
+    event = ExternalEventReceived(source="github", external_id="wh-9", payload=body)
+    assert event.payload == body
+
+
+def test_external_event_payload_is_required() -> None:
+    """(SFP-124) Dropping ``payload`` raises — no default, never synthesized."""
+    with pytest.raises(ValidationError):
+        ExternalEventReceived(source="github", external_id="wh-9")  # type: ignore[call-arg]
+
+
+def test_external_event_naming_deviation_documented() -> None:
+    """(SFP-124) The docstring documents the ``source``-vs-``provider``
+    deviation from MAS §5.5 and the deliberately deferred rename."""
+    doc = inspect.getdoc(ExternalEventReceived) or ""
+    assert "§5.5" in doc
+    assert "provider" in doc
+    assert "source" in doc
+    assert "deferred" in doc
