@@ -8,6 +8,7 @@ dependencies = [
     "sfp-config",
     "sfp-contracts",
     "sfp-messaging",
+    "uvicorn>=0.52.0",
 ]
 
 [build-system]
@@ -19,7 +20,10 @@ build-backend = "hatchling.build"
 # factory's runtime imports (SFP-122). SFP-124 adds the publisher:
 # ExternalEventReceived / EventEnvelope (sfp-contracts) are its runtime
 # imports, and it types its bus seam against the MessageBus Protocol
-# (sfp-messaging, TYPE_CHECKING-only at runtime).
+# (sfp-messaging, TYPE_CHECKING-only at runtime). SFP-132 adds the minimal
+# dev webhook runner (entrypoints/dev_webhook.py), served via uvicorn — the
+# same dependency the communication dev runner declared before the drift
+# removal.
 sfp-config = { workspace = true }
 sfp-contracts = { workspace = true }
 sfp-messaging = { workspace = true }
