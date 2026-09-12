@@ -46,7 +46,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -62,7 +62,7 @@ from tenacity import (
 from workspace_worker.agent_runtime.model_config import AgentModelConfig
 from workspace_worker.infrastructure.settings import WorkspaceWorkerSettings
 
-__all__ = ["ClaudeAgentRuntime"]
+__all__ = ["ClaudeAgentRuntime", "render_structured_verdict"]
 
 
 class _TransientSDKError(Exception):
@@ -99,6 +99,32 @@ SleepFn = Callable[[float], Awaitable[None]]
 #: Duck-typed SDK query entry point: an async-generator factory. The adapter
 #: consumes its stream and inspects only the final ``ResultMessage``.
 QueryFn = Callable[..., AsyncIterator[Any]]
+
+
+def render_structured_verdict(payload: Mapping[str, Any]) -> str:
+    """Deterministic, sorted-key JSON rendering of a structured verdict.
+
+    The ONE shared definition of the runtime's structured-verdict rendering
+    (SFP-249 F1 introduced it as the ``final_text`` fallback on the
+    structured-only path; SFP-252 promotes it to a named, exported rule): the
+    runtime fallback and the ticket-pipeline REVIEWER_MALFUNCTION guard both
+    render through this function, so the guard's equality check compares
+    against EXACTLY the bytes the runtime produces — byte-identity by
+    construction, never an independently re-derived string. Both call sites
+    render the VALIDATED contract dump (``model_dump(mode="json")``), so the
+    same verdict always renders to the same text on both sides.
+
+    Deterministic (MAS §12.7): sorted keys, default separators, no ambient
+    formatting/clock/network — a pure function of the payload.
+
+    Args:
+        payload: The structured verdict as a JSON-native mapping (the
+            validated contract's ``model_dump(mode="json")``).
+
+    Returns:
+        The canonical rendering string.
+    """
+    return json.dumps(payload, sort_keys=True)
 
 
 def _failure(request: AgentRunRequest, message: str) -> AgentRunResult:
@@ -338,8 +364,11 @@ class ClaudeAgentRuntime:
                 return _failure(request, f"agent output was not valid JSON: {exc}")
 
         # 6. Validate against the injected output contract (hard reject, no retry).
+        #    The validated model is kept: step 7 renders ``final_text`` from it
+        #    so the rendering is canonical (SFP-252 — see below).
+        validated: BaseModel
         try:
-            self._output_contract.model_validate(parsed)
+            validated = self._output_contract.model_validate(parsed)
         except ValidationError as exc:
             return _failure(request, f"agent output failed contract validation: {exc}")
 
@@ -351,16 +380,18 @@ class ClaudeAgentRuntime:
         #    output_format path leaves ``result`` None while
         #    ``structured_output`` carries the verdict) a DETERMINISTIC
         #    rendering of the structured verdict, so the field is never
-        #    empty on a success and the REVIEWER_MALFUNCTION guard has a
-        #    non-empty source on BOTH paths. ``output`` stays the only
-        #    decision field.
+        #    empty on a success. ``output`` stays the only decision field.
+        #    SFP-252: the rendering is computed ONCE through the shared
+        #    render_structured_verdict over the VALIDATED contract dump —
+        #    the REVIEWER_MALFUNCTION guard renders the same verdict the
+        #    same way, making "final_text carries only the structured
+        #    rendering (no reviewer-authored prose)" detectable by exact
+        #    equality against the identical string.
         final_text: str | None
         if isinstance(result_text, str) and result_text.strip():
             final_text = result_text
         elif parsed is not None:
-            # Deterministic: sorted keys, no ambient formatting/clock — the
-            # same verdict always renders to the same text (MAS §12.7).
-            final_text = json.dumps(parsed, sort_keys=True)
+            final_text = render_structured_verdict(validated.model_dump(mode="json"))
         else:  # pragma: no cover — defensive: step 4 rejects no-output results
             final_text = None
         return AgentRunResult(
