@@ -99,7 +99,11 @@ from workspace_worker.exec.lint import lint as _run_lint
 from workspace_worker.exec.tests import run_tests as _run_tests
 from workspace_worker.infrastructure.settings import WorkspaceWorkerSettings
 from workspace_worker.repo.branch import BranchManager
-from workspace_worker.repo.git.adapter import GitProviderAdapter, PullRequestReview
+from workspace_worker.repo.git.adapter import (
+    GitProviderAdapter,
+    PullRequestAlreadyExistsError,
+    PullRequestReview,
+)
 from workspace_worker.repo.jira.client import JiraClient
 from workspace_worker.repo.manager import BaseSyncConflictError, RepoManager, RepoManagerError
 from workspace_worker.repo.worktree import WorktreeManager, _sanitize_job_id
@@ -902,7 +906,12 @@ def run_pipeline(
             or corrupt checkpoint is deleted with a logged reason and its stage
             re-runs. A clean run (``resume=False``, the default) behaves EXACTLY
             as before — it still WRITES checkpoints after each checkpointed stage
-            but never reads (or validates) them.
+            but never reads (or validates) them. Under either run mode,
+            ``create_pr`` is idempotent (SFP-253): GitHub's specific 422 "A pull
+            request already exists" for the ticket head branch triggers a single
+            list-PRs-by-head lookup, and the existing OPEN PR (exactly one
+            required) is adopted as the run's PR — the run continues to the
+            review stage; zero or ambiguous results re-raise the adapter error.
         checkpoints_dir: Where checkpoints live (injectable for tests). Defaults
             to ``<worktree_base>/<ticket_key>/checkpoints`` — kept OUTSIDE the
             worktree so a worktree mishap cannot lose them.
@@ -1167,17 +1176,44 @@ def run_pipeline(
     repo_manager.push(worktree_path, branch_name)
 
     # 14. Open the pull request via the CODER adapter (sfp-coder-bot identity).
+    #     SFP-253 — idempotent create_pr on resume: when GitHub answers with the
+    #     specific 422 "A pull request already exists" (a previous run already
+    #     opened the PR for this branch), the existing OPEN PR for the head
+    #     branch is looked up (list-PRs-by-head) and ADOPTED as this run's PR —
+    #     its number/url/head_sha flow into every downstream stage (review,
+    #     SFP-249 malfunction comments, pre-merge gate, merge) and into
+    #     PipelineResult — and the run continues to the review stage instead of
+    #     aborting. Adoption requires EXACTLY one open PR: zero (the 422-causing
+    #     PR was closed in the race window) or an ambiguous list re-raises the
+    #     adapter error — fail loud, never guess. Any other 422/error propagates
+    #     exactly as before (a typed exception distinct from this signature is
+    #     never caught here). The adopted PR is not re-titled/re-bodied — it is
+    #     taken as-is (out of scope by spec).
     trace.append("coder_adapter.create_pr")
     title = pr_title if pr_title is not None else f"{ticket_key}: {pr_spec.title}"
     body = pr_body if pr_body is not None else _build_pr_body(ticket_key, pr_spec, coder_output)
-    pr = coder_adapter.create_pr(
-        owner,
-        repo_name,
-        title=title,
-        head=branch_name,
-        base=base_branch,
-        body=body,
-    )
+    try:
+        pr = coder_adapter.create_pr(
+            owner,
+            repo_name,
+            title=title,
+            head=branch_name,
+            base=base_branch,
+            body=body,
+        )
+    except PullRequestAlreadyExistsError:
+        open_prs = coder_adapter.find_open_pr_for_branch(owner, repo_name, branch_name)
+        if len(open_prs) != 1:
+            # No open PR despite the 422 (or an ambiguous list) — the original
+            # adapter error is re-raised as today (fail loud, no guessing).
+            raise
+        pr = open_prs[0]
+        trace.append("coder_adapter.reuse_open_pr")
+        _log.info(
+            "create_pr: a pull request already exists for head %s — reusing open PR #%s",
+            branch_name,
+            pr.number,
+        )
 
     # 15. Reviewer judges the PR. SFP-249: the seam is wrapped by the
     #     malfunction guard — a malformed verdict (NO reviewer-authored prose:

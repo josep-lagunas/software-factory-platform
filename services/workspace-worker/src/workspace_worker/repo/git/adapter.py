@@ -26,6 +26,13 @@ Transient failures — HTTP ``429``/``5xx`` and the network errors
 ``ConnectError``/``ReadTimeout``/``RemoteProtocolError`` — are retried with
 exponential backoff + jitter; other ``4xx`` are surfaced immediately as a
 redacted :class:`GitProviderAdapterError`.
+
+SFP-253 adds the resume-recovery pair: :meth:`create_pr` surfaces GitHub's
+specific 422 "A pull request already exists" as a dedicated
+:class:`PullRequestAlreadyExistsError` (parsed payload attached), and
+:meth:`find_open_pr_for_branch` lists a head branch's open PRs so a resumed
+run can adopt the existing PR instead of aborting. Every other 422 remains a
+plain hard error.
 """
 
 from __future__ import annotations
@@ -47,6 +54,7 @@ __all__ = [
     "GitPushResult",
     "GitSyncResult",
     "PrCommentResult",
+    "PullRequestAlreadyExistsError",
     "PullRequestResult",
     "PullRequestReview",
     "ReviewResult",
@@ -73,6 +81,42 @@ class GitProviderAdapterError(RuntimeError):
 
     The token is guaranteed absent from the message (see :func:`_redact`).
     """
+
+
+#: Substring of GitHub's documented "pull request already exists" error message
+#: (SFP-253). The full message carries the owner:branch (e.g. ``A pull request
+#: already exists for arconta:sfp-122-x``.), so detection matches on the
+#: containment of this stable prefix, never the whole string.
+_PR_ALREADY_EXISTS_MESSAGE = "A pull request already exists"
+
+
+class PullRequestAlreadyExistsError(GitProviderAdapterError):
+    """Raised when :meth:`GitProviderAdapter.create_pr` hits GitHub's specific
+    "A pull request already exists" 422 (SFP-253).
+
+    A DEDICATED subclass raised ONLY for that exact error signature — an
+    ``errors`` entry carrying ``resource == "PullRequest"``, ``code ==
+    "custom"``, and a ``message`` containing ``"A pull request already
+    exists"`` — so a caller (the pipeline's ``--resume`` recovery) can branch
+    on the TYPE without re-string-matching the HTTP payload. Every other 422
+    (and every other failure) still surfaces as the plain redacted
+    :class:`GitProviderAdapterError` — no blanket-422 handling.
+
+    The classic producer is a resumed run whose previous invocation already
+    opened the PR for the ticket head branch; the caller recovers by looking
+    up the existing open PR (:meth:`GitProviderAdapter.find_open_pr_for_branch`)
+    and adopting it, never by creating a second PR.
+
+    Attributes:
+        error_payload: The already-parsed GitHub error-response JSON (the
+            ``422`` body), with the token redacted from every string value
+            (defensive — the token travels in the request header only). The
+            matched ``errors`` entry is inside ``error_payload["errors"]``.
+    """
+
+    def __init__(self, message: str, *, error_payload: dict[str, object]) -> None:
+        super().__init__(message)
+        self.error_payload = error_payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,6 +340,65 @@ def _head_sha_from_pr_payload(data: dict[str, object]) -> str:
         return ""
     sha = head.get("sha")
     return sha if isinstance(sha, str) else ""
+
+
+def _redact_json_value(value: dict[str, object], token: str) -> dict[str, object]:
+    """Redact ``token`` from every string inside a parsed-JSON object (SFP-253).
+
+    A recursive :func:`_redact` for structures: strings are redacted, lists and
+    dicts are walked, everything else is returned as-is. Used for the parsed
+    GitHub error payload carried on :class:`PullRequestAlreadyExistsError` so
+    the module's "token absent from every surfaced error" guarantee holds for
+    the payload attribute, not just the message (defensive — the token is
+    request-header-only, so a well-formed GitHub response never echoes it).
+    """
+
+    def _walk(item: object) -> object:
+        if isinstance(item, str):
+            return _redact(item, token)
+        if isinstance(item, list):
+            return [_walk(entry) for entry in item]
+        if isinstance(item, dict):
+            return {key: _walk(entry) for key, entry in item.items()}
+        return item
+
+    return {key: _walk(item) for key, item in value.items()}
+
+
+def _is_pr_already_exists_payload(data: object) -> bool:
+    """Whether a ``422`` response body is GitHub's "PR already exists" error.
+
+    Matches the documented signature (pinned by the 2026-09-12 SFP-122
+    incident payload): the ``errors`` array contains an entry with
+    ``resource == "PullRequest"``, ``code == "custom"``, and a ``message``
+    string CONTAINING ``"A pull request already exists"`` (GitHub suffixes the
+    owner:branch). Shape-checks every level — anything malformed, and any
+    other ``422`` (e.g. plain ``"Validation Failed"`` with no ``errors``), is
+    NOT this error and must keep surfacing as a hard
+    :class:`GitProviderAdapterError`.
+
+    Args:
+        data: The parsed JSON body of the ``422`` response (any shape).
+
+    Returns:
+        ``True`` only when the exact error signature is present.
+    """
+    if not isinstance(data, dict):
+        return False
+    errors = data.get("errors")
+    if not isinstance(errors, list):
+        return False
+    for entry in errors:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("resource") != "PullRequest":
+            continue
+        if entry.get("code") != "custom":
+            continue
+        message = entry.get("message")
+        if isinstance(message, str) and _PR_ALREADY_EXISTS_MESSAGE in message:
+            return True
+    return False
 
 
 def _last_url_path_segment(url: str) -> str:
@@ -552,6 +655,9 @@ class GitProviderAdapter:
         Raises:
             ValueError: if ``owner`` / ``repo`` / ``title`` / ``head`` / ``base``
                 is empty (before any network call).
+            PullRequestAlreadyExistsError: if GitHub answers with the specific
+                422 "A pull request already exists" error signature — the typed
+                signal the pipeline's resume recovery branches on.
             GitProviderAdapterError: if the request ultimately fails after
                 retries, or a non-retryable error is returned. The token is
                 redacted from the message.
@@ -569,6 +675,26 @@ class GitProviderAdapter:
         url = f"{self._base}/repos/{owner}/{repo}/pulls"
         payload = {"title": title, "head": head, "base": base, "body": body}
         response = self._request("POST", url, json=payload)
+        # The ONE typed 422: GitHub's "A pull request already exists" surfaces
+        # as a dedicated PullRequestAlreadyExistsError (parsed payload attached)
+        # so the pipeline's resume recovery can branch on the TYPE. Every other
+        # non-success (incl. every other 422) takes the plain redacted-error
+        # path below, unchanged.
+        if response.status_code == httpx.codes.UNPROCESSABLE_ENTITY:
+            try:
+                error_body: object = response.json()
+            except ValueError:
+                error_body = None
+            if isinstance(error_body, dict) and _is_pr_already_exists_payload(error_body):
+                raise PullRequestAlreadyExistsError(
+                    _redact(
+                        f"GitHub create pull request failed: HTTP "
+                        f"{response.status_code} {response.reason_phrase} for {url}: "
+                        f"{response.text}",
+                        self._token,
+                    ),
+                    error_payload=_redact_json_value(error_body, self._token),
+                )
         self._raise_for_status("create pull request", response, url)
         data = response.json()
         return PullRequestResult(
@@ -579,6 +705,100 @@ class GitProviderAdapter:
             state=data["state"],
             head_sha=_head_sha_from_pr_payload(data),
         )
+
+    def find_open_pr_for_branch(
+        self,
+        owner: str,
+        repo: str,
+        head_branch: str,
+    ) -> list[PullRequestResult]:
+        """List the OPEN pull requests whose head branch is ``head_branch`` (SFP-253).
+
+        The recovery-side lookup for the resume path: GitHub guarantees at most
+        ONE open PR per head branch, so a single result is the PR a resumed run
+        adopts after :meth:`create_pr` raised
+        :class:`PullRequestAlreadyExistsError`. Issues the list-PRs-by-head
+        GET ``/repos/{owner}/{repo}/pulls?head={owner}:{head_branch}&state=open``
+        (the ``owner:branch`` head form is GitHub's required filter format) via
+        :meth:`_request` (bearer auth + tenacity retry on
+        ``{429,500,502,503,504}`` and the network errors, no retry on other
+        ``4xx``) and :meth:`_raise_for_status` (a redacted
+        :class:`GitProviderAdapterError` on any non-success).
+
+        Parse-not-decide (the adapter never guesses): the FULL filtered list is
+        returned in GitHub's order and the CALLER requires exactly one entry —
+        an empty list (the 422-causing PR was closed in the race window) and an
+        ambiguous list (impossible per GitHub's model, but never silently
+        ``[0]``-indexed) are both surfaced for the caller's fail-loud decision.
+        Entries are additionally filtered locally on ``state == "open"``
+        (belt-and-braces with the server-side ``state=open`` param — a payload
+        whose state is missing/non-``open`` is dropped, never adopted). One
+        page, no pagination walk: head-filtered, open-only lists hold at most
+        one entry by construction.
+
+        Args:
+            owner: Repository owner (account or organization). Also prefixes
+                the head filter (GitHub's ``owner:branch`` form).
+            repo: Repository name.
+            head_branch: The head branch name to look up (the PR head).
+
+        Returns:
+            The :class:`PullRequestResult` list for the branch's open PRs —
+            ``[]`` when none is open. Malformed entries (a non-dict item, or a
+            missing/non-int ``number``) are skipped defensively rather than
+            raising; ``url`` / ``state`` / ``head_sha`` degrade to ``""`` when
+            absent or not strings (same defensive family as
+            :meth:`list_pr_reviews`).
+
+        Raises:
+            ValueError: if ``owner`` / ``repo`` / ``head_branch`` is empty
+                (before any network call).
+            GitProviderAdapterError: if the request ultimately fails after
+                retries, a non-retryable error is returned, or the payload is
+                not a JSON list. The token is redacted from the message.
+        """
+        if not owner:
+            raise ValueError("owner must not be empty")
+        if not repo:
+            raise ValueError("repo must not be empty")
+        if not head_branch:
+            raise ValueError("head_branch must not be empty")
+        query = httpx.QueryParams({"head": f"{owner}:{head_branch}", "state": "open"})
+        url = f"{self._base}/repos/{owner}/{repo}/pulls?{query}"
+        response = self._request("GET", url)
+        self._raise_for_status("list pull requests by head", response, url)
+        data = response.json()
+        if not isinstance(data, list):
+            raise GitProviderAdapterError(
+                _redact(
+                    f"GitHub list pull requests by head returned non-list payload "
+                    f"for {url}: {type(data).__name__}",
+                    self._token,
+                )
+            )
+        open_prs: list[PullRequestResult] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            number = item.get("number")
+            if not isinstance(number, int):
+                continue
+            state = item.get("state")
+            html_url = item.get("html_url")
+            if state != "open":
+                # Local fail-closed mirror of the server-side state=open filter.
+                continue
+            open_prs.append(
+                PullRequestResult(
+                    owner=owner,
+                    repo=repo,
+                    number=number,
+                    url=html_url if isinstance(html_url, str) else "",
+                    state=state,
+                    head_sha=_head_sha_from_pr_payload(item),
+                )
+            )
+        return open_prs
 
     def update_pr(
         self,
