@@ -19,7 +19,7 @@ ID-031 (the event names) and ID-072 (producer ownership, documented on the
 relevant payloads below).
 """
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict
 
@@ -36,10 +36,24 @@ class EventPayload(BaseModel):
 
 
 class ExternalEventReceived(EventPayload):
-    """An inbound signal from an external system (webhook, poller, etc.)."""
+    """An inbound signal from an external system (webhook, poller, etc.).
+
+    Carries the external system's body as ``payload``, **verbatim and opaque**
+    (MAS §5.5 / MAS §9.2): no default, no filtering, no schema validation —
+    the External Events Service "never interprets provider payloads", and the
+    owning service interprets the body via its own local schema (ID-026 /
+    ID-041).
+
+    Naming deviation (documented; rename deliberately deferred): MAS §5.5
+    names the originating-system field ``provider``; this bus event names it
+    ``source``. Renaming ``source`` → ``provider`` is a breaking contract
+    change explicitly deferred to a separate decision — the deviation is
+    documented here rather than silently widened.
+    """
 
     source: str
     external_id: str
+    payload: dict[str, Any]
 
 
 class TicketUpdated(EventPayload):

@@ -5,7 +5,10 @@ Residents: the SFP-121 endpoint-configuration resolver, the SFP-122
 authentication-strategy Protocol + factory, and the concrete strategies
 (SFP-123) — imported below so their registration into
 :data:`AUTH_STRATEGY_REGISTRY` happens on any import of this package;
-webhook ingress (SFP-120) consumes all three.
+webhook ingress (SFP-120) consumes all three. The SFP-124
+:class:`ExternalEventPublisher` wraps verified payloads in
+``ExternalEventReceived`` envelopes and publishes them on the injected
+MessageBus.
 """
 
 from __future__ import annotations
@@ -24,6 +27,11 @@ from external_events.application.endpoint_resolver import (
     SessionFactory,
     resolve,
 )
+from external_events.application.publisher import (
+    EventEnvelopeFactory,
+    ExternalEventPublisher,
+    make_external_event_envelope,
+)
 
 # SFP-123: importing the strategies package populates AUTH_STRATEGY_REGISTRY
 # with the v0 strategies (registration is a package-import side effect of
@@ -39,6 +47,8 @@ __all__ = [
     "AuthenticationStrategy",
     "EndpointConfigNotFoundError",
     "EndpointConfigResolver",
+    "EventEnvelopeFactory",
+    "ExternalEventPublisher",
     "GitHubHmacStrategy",
     "ResolvedEndpointConfig",
     "SessionFactory",
@@ -46,5 +56,6 @@ __all__ = [
     "StrategyRegistry",
     "UnknownAuthStrategyError",
     "build_authentication_strategy",
+    "make_external_event_envelope",
     "resolve",
 ]

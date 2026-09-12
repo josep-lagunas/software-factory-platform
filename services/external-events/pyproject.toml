@@ -6,6 +6,8 @@ dependencies = [
     "sqlalchemy>=2.0.0",
     "alembic>=1.13.0",
     "sfp-config",
+    "sfp-contracts",
+    "sfp-messaging",
 ]
 
 [build-system]
@@ -14,8 +16,13 @@ build-backend = "hatchling.build"
 
 [tool.uv.sources]
 # sfp-config: the SFP-86 SecretProvider seam + SecretRef are the auth
-# factory's runtime imports (SFP-122).
+# factory's runtime imports (SFP-122). SFP-124 adds the publisher:
+# ExternalEventReceived / EventEnvelope (sfp-contracts) are its runtime
+# imports, and it types its bus seam against the MessageBus Protocol
+# (sfp-messaging, TYPE_CHECKING-only at runtime).
 sfp-config = { workspace = true }
+sfp-contracts = { workspace = true }
+sfp-messaging = { workspace = true }
 
 [tool.coverage.run]
 source = ["src/external_events"]
