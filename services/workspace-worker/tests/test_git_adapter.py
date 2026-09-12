@@ -22,10 +22,13 @@ from workspace_worker.repo.git.adapter import (
     GitPushResult,
     GitSyncResult,
     PrCommentResult,
+    PullRequestAlreadyExistsError,
     PullRequestResult,
     PullRequestReview,
     ReviewResult,
+    _is_pr_already_exists_payload,
     _redact,
+    _redact_json_value,
 )
 
 TOKEN = "ghp_secrettoken_value_123"
@@ -835,6 +838,400 @@ def test_create_pr_empty_owner_or_repo_raises_value_error_before_any_http(
             adapter.create_pr(OWNER, "", title=TITLE, head=HEAD, base=BASE, body=BODY)
 
     assert called == []  # no HTTP call made — validated locally
+
+
+# ---------------------------------------------------------------------------
+# create_pr — the typed 422 "A pull request already exists" (SFP-253)
+# ---------------------------------------------------------------------------
+
+#: The documented GitHub 422 payload for creating a PR whose head branch
+#: already has an open PR — the shape behind the 2026-09-12 SFP-122 incident
+#: abort (a --resume run whose prior invocation had already opened the PR).
+#: Detection keys on the ``errors[]`` entry's resource/code/message triple;
+#: GitHub suffixes the message with ``owner:branch``.
+ALREADY_EXISTS_422: dict[str, object] = {
+    "message": "Validation Failed",
+    "errors": [
+        {
+            "resource": "PullRequest",
+            "code": "custom",
+            "message": f"A pull request already exists for {OWNER}:{HEAD}.",
+        }
+    ],
+    "documentation_url": "https://docs.github.com/rest/pulls/pulls#create-a-pull-request",
+    "status": "422",
+}
+
+
+def test_create_pr_already_exists_422_raises_dedicated_error() -> None:
+    # SFP-253 AC5: the exact signature (resource PullRequest + code custom +
+    # message 'A pull request already exists') raises the DEDICATED exception,
+    # not the plain adapter error — and it is NOT retried (422 is non-transient).
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(422, json=ALREADY_EXISTS_422)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(PullRequestAlreadyExistsError) as exc_info:
+        adapter.create_pr(OWNER, REPO, title=TITLE, head=HEAD, base=BASE, body=BODY)
+
+    assert tries == 1  # NOT retried — a 422 is never transient
+    msg = str(exc_info.value)
+    assert "422" in msg
+    assert "create pull request" in msg
+    assert TOKEN not in msg
+
+
+def test_create_pr_already_exists_error_is_adapter_error_subclass() -> None:
+    # The typed error stays inside the adapter's exception contract: existing
+    # ``except GitProviderAdapterError`` callers keep catching it (only the
+    # pipeline's resume recovery branches on the narrower type).
+    assert issubclass(PullRequestAlreadyExistsError, GitProviderAdapterError)
+
+
+def test_create_pr_already_exists_error_carries_parsed_payload() -> None:
+    # The exception carries the already-parsed GitHub error payload so the
+    # caller never re-parses (or re-string-matches) the HTTP body. The matched
+    # errors[] entry is present verbatim.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json=ALREADY_EXISTS_422)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(PullRequestAlreadyExistsError) as exc_info:
+        adapter.create_pr(OWNER, REPO, title=TITLE, head=HEAD, base=BASE, body=BODY)
+
+    payload = exc_info.value.error_payload
+    assert isinstance(payload, dict)
+    errors = payload.get("errors")
+    assert isinstance(errors, list) and len(errors) == 1
+    entry = errors[0]
+    assert isinstance(entry, dict)
+    assert entry.get("resource") == "PullRequest"
+    assert entry.get("code") == "custom"
+    assert isinstance(entry.get("message"), str)
+    assert "A pull request already exists" in entry.get("message", "")
+
+
+def test_create_pr_already_exists_token_echo_redacted_from_message_and_payload() -> None:
+    # Defensive: a pathological response body echoing the token — BOTH the
+    # message AND the carried payload are redacted (the module's guarantee
+    # covers every surfaced error surface).
+    payload = {
+        "message": "Validation Failed",
+        "errors": [
+            {
+                "resource": "PullRequest",
+                "code": "custom",
+                "message": f"A pull request already exists for {TOKEN}:{HEAD}.",
+            }
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json=payload)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(PullRequestAlreadyExistsError) as exc_info:
+        adapter.create_pr(OWNER, REPO, title=TITLE, head=HEAD, base=BASE, body=BODY)
+
+    assert TOKEN not in str(exc_info.value)
+    rendered_payload = json.dumps(exc_info.value.error_payload)
+    assert TOKEN not in rendered_payload
+    assert "***" in rendered_payload
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"message": "Validation Failed"},  # no errors array at all
+        # wrong resource — an issue-comment duplicate, not a PR duplicate
+        {
+            "message": "Validation Failed",
+            "errors": [
+                {
+                    "resource": "Issue",
+                    "code": "custom",
+                    "message": f"A pull request already exists for {OWNER}:{HEAD}.",
+                }
+            ],
+        },
+        # wrong code — a field-validation error, not the custom duplicate rule
+        {
+            "message": "Validation Failed",
+            "errors": [
+                {
+                    "resource": "PullRequest",
+                    "code": "invalid",
+                    "message": f"A pull request already exists for {OWNER}:{HEAD}.",
+                }
+            ],
+        },
+        # wrong message — a PullRequest/custom error about something else
+        {
+            "message": "Validation Failed",
+            "errors": [
+                {
+                    "resource": "PullRequest",
+                    "code": "custom",
+                    "message": "head is the same as base",
+                }
+            ],
+        },
+        # malformed errors container
+        {"message": "Validation Failed", "errors": "not-a-list"},
+        # malformed errors entries (never match, never raise)
+        {"message": "Validation Failed", "errors": ["garbage", {"code": "custom"}]},
+    ],
+)
+def test_create_pr_other_422_shapes_stay_plain_adapter_error(payload: dict[str, object]) -> None:
+    # SFP-253 AC4: ONLY the exact signature is typed — every other 422 stays a
+    # hard, plain GitProviderAdapterError (exact type, not the subclass).
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(422, json=payload)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        adapter.create_pr(OWNER, REPO, title=TITLE, head=HEAD, base=BASE, body=BODY)
+
+    assert type(exc_info.value) is GitProviderAdapterError
+    assert tries == 1
+
+
+def test_create_pr_422_non_json_body_stays_plain_adapter_error() -> None:
+    # A 422 whose body does not parse as JSON cannot carry the signature — it
+    # takes the plain redacted-error path (the parse failure is swallowed into
+    # a non-match, never into a crash).
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(422, text="<html>gateway error</html>")
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        adapter.create_pr(OWNER, REPO, title=TITLE, head=HEAD, base=BASE, body=BODY)
+
+    assert type(exc_info.value) is GitProviderAdapterError
+    assert tries == 1
+
+
+# ---------------------------------------------------------------------------
+# find_open_pr_for_branch — the list-PRs-by-head lookup (SFP-253)
+# ---------------------------------------------------------------------------
+
+
+def test_find_open_pr_for_branch_reexported() -> None:
+    # PullRequestAlreadyExistsError is re-exported from the git subpackage.
+    from workspace_worker.repo import git
+    from workspace_worker.repo.git.adapter import (
+        PullRequestAlreadyExistsError as Direct,
+    )
+
+    assert git.PullRequestAlreadyExistsError is Direct
+    assert "PullRequestAlreadyExistsError" in git.__all__
+
+
+def test_find_open_pr_for_branch_issues_get_with_head_and_state_open() -> None:
+    # GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open + bearer
+    # — the owner-prefixed head form is GitHub's required filter format.
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.method == "GET"
+        assert request.url.path == f"/repos/{OWNER}/{REPO}/pulls"
+        assert dict(request.url.params) == {"head": f"{OWNER}:{HEAD}", "state": "open"}
+        assert request.headers.get("authorization") == f"Bearer {TOKEN}"
+        return httpx.Response(200, json=[_pr_response(head_sha=SHA)])
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    open_prs = adapter.find_open_pr_for_branch(OWNER, REPO, HEAD)
+
+    assert len(seen) == 1
+    assert open_prs == [
+        PullRequestResult(
+            owner=OWNER, repo=REPO, number=PR_NUMBER, url=PR_URL, state="open", head_sha=SHA
+        )
+    ]
+
+
+def test_find_open_pr_for_branch_parses_fields_from_response() -> None:
+    # Parse-not-echo: number/url/state/head_sha come from the response JSON
+    # (deliberately different from any input-derived value).
+    resp = _pr_response(
+        number=777,
+        url=f"https://github.com/{OWNER}/{REPO}/pull/777",
+        state="open",
+        head_sha="d" * 40,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[resp])
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    open_prs = adapter.find_open_pr_for_branch(OWNER, REPO, HEAD)
+
+    assert len(open_prs) == 1
+    assert open_prs[0].number == 777
+    assert open_prs[0].url == f"https://github.com/{OWNER}/{REPO}/pull/777"
+    assert open_prs[0].state == "open"
+    assert open_prs[0].head_sha == "d" * 40
+
+
+def test_find_open_pr_for_branch_no_open_pr_returns_empty_list() -> None:
+    # The no-open-PR case (the 422-causing PR was closed in the race window):
+    # an EMPTY list — the caller decides to fail loud, never the adapter.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    assert adapter.find_open_pr_for_branch(OWNER, REPO, HEAD) == []
+
+
+def test_find_open_pr_for_branch_skips_malformed_and_non_open_entries() -> None:
+    # Defensive parsing (the list_pr_reviews family): non-dict items and
+    # missing/non-int numbers are skipped; a missing html_url degrades to "".
+    # A non-open state is DROPPED (local fail-closed mirror of state=open) and
+    # a missing/non-string state can never be adopted — the returned list only
+    # ever holds entries positively confirmed open.
+    payload: list[object] = [
+        "garbage",
+        {"html_url": PR_URL, "state": "open"},  # no number -> skipped
+        {"number": "not-an-int", "state": "open"},  # non-int number -> skipped
+        _pr_response(number=51, state="closed", head_sha=SHA),  # closed -> dropped
+        {"number": 52, "html_url": PR_URL, "state": None},  # state absent-ish -> dropped
+        _pr_response(number=53, state="open"),  # no head -> head_sha ""
+        {"number": 54, "state": "open"},  # no html_url -> url ""
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    open_prs = adapter.find_open_pr_for_branch(OWNER, REPO, HEAD)
+
+    assert open_prs == [
+        PullRequestResult(owner=OWNER, repo=REPO, number=53, url=PR_URL, state="open", head_sha=""),
+        PullRequestResult(owner=OWNER, repo=REPO, number=54, url="", state="open", head_sha=""),
+    ]
+
+
+def test_find_open_pr_for_branch_non_list_payload_raises_adapter_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": "unexpected"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="non-list"):
+        adapter.find_open_pr_for_branch(OWNER, REPO, HEAD)
+
+
+def test_find_open_pr_for_branch_retry_then_succeed_on_500() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        if tries < 3:
+            return httpx.Response(500, json={"message": "server error"})
+        return httpx.Response(200, json=[_pr_response()])
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    open_prs = adapter.find_open_pr_for_branch(OWNER, REPO, HEAD)
+
+    assert tries == 3
+    assert [pr.number for pr in open_prs] == [PR_NUMBER]
+
+
+def test_find_open_pr_for_branch_no_retry_on_422() -> None:
+    tries = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal tries
+        tries += 1
+        return httpx.Response(422, json={"message": "Validation Failed"})
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError, match="422"):
+        adapter.find_open_pr_for_branch(OWNER, REPO, HEAD)
+
+    assert tries == 1  # NOT retried
+
+
+def test_find_open_pr_for_branch_token_redacted_from_error_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text=f"forbidden: invalid token {TOKEN}")
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        adapter.find_open_pr_for_branch(OWNER, REPO, HEAD)
+
+    msg = str(exc_info.value)
+    assert TOKEN not in msg
+    assert "***" in msg
+
+
+@pytest.mark.parametrize("which", ["owner", "repo", "head_branch"])
+def test_find_open_pr_for_branch_empty_args_raise_value_error_before_any_http(
+    which: str,
+) -> None:
+    called: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request)
+        return httpx.Response(200, json=[])
+
+    adapter = GitProviderAdapter(TOKEN, client=_client(handler), max_attempts=3)
+    if which == "owner":
+        with pytest.raises(ValueError, match="owner"):
+            adapter.find_open_pr_for_branch("", REPO, HEAD)
+    elif which == "repo":
+        with pytest.raises(ValueError, match="repo"):
+            adapter.find_open_pr_for_branch(OWNER, "", HEAD)
+    else:
+        with pytest.raises(ValueError, match="head_branch"):
+            adapter.find_open_pr_for_branch(OWNER, REPO, "")
+
+    assert called == []  # no HTTP call made — validated locally
+
+
+def test_pr_already_exists_matcher_is_shape_safe() -> None:
+    # Direct rows for the signature matcher's defensive legs: non-dict data and
+    # a non-list ``errors`` never match (fail closed, never raise).
+    assert _is_pr_already_exists_payload(None) is False
+    assert _is_pr_already_exists_payload([{"resource": "PullRequest"}]) is False
+    assert _is_pr_already_exists_payload({"errors": "not-a-list"}) is False
+    assert _is_pr_already_exists_payload(ALREADY_EXISTS_422) is True
+
+
+def test_redact_json_value_walks_scalars_lists_and_dicts() -> None:
+    # The recursive redaction walks every container level and passes
+    # non-string scalars through untouched.
+    payload: dict[str, object] = {
+        "status": 422,
+        "ok": True,
+        "none": None,
+        "secret": f"prefix {TOKEN} suffix",
+        "errors": [{"message": f"bad {TOKEN}", "code": 7}],
+    }
+    redacted = _redact_json_value(payload, TOKEN)
+    assert redacted["status"] == 422
+    assert redacted["ok"] is True
+    assert redacted["none"] is None
+    assert redacted["secret"] == "prefix *** suffix"
+    errors = redacted["errors"]
+    assert isinstance(errors, list)
+    entry = errors[0]
+    assert isinstance(entry, dict)
+    assert entry["message"] == "bad ***"
+    assert entry["code"] == 7
 
 
 # ---------------------------------------------------------------------------
