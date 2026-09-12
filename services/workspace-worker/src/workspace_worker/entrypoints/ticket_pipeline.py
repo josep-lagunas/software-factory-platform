@@ -78,7 +78,7 @@ from sfp_contracts.context.bindings import ResolvedContext
 from sfp_contracts.context.declaration import TicketContextDeclaration
 
 from workspace_worker.agent_runtime.model_config import AgentModelConfig
-from workspace_worker.agent_runtime.runtime import ClaudeAgentRuntime
+from workspace_worker.agent_runtime.runtime import ClaudeAgentRuntime, render_structured_verdict
 from workspace_worker.agents.coder import code
 from workspace_worker.agents.planner import plan
 from workspace_worker.agents.reviewer import review_with_text
@@ -549,8 +549,10 @@ REVIEWER_MALFUNCTION_ERROR = (
 )
 
 #: SFP-249 — the body of the conversation comment posted when a verdict comes
-#: back malformed. Notes the malfunction AND that the review was retried — it
-#: is a PR conversation comment, never a review verdict.
+#: back malformed (SFP-252 widened "malformed" to the absence of
+#: reviewer-authored prose: empty OR rendering-only). Notes the malfunction
+#: AND that the review was retried — it is a PR conversation comment, never a
+#: review verdict.
 REVIEWER_MALFUNCTION_COMMENT = (
     "⚠️ Reviewer malfunction: the reviewer returned a verdict without a textual "
     "rationale (an infra issue with the reviewer, NOT a code verdict). The review "
@@ -558,32 +560,69 @@ REVIEWER_MALFUNCTION_COMMENT = (
 )
 
 
-def is_malformed_rationale(rationale_source: str | None) -> bool:
-    """Whether a review verdict's rationale is a REVIEWER_MALFUNCTION (SFP-249).
+def is_malformed_rationale(rationale_source: str | None, structured_rendering: str | None) -> bool:
+    """Whether a review verdict's rationale is a REVIEWER_MALFUNCTION.
 
-    The rationale is the reviewer's ``final_text`` — the textual rationale the
-    runtime transports alongside the structured verdict: the reviewer's final
-    agent message, or (the SDK-enforced ``output_format`` path, where that
-    message is empty) the runtime's deterministic rendering of the structured
-    verdict. A rationale that is
-    empty after strip is a malfunction on EVERY status — including
-    ``APPROVED``: an empty-rationale approval is exactly as untrustworthy as an
-    empty-rationale rejection, and both mean the reviewer itself malfunctioned
-    rather than judged the code.
+    SFP-249 defined the malfunction as an EMPTY (post-strip) rationale;
+    SFP-252 widens it to the ABSENCE OF REVIEWER-AUTHORED PROSE. The rationale
+    is the reviewer's ``final_text`` — the textual rationale the runtime
+    transports alongside the structured verdict: the reviewer's final agent
+    message, or (the SDK-enforced ``output_format`` path, where that message is
+    empty) the runtime's deterministic rendering of the structured verdict. A
+    rationale is malformed on EITHER leg:
 
-    Pure/deterministic: a function of the rationale text alone (no network, no
-    clock, no verdict dependency — the same empty text classifies as malformed
-    for every status).
+    * **empty** — ``None`` or strips to empty (the SFP-249 leg);
+    * **rendering-only** — EXACTLY equal to the runtime's deterministic
+      rendering of the structured verdict (the SFP-249 F1 fallback text). A
+      final text carrying nothing but that rendering means the reviewer
+      authored NO prose — the measured SFP-249 blind spot (SFP-122 run
+      2026-09-12, PR #167): a non-empty rendering passed the empty-strip
+      check and an infrastructure malfunction masqueraded as a code
+      rejection.
+
+    The rule fires on EVERY status — including ``APPROVED`` — and NEVER keys
+    on gate values: a genuinely terrible PR can legitimately fail all six
+    gates WITH prose, and prose presence is the discriminator (an
+    all-false-gate APPROVE with prose is a real, if surprising, verdict; any
+    verdict without prose is an infra malfunction either way).
+
+    Pure/deterministic (MAS §12.7): a function of the two strings alone — no
+    network, no clock, no verdict-status dependency; the same inputs classify
+    the same way for every status.
 
     Args:
         rationale_source: The reviewer's final textual rationale
             (``AgentRunResult.final_text``), or ``None`` when the runtime
             captured no final text.
+        structured_rendering: The runtime's deterministic rendering of the
+            SAME structured verdict, passed in by the call site (which already
+            holds both — never recomputed or fetched inside the predicate).
+            ``None``/empty skips the equality leg (belt-and-braces; the guard
+            call site always supplies it).
 
     Returns:
-        ``True`` when the rationale strips to empty (malfunction).
+        ``True`` when the rationale carries no reviewer-authored prose —
+        empty, or exactly the structured rendering (malfunction).
     """
-    return not (rationale_source or "").strip()
+    text = (rationale_source or "").strip()
+    if not text:
+        return True
+    rendering = (structured_rendering or "").strip()
+    return bool(rendering) and text == rendering
+
+
+def _structured_rendering(verdict: ReviewerOutput) -> str:
+    """The runtime's deterministic rendering of ``verdict`` (SFP-252).
+
+    Byte-identical BY CONSTRUCTION to the runtime's ``final_text`` fallback on
+    the structured-only path (SFP-249 F1): the runtime renders the VALIDATED
+    contract dump through the same shared
+    :func:`~workspace_worker.agent_runtime.runtime.render_structured_verdict`,
+    and ``verdict`` here is the same contract validated from the same parsed
+    output — so the guard's equality leg compares against exactly the bytes
+    the runtime produces, never an independently re-derived string.
+    """
+    return render_structured_verdict(verdict.model_dump(mode="json"))
 
 
 def _review_body(review_status: ReviewStatus, final_text: str | None) -> str:
@@ -595,8 +634,9 @@ def _review_body(review_status: ReviewStatus, final_text: str | None) -> str:
     structured-verdict rendering on the structured-only path). Falls back to
     the BARE status word ONLY when the final text is empty/``None`` — kept as
     belt-and-braces: unreachable while the malfunction guard is on (the guard
-    re-runs or aborts before any submission, and on the structured-only path
-    the runtime itself guarantees a non-empty rendering), so in practice a
+    re-runs or aborts before any submission, and SFP-252 widened the guard to
+    the rendering-only text too — a rationale that is nothing but the
+    structured rendering never reaches a submission), so in practice a
     submitted body always carries both.
 
     Args:
@@ -629,8 +669,9 @@ def _guarded_review(
     SFP-249 guard around the reviewer seam, shared by BOTH review sites (the
     primary review ~step 15 and the SFP-241 pre-merge re-review):
 
-    * first verdict malformed (empty rationale after strip on ANY status,
-      including ``APPROVED``) → re-run the SAME review call once — same seam
+    * first verdict malformed (NO reviewer-authored prose — empty, or exactly
+      the runtime's structured rendering — on ANY status, including
+      ``APPROVED``) → re-run the SAME review call once — same seam
       (``runtime``), same inputs (``pr_spec`` / ``coder_output`` /
       ``resolved`` / prompt / ticket), so the reviewer's ``max_turns`` ceiling
       applies exactly as on the first attempt (MAS §12.7 determinism — the
@@ -653,7 +694,11 @@ def _guarded_review(
     reviewer's final agent message, or (the SDK-enforced ``output_format``
     path, where that message is empty) a deterministic rendering of the
     structured verdict (ID-021: contracts carry structured judgments only;
-    the rationale lives on GitHub, never in ``ReviewerOutput``).
+    the rationale lives on GitHub, never in ``ReviewerOutput``). SFP-252: that
+    rendering-only text is itself the malfunction — the guard checks each
+    verdict's final text against the rendering of that SAME verdict
+    (:func:`_structured_rendering`, byte-identical to the runtime's fallback
+    by construction) and classifies equality as "no reviewer-authored prose".
 
     Args:
         on_malfunction: Optional sink invoked with
@@ -692,7 +737,7 @@ def _guarded_review(
         return output, result_text
 
     review_output, final_text = _run_once()
-    if not is_malformed_rationale(final_text):
+    if not is_malformed_rationale(final_text, _structured_rendering(review_output)):
         return review_output, final_text
 
     _log.warning(
@@ -700,7 +745,7 @@ def _guarded_review(
         review_output.review_status.value,
     )
     retry_output, retry_text = _run_once()
-    if not is_malformed_rationale(retry_text):
+    if not is_malformed_rationale(retry_text, _structured_rendering(retry_output)):
         return retry_output, retry_text
 
     _log.error("reviewer malfunction: verdict without rationale twice (infra issue)")
@@ -712,13 +757,14 @@ def _guarded_review(
 class ReviewerMalfunctionError(Exception):
     """Raised when the reviewer returns a verdict without rationale TWICE (SFP-249).
 
-    A verdict whose textual rationale is empty on ANY status is a
-    REVIEWER_MALFUNCTION — an infrastructure issue with the reviewer itself,
-    never a judgment about the code. The pipeline re-runs the review once; a
-    second malformed verdict aborts with :data:`REVIEWER_MALFUNCTION_ERROR`,
-    whose message is deliberately distinct from the ``"review not approved"``
-    code-verdict abort so the two failure families cannot be confused
-    (MAS §8.8).
+    A verdict whose textual rationale carries no reviewer-authored prose —
+    empty (SFP-249), or nothing but the runtime's structured rendering
+    (SFP-252) — on ANY status is a REVIEWER_MALFUNCTION: an infrastructure
+    issue with the reviewer itself, never a judgment about the code. The
+    pipeline re-runs the review once; a second malformed verdict aborts with
+    :data:`REVIEWER_MALFUNCTION_ERROR`, whose message is deliberately distinct
+    from the ``"review not approved"`` code-verdict abort so the two failure
+    families cannot be confused (MAS §8.8).
     """
 
 
@@ -1134,11 +1180,12 @@ def run_pipeline(
     )
 
     # 15. Reviewer judges the PR. SFP-249: the seam is wrapped by the
-    #     malfunction guard — a malformed verdict (empty rationale on ANY
-    #     status, including APPROVED) triggers a PR conversation comment
-    #     (never a verdict) and the review is re-run ONCE; malformed twice
-    #     aborts with the differentiated REVIEWER_MALFUNCTION_ERROR (an infra
-    #     issue, never a code verdict).
+    #     malfunction guard — a malformed verdict (NO reviewer-authored prose:
+    #     empty or rendering-only, on ANY status, including APPROVED;
+    #     SFP-252) triggers a PR conversation comment (never a verdict) and
+    #     the review is re-run ONCE; malformed twice aborts with the
+    #     differentiated REVIEWER_MALFUNCTION_ERROR (an infra issue, never a
+    #     code verdict).
     def _comment_malfunction(body: str) -> None:
         trace.append("reviewer_adapter.add_pr_comment")
         reviewer_adapter.add_pr_comment(owner, repo_name, pr.number, body=body)
