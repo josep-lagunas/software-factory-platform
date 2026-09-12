@@ -24,6 +24,13 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+# VERIFIED STILL NEEDED (SFP-251): notify-run.sh invokes this via plain
+# `uv run python`, and the DEFAULT sync set installs NO workspace members —
+# the root project is virtual (no build-system) and members only land with
+# `uv sync --all-packages`. Empirically, in a default-sync venv both
+# `communication` and `sfp_config` are unimportable without this pin. Drop it
+# only if the launch recipe moves to --all-packages (or members become
+# default dependencies).
 sys.path.insert(0, str(REPO / "services" / "communication" / "src"))
 
 from communication.interfaces.slack_outbound import SlackOutboundClient  # noqa: E402

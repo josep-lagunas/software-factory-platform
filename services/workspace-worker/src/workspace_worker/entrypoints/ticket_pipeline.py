@@ -35,8 +35,12 @@ Binding resolutions (Orchestrator-decided; implemented exactly):
    locally-committed objects).
 5. **Single-PR semantics** — ``PlannerOutput.pr_specs[0]`` only (linear slice,
    no fan-out); more than one spec is a deterministic error.
-6. **Per-role** ``max_turns``: planner=5, test_designer=5, coder=50, reviewer=5.
-   One runtime per role; readiness reuses the planner runtime.
+6. **Per-role** ``max_turns`` (SFP-251): planner=15, test_designer=30,
+   coder=80, reviewer=30, readiness=8 — the MEASURED operational defaults,
+   sourced from :class:`WorkspaceWorkerSettings` (env-tunable via
+   ``SFP_<ROLE>_MAX_TURNS``). One runtime per role. The Coder's reasoning
+   effort is likewise settings-driven (``SFP_CODER_EFFORT``, default
+   ``medium``); every other role stays hardcoded ``low``.
 7. **Truthful checkpoints (SFP-247)** — ``code.json`` is written only after the
    pipeline's own commit verification (``git rev-list --count <base>..<branch>
    >= 1``, using the loop's existing ``branch_name``/``base_branch``
@@ -71,7 +75,7 @@ from sfp_agent_runtime.prompt_builder import PromptBuilder
 from sfp_config import LocalSecretProvider, SecretRef
 from sfp_contracts.agents.coder import CoderOutput
 from sfp_contracts.agents.planner import PlannerOutput, PrSpec
-from sfp_contracts.agents.readiness import ReadinessVerdict
+from sfp_contracts.agents.readiness import ReadinessOutput, ReadinessVerdict
 from sfp_contracts.agents.reviewer import ReviewerOutput, ReviewStatus
 from sfp_contracts.agents.test_designer import TestDesignerOutput
 from sfp_contracts.context.bindings import ResolvedContext
@@ -137,27 +141,41 @@ _DONE_TRANSITION_ID = "51"
 #: default prompt against this dir via :class:`PromptBuilder`.
 _DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-#: Per-role ``max_turns`` bound (RESOLUTION 6). Planner / Test Designer /
-#: Reviewer are bounded tight (judgment runs); the Coder is given room for a
-#: multi-step implementation run, capped to fail-fast.
-_MAX_TURNS: Mapping[str, int] = {
-    "planner": 15,
-    "test_designer": 15,
-    "coder": 50,
-    "reviewer": 15,
-    "readiness": 8,
-}
 
-#: SMOKE-PATCH (local, NOT committed): per-role reasoning effort forwarded to
-#: the runtime -> ClaudeAgentOptions(effort=...). Emit-JSON agents finalize in
-#: few turns at "low"; the Coder keeps "medium" for real implementation work.
-_ROLE_EFFORT: Mapping[str, str] = {
-    "planner": "low",
-    "test_designer": "low",
-    "reviewer": "low",
-    "readiness": "low",
-    "coder": "medium",
-}
+def _role_max_turns(settings: WorkspaceWorkerSettings) -> dict[str, int]:
+    """Per-role ``max_turns`` bound (RESOLUTION 6, SFP-251) — settings-driven.
+
+    The committed defaults ARE the measured operational values (planner=15,
+    test_designer=30, coder=80, reviewer=30, readiness=8); each is env-tunable
+    via its ``SFP_<ROLE>_MAX_TURNS`` name on :class:`WorkspaceWorkerSettings`.
+    Judgment roles are bounded tight; the Coder is given room for a
+    multi-step implementation run, capped to fail-fast.
+    """
+    return {
+        "planner": settings.planner_max_turns,
+        "test_designer": settings.test_designer_max_turns,
+        "coder": settings.coder_max_turns,
+        "reviewer": settings.reviewer_max_turns,
+        "readiness": settings.readiness_max_turns,
+    }
+
+
+def _role_effort(settings: WorkspaceWorkerSettings) -> dict[str, str]:
+    """Per-role reasoning effort -> ``ClaudeAgentOptions(effort=...)`` (SFP-251).
+
+    Emit-JSON agents finalize in few turns at ``low``; the Coder keeps a
+    settings-driven tier (default ``medium``, env-tunable via
+    ``SFP_CODER_EFFORT``) for real implementation work. Non-coder roles stay
+    hardcoded ``low`` (effort variance for them is out of scope).
+    """
+    return {
+        "planner": "low",
+        "test_designer": "low",
+        "reviewer": "low",
+        "readiness": "low",
+        "coder": settings.coder_effort,
+    }
+
 
 #: Output contract per agent role (one :class:`ClaudeAgentRuntime` each).
 _OUTPUT_CONTRACTS: Mapping[str, type[Any]] = {
@@ -165,12 +183,9 @@ _OUTPUT_CONTRACTS: Mapping[str, type[Any]] = {
     "test_designer": TestDesignerOutput,
     "coder": CoderOutput,
     "reviewer": ReviewerOutput,
-    # SMOKE-PATCH (local, NOT committed — formalize via PR): readiness emits
-    # ReadinessOutput, NOT PlannerOutput — reusing the planner runtime made the
-    # contract validation fail (fail-closed -> NEEDS_CLARIFICATION).
-    "readiness": __import__(
-        "sfp_contracts.agents.readiness", fromlist=["ReadinessOutput"]
-    ).ReadinessOutput,
+    # Readiness emits ReadinessOutput, NOT PlannerOutput — its own contract
+    # (reusing the planner's made contract validation fail closed).
+    "readiness": ReadinessOutput,
 }
 
 #: Module logger — checkpoint load/skip events land here for resume observability.
@@ -962,8 +977,8 @@ def run_pipeline(
     resolved: ResolvedContext = resolve_context(declaration, {}, ticket_id=ticket_key)
 
     # 2. Readiness gate — uses a DEDICATED readiness runtime (ReadinessOutput
-    # contract), NOT the planner runtime (PlannerOutput) — contract mismatch
-    # made the gate fail-closed (SMOKE-PATCH, local, formalize via PR).
+    # contract), NOT the planner runtime (PlannerOutput) — a contract mismatch
+    # there made the gate fail closed.
     # SFP-232: compute the human/automatic frontier flag deterministically from
     # the issue's labels + the offline DAG, and forward it to the rubric so the
     # two *boundary* ID-070 sections are required (presence only) just at the
@@ -1344,21 +1359,25 @@ def _build_runtimes(
     secret_provider: LocalSecretProvider,
     model_resolver: AgentModelConfig,
 ) -> dict[str, ClaudeAgentRuntime]:
-    """Construct the four per-role ClaudeAgentRuntime instances (RESOLUTION 6).
+    """Construct the five per-role ClaudeAgentRuntime instances (RESOLUTION 6).
 
-    The Coder runtime is constructed with ``cwd=None`` — its cwd is rebound at
+    Per-role ``max_turns`` + the Coder's effort tier are read from
+    ``settings`` (SFP-251) — never from ad-hoc ``os.environ`` lookups. The
+    Coder runtime is constructed with ``cwd=None`` — its cwd is rebound at
     loop time once the worktree path exists (RESOLUTION 3).
     """
+    max_turns = _role_max_turns(settings)
+    effort = _role_effort(settings)
     runtimes: dict[str, ClaudeAgentRuntime] = {}
     for role, contract in _OUTPUT_CONTRACTS.items():
         runtimes[role] = ClaudeAgentRuntime(
             settings,
             secret_provider,
             contract,
-            max_turns=_MAX_TURNS[role],
+            max_turns=max_turns[role],
             cwd=None,
             model_resolver=model_resolver,
-            effort=_ROLE_EFFORT.get(role),
+            effort=effort.get(role),
             # All roles get schema enforcement (output_format). The earlier
             # "Coder didn't write with output_format" was the permission prompt
             # (fixed via permission_mode=bypassPermissions in the runtime), NOT
@@ -1398,7 +1417,16 @@ def build(
     repo_name = repo_name or os.environ.get("SFP_GIT_REPO", "sfp")
     repo_url = os.environ.get("SFP_REPO_URL", f"https://github.com/{owner}/{repo_name}.git")
 
-    worktree_base = worktree_base or Path(os.environ.get("SFP_WORKTREE_BASE", "/tmp/sfp-worktrees"))
+    # Durable worktree base (SFP-251): ``~/Library/Caches/sfp-worktrees`` — a
+    # per-user cache location that survives reboots (unlike ``/tmp``, which the
+    # OS sweeps and would orphan checkpointed runs mid-resume). Env-tunable via
+    # SFP_WORKTREE_BASE; explicit ``worktree_base`` (tests, CLI) always wins.
+    worktree_base = worktree_base or Path(
+        os.environ.get(
+            "SFP_WORKTREE_BASE",
+            str(Path.home() / "Library" / "Caches" / "sfp-worktrees"),
+        )
+    )
     clone_dest = worktree_base / "clone"
 
     # Branch naming rule ``sfp-<ticket-key>-<slug>`` (ID-025 / BranchManager).
