@@ -1038,32 +1038,43 @@ def test_more_than_one_pr_spec_is_a_deterministic_error(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_build_constructs_dual_adapters_and_five_runtimes_from_env(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """build() wires: 5 ClaudeAgentRuntime (coder cwd=None; incl. a dedicated
-    readiness runtime), 2 GitProviderAdapter (coder+reviewer tokens), 1
-    RepoManager (coder token), 1 JiraClient."""
-    # Tokens resolved from env by LocalSecretProvider.
-    monkeypatch.setenv("GITHUB_TOKEN_CODER", "coder-tok")
-    monkeypatch.setenv("GITHUB_TOKEN_REVIEWER", "reviewer-tok")
-    monkeypatch.setenv("JIRA_API_TOKEN", "jira-tok")
-    monkeypatch.setenv("SFP_JIRA_EMAIL", "bot@example.com")
+#: The six SFP-251 launch knobs (env-tunable settings surface). Tests clear
+#: them first so a leaked operator/CI env var can never skew a defaults pin —
+#: the CI==local guarantee (SFP-251 acceptance) is "empty env → identical
+#: values", which is exactly what the delenv + assert-defaults rows encode.
+_SFP251_KNOBS = (
+    "SFP_PLANNER_MAX_TURNS",
+    "SFP_TEST_DESIGNER_MAX_TURNS",
+    "SFP_CODER_MAX_TURNS",
+    "SFP_REVIEWER_MAX_TURNS",
+    "SFP_READINESS_MAX_TURNS",
+    "SFP_CODER_EFFORT",
+)
 
-    settings = WorkspaceWorkerSettings(
-        anthropic_base_url="https://llm.example.com",
-        default_model="glm-x",
-        llm_provider_secret_ref=SecretRef(name="LLM_TOKEN"),
-    )
-    sp = LocalSecretProvider(secrets_file=None)
 
-    # Recording fakes for every real constructor build() references.
+def _clear_sfp251_knobs(monkeypatch: pytest.MonkeyPatch) -> None:
+    for _knob in _SFP251_KNOBS:
+        monkeypatch.delenv(_knob, raising=False)
+
+
+def _patch_build_ctors(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
+    """Patch every real constructor build() references with recording fakes.
+
+    Returns the recording lists: ``runtime_instances`` (one dict per runtime:
+    contract / max_turns / effort / cwd), ``jira_calls``, ``repo_calls``,
+    ``adapter_calls``.
+    """
     runtime_instances: list[dict[str, Any]] = []
 
     def fake_runtime_ctor(
         settings_, sp_, contract, *, max_turns=None, cwd=None, model_resolver=None, **kw
     ):
-        inst = {"contract": contract, "max_turns": max_turns, "cwd": cwd}
+        inst = {
+            "contract": contract,
+            "max_turns": max_turns,
+            "effort": kw.get("effort"),
+            "cwd": cwd,
+        }
         runtime_instances.append(inst)
         return inst
 
@@ -1083,22 +1094,51 @@ def test_build_constructs_dual_adapters_and_five_runtimes_from_env(
         adapter_calls.append(token)
         return object()
 
-    def fake_wt_ctor(repo_path, **kw):
-        return object()
-
-    def fake_branch_ctor(repo_path, **kw):
-        return object()
-
-    def fake_prompt_ctor(path, **kw):
-        return object()
-
     monkeypatch.setattr(pipeline_mod, "ClaudeAgentRuntime", fake_runtime_ctor)
     monkeypatch.setattr(pipeline_mod, "JiraClient", fake_jira_ctor)
     monkeypatch.setattr(pipeline_mod, "RepoManager", fake_repo_ctor)
     monkeypatch.setattr(pipeline_mod, "GitProviderAdapter", fake_adapter_ctor)
-    monkeypatch.setattr(pipeline_mod, "WorktreeManager", fake_wt_ctor)
-    monkeypatch.setattr(pipeline_mod, "BranchManager", fake_branch_ctor)
-    monkeypatch.setattr(pipeline_mod, "PromptBuilder", fake_prompt_ctor)
+    monkeypatch.setattr(pipeline_mod, "WorktreeManager", lambda repo_path, **kw: object())
+    monkeypatch.setattr(pipeline_mod, "BranchManager", lambda repo_path, **kw: object())
+    monkeypatch.setattr(pipeline_mod, "PromptBuilder", lambda path, **kw: object())
+
+    return {
+        "runtime_instances": runtime_instances,
+        "jira_calls": jira_calls,
+        "repo_calls": repo_calls,
+        "adapter_calls": adapter_calls,
+    }
+
+
+def test_build_constructs_dual_adapters_and_five_runtimes_from_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """build() wires: 5 ClaudeAgentRuntime (coder cwd=None; incl. a dedicated
+    readiness runtime), 2 GitProviderAdapter (coder+reviewer tokens), 1
+    RepoManager (coder token), 1 JiraClient.
+
+    Pins the SFP-251 turn/effort defaults as they flow through build(): with
+    the six launch knobs absent from the env (CI and a bare local launch
+    resolve IDENTICALLY), the measured values are planner=15,
+    test_designer=30, coder=80, reviewer=30, readiness=8, coder effort
+    'medium' (others 'low').
+    """
+    # Tokens resolved from env by LocalSecretProvider.
+    monkeypatch.setenv("GITHUB_TOKEN_CODER", "coder-tok")
+    monkeypatch.setenv("GITHUB_TOKEN_REVIEWER", "reviewer-tok")
+    monkeypatch.setenv("JIRA_API_TOKEN", "jira-tok")
+    monkeypatch.setenv("SFP_JIRA_EMAIL", "bot@example.com")
+    _clear_sfp251_knobs(monkeypatch)
+
+    settings = WorkspaceWorkerSettings(
+        anthropic_base_url="https://llm.example.com",
+        default_model="glm-x",
+        llm_provider_secret_ref=SecretRef(name="LLM_TOKEN"),
+    )
+    sp = LocalSecretProvider(secrets_file=None)
+
+    rec = _patch_build_ctors(monkeypatch)
+    runtime_instances = rec["runtime_instances"]
 
     deps = build(
         TICKET,
@@ -1116,24 +1156,76 @@ def test_build_constructs_dual_adapters_and_five_runtimes_from_env(
     assert len(runtime_instances) == 5
     coder_inst = next(r for r in runtime_instances if r["contract"].__name__ == "CoderOutput")
     assert coder_inst["cwd"] is None
-    # Per-role max_turns (RESOLUTION 6). Readiness is bounded tight (8); the
-    # coder gets room (50); judgment roles are mid-bounded (15).
+    # Per-role max_turns (RESOLUTION 6 / SFP-251): the MEASURED defaults —
+    # planner=15, test_designer=30, coder=80, reviewer=30, readiness=8.
     turns_by_contract = {r["contract"].__name__: r["max_turns"] for r in runtime_instances}
     assert turns_by_contract["PlannerOutput"] == 15
-    assert turns_by_contract["TestDesignerOutput"] == 15
-    assert turns_by_contract["CoderOutput"] == 50
-    assert turns_by_contract["ReviewerOutput"] == 15
+    assert turns_by_contract["TestDesignerOutput"] == 30
+    assert turns_by_contract["CoderOutput"] == 80
+    assert turns_by_contract["ReviewerOutput"] == 30
     assert turns_by_contract["ReadinessOutput"] == 8
+    # Effort tiers (SFP-251): coder 'medium', every other role 'low'.
+    effort_by_contract = {r["contract"].__name__: r["effort"] for r in runtime_instances}
+    assert effort_by_contract["CoderOutput"] == "medium"
+    for _name in ("PlannerOutput", "TestDesignerOutput", "ReviewerOutput", "ReadinessOutput"):
+        assert effort_by_contract[_name] == "low"
     # Dual adapters: coder token + reviewer token (RESOLUTION 2 / ID-073).
-    assert adapter_calls == ["coder-tok", "reviewer-tok"]
+    assert rec["adapter_calls"] == ["coder-tok", "reviewer-tok"]
     # RepoManager uses the CODER token (object upload is a Coder-side op, ID-035).
-    assert repo_calls == ["coder-tok"]
+    assert rec["repo_calls"] == ["coder-tok"]
     # JiraClient got the site/email/token.
-    assert jira_calls == [("https://arconta.atlassian.net", "bot@example.com", "jira-tok")]
+    assert rec["jira_calls"] == [("https://arconta.atlassian.net", "bot@example.com", "jira-tok")]
     # Branch name follows the sfp-<key>-<slug> convention.
     assert deps.branch_name == "sfp-sfp-224-slice"
     assert deps.repo_url == REPO_URL
     assert deps.done_transition_id == "51"
+
+
+def test_build_env_overrides_role_max_turns_and_coder_effort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The SFP_ env names are the override surface (SFP-251): build() with
+    settings=None constructs WorkspaceWorkerSettings from the environment, so
+    SFP_REVIEWER_MAX_TURNS=40 reaches the built Reviewer runtime as 40 (and
+    SFP_CODER_EFFORT=high reaches the Coder as its effort tier) while every
+    non-overridden role keeps its committed default."""
+    # Required settings fields + secrets, all from env (settings=None below).
+    monkeypatch.setenv("SFP_ANTHROPIC_BASE_URL", "https://llm.example.com")
+    monkeypatch.setenv("SFP_DEFAULT_MODEL", "glm-x")
+    monkeypatch.setenv("SFP_LLM_PROVIDER_SECRET_REF", '{"name": "LLM_TOKEN"}')
+    monkeypatch.setenv("GITHUB_TOKEN_CODER", "coder-tok")
+    monkeypatch.setenv("GITHUB_TOKEN_REVIEWER", "reviewer-tok")
+    monkeypatch.setenv("JIRA_API_TOKEN", "jira-tok")
+    monkeypatch.setenv("SFP_JIRA_EMAIL", "bot@example.com")
+    _clear_sfp251_knobs(monkeypatch)
+    # The overrides under test.
+    monkeypatch.setenv("SFP_REVIEWER_MAX_TURNS", "40")
+    monkeypatch.setenv("SFP_CODER_EFFORT", "high")
+
+    rec = _patch_build_ctors(monkeypatch)
+
+    build(
+        TICKET,
+        slug="slice",
+        owner=OWNER,
+        repo_name=REPO,
+        worktree_base=tmp_path,
+        settings=None,
+        secret_provider=LocalSecretProvider(secrets_file=None),
+    )
+
+    runtime_instances = rec["runtime_instances"]
+    assert len(runtime_instances) == 5
+    turns_by_contract = {r["contract"].__name__: r["max_turns"] for r in runtime_instances}
+    # The overridden role carries the env value…
+    assert turns_by_contract["ReviewerOutput"] == 40
+    # …and every non-overridden role keeps its committed default (15/30/80/8).
+    assert turns_by_contract["PlannerOutput"] == 15
+    assert turns_by_contract["TestDesignerOutput"] == 30
+    assert turns_by_contract["CoderOutput"] == 80
+    assert turns_by_contract["ReadinessOutput"] == 8
+    effort_by_contract = {r["contract"].__name__: r["effort"] for r in runtime_instances}
+    assert effort_by_contract["CoderOutput"] == "high"
 
 
 def test_main_returns_zero_on_success_and_nonzero_on_abort(
