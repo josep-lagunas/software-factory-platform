@@ -41,13 +41,16 @@ from sfp_agent_runtime.interfaces import AgentRunRequest
 from sfp_config import LocalSecretProvider, SecretRef
 from sfp_contracts.agents.reviewer import ReviewerOutput, ReviewStatus
 from test_ticket_pipeline import (  # type: ignore[no-redef]
+    _REUSED_PR_NUMBER,
     HEAD_SHA,
     OWNER,
     PR_NUMBER,
     REPO,
     FakeGitAdapter,
     FakeRuntime,
+    _already_exists_error,
     _make_runtimes,
+    _reused_pr,
     _review,
     _reviewer_output,
     _run,
@@ -645,3 +648,32 @@ def test_structured_path_with_reviewer_prose_merges(
     ) in fakes["reviewer_adapter"].calls
     assert ("merge_pr", OWNER, REPO, PR_NUMBER, "squash") in fakes["coder_adapter"].calls
     assert fakes["jira"].transitions == [("SFP-224", "51")]
+
+
+# --------------------------------------------------------------------------- #
+# SFP-253 — the malfunction path against a REUSED PR (resume idempotency)
+# --------------------------------------------------------------------------- #
+
+
+def test_malfunction_comment_lands_on_the_reused_pr_number(tmp_path: Any) -> None:
+    """SFP-253 regression pin (AC6): the SFP-249 malfunction-comment path reads
+    the PR from the run state — on a run that ADOPTED an existing open PR
+    (GitHub's typed 422 + exactly-one lookup hit), the conversation comment
+    lands on the REUSED PR number. No new PR exists to comment on instead."""
+    runtimes, _ = _make_runtimes(approved=True, reviewer_final_texts=[None, None])
+    coder_adapter = FakeGitAdapter(create_pr_exc=_already_exists_error(), open_prs=[_reused_pr()])
+
+    result, fakes = _run(tmp_path, runtimes, coder_adapter=coder_adapter)
+
+    assert result.success is False
+    # The abort carries the REUSED PR number (the run's PR after adoption).
+    assert result.pr_number == _REUSED_PR_NUMBER
+    assert result.error == REVIEWER_MALFUNCTION_ERROR
+    # The conversation comment landed on the REUSED PR number.
+    comment_calls = [c for c in fakes["reviewer_adapter"].calls if c[0] == "add_pr_comment"]
+    assert comment_calls == [
+        ("add_pr_comment", OWNER, REPO, _REUSED_PR_NUMBER, REVIEWER_MALFUNCTION_COMMENT)
+    ]
+    # No verdict was ever submitted and nothing merged on any PR number.
+    assert all(c[0] != "submit_review" for c in fakes["reviewer_adapter"].calls)
+    assert all(c[0] != "merge_pr" for c in coder_adapter.calls)

@@ -53,6 +53,7 @@ from workspace_worker.repo.git.adapter import (
     GitMergeResult,
     GitProviderAdapterError,
     PrCommentResult,
+    PullRequestAlreadyExistsError,
     PullRequestResult,
     PullRequestReview,
     ReviewResult,
@@ -428,10 +429,23 @@ class FakeGitAdapter:
     SFP-241: ``list_pr_reviews`` returns a canned review list (default: one
     APPROVED review for :data:`HEAD_SHA` — the clean-resume short-circuit) so
     the pre-merge review-state gate is driveable per scenario.
+
+    SFP-253: ``create_pr_exc`` optionally makes ``create_pr`` raise (the 422
+    recovery scenarios inject the typed PullRequestAlreadyExistsError or a
+    plain adapter error), and ``open_prs`` is what ``find_open_pr_for_branch``
+    serves (the list-PRs-by-head lookup result).
     """
 
-    def __init__(self, pr_number: int = PR_NUMBER) -> None:
+    def __init__(
+        self,
+        pr_number: int = PR_NUMBER,
+        *,
+        create_pr_exc: Exception | None = None,
+        open_prs: list[PullRequestResult] | None = None,
+    ) -> None:
         self.pr_number = pr_number
+        self._create_pr_exc = create_pr_exc
+        self._open_prs = open_prs if open_prs is not None else []
         self.calls: list[tuple[str, ...]] = []
         self.reviews: list[PullRequestReview] = [
             PullRequestReview(
@@ -447,10 +461,19 @@ class FakeGitAdapter:
         self.calls.append(("list_pr_reviews", owner, repo, number))
         return list(self.reviews)
 
+    def find_open_pr_for_branch(
+        self, owner: str, repo: str, head_branch: str
+    ) -> list[PullRequestResult]:
+        """SFP-253: record the list-PRs-by-head lookup + serve the canned list."""
+        self.calls.append(("find_open_pr_for_branch", owner, repo, head_branch))
+        return list(self._open_prs)
+
     def create_pr(
         self, owner: str, repo: str, *, title: str, head: str, base: str, body: str
     ) -> PullRequestResult:
         self.calls.append(("create_pr", owner, repo, title, head, base, body))
+        if self._create_pr_exc is not None:
+            raise self._create_pr_exc
         return PullRequestResult(
             owner=owner,
             repo=repo,
@@ -1322,6 +1345,173 @@ def test_checkpoints_are_written_on_a_normal_run(tmp_path: Path) -> None:
     PlannerOutput.model_validate(json.loads((ckpts / "plan.json").read_text()))
     TestDesignerOutput.model_validate(json.loads((ckpts / "design.json").read_text()))
     CoderOutput.model_validate(json.loads((ckpts / "code.json").read_text()))
+
+
+# --------------------------------------------------------------------------- #
+# Idempotent create_pr on resume — reuse the existing OPEN PR (SFP-253)
+# --------------------------------------------------------------------------- #
+
+
+def _already_exists_error() -> PullRequestAlreadyExistsError:
+    """The typed 422, built from the documented GitHub payload shape (the
+    SFP-122-incident signature: resource PullRequest + code custom + message)."""
+    return PullRequestAlreadyExistsError(
+        "GitHub create pull request failed: HTTP 422 Unprocessable Entity "
+        f"for /repos/{OWNER}/{REPO}/pulls: Validation Failed",
+        error_payload={
+            "message": "Validation Failed",
+            "errors": [
+                {
+                    "resource": "PullRequest",
+                    "code": "custom",
+                    "message": f"A pull request already exists for {OWNER}:{BRANCH}.",
+                }
+            ],
+        },
+    )
+
+
+#: The reused PR's number — deliberately different from the fake's default
+#: PR_NUMBER so a run reporting it proves the PR was ADOPTED, not created.
+_REUSED_PR_NUMBER = 777
+
+
+def _reused_pr() -> PullRequestResult:
+    """The OPEN PR a resumed run adopts, as the list-PRs-by-head lookup
+    returns it (head matches the fake's canned APPROVED review → clean
+    pre-merge short-circuit)."""
+    return PullRequestResult(
+        owner=OWNER,
+        repo=REPO,
+        number=_REUSED_PR_NUMBER,
+        url=f"https://github.com/{OWNER}/{REPO}/pull/{_REUSED_PR_NUMBER}",
+        state="open",
+        head_sha=HEAD_SHA,
+    )
+
+
+def _resume_past_code(tmp_path: Path) -> Path:
+    """Materialise a full resume state: all three stage checkpoints + the
+    reused worktree (a run whose code stage already completed). Returns the
+    checkpoints dir."""
+    ckpts = tmp_path / "ckpts"
+    _write_ckpt(ckpts, "plan", PlannerOutput.model_validate(_planner_output()).model_dump_json())
+    _write_ckpt(
+        ckpts,
+        "design",
+        TestDesignerOutput.model_validate(_test_designer_output()).model_dump_json(),
+    )
+    _write_ckpt(ckpts, "code", CoderOutput.model_validate(_coder_output()).model_dump_json())
+    (tmp_path / "wt" / TICKET).mkdir(parents=True, exist_ok=True)
+    return ckpts
+
+
+def test_resume_reuses_existing_open_pr_and_continues_to_review(tmp_path: Path) -> None:
+    """AC1: --resume with an existing OPEN PR for the ticket branch — GitHub
+    answers create_pr with the typed 422, the lookup finds exactly one open PR,
+    its number is recorded as the run's PR, and the run continues to the review
+    stage and merges WITHOUT aborting or creating a new PR."""
+    ckpts = _resume_past_code(tmp_path)
+    adapter = FakeGitAdapter(create_pr_exc=_already_exists_error(), open_prs=[_reused_pr()])
+    runtimes, handles = _make_runtimes(approved=True)
+
+    result, fakes = _run(
+        tmp_path, runtimes, resume=True, checkpoints_dir=ckpts, coder_adapter=adapter
+    )
+
+    assert result.success is True
+    assert result.pr_number == _REUSED_PR_NUMBER
+    # Exactly one create_pr attempt (which raised) + exactly one lookup…
+    create_calls = [c for c in fakes["coder_adapter"].calls if c[0] == "create_pr"]
+    lookup_calls = [c for c in fakes["coder_adapter"].calls if c[0] == "find_open_pr_for_branch"]
+    assert len(create_calls) == 1
+    assert lookup_calls == [("find_open_pr_for_branch", OWNER, REPO, BRANCH)]
+    # …the reuse is an auditable trace fact, then the review stage ran on the
+    # REUSED number (submit_review / pre-merge read / merge all carry it).
+    assert "coder_adapter.create_pr" in result.trace
+    assert "coder_adapter.reuse_open_pr" in result.trace
+    assert ("submit_review", OWNER, REPO, _REUSED_PR_NUMBER) in [
+        (c[0], c[1], c[2], c[3]) for c in fakes["reviewer_adapter"].calls
+    ]
+    assert ("list_pr_reviews", OWNER, REPO, _REUSED_PR_NUMBER) in fakes["coder_adapter"].calls
+    assert ("merge_pr", OWNER, REPO, _REUSED_PR_NUMBER, "squash") in fakes["coder_adapter"].calls
+    # The run reached the end (Done transition on the merged reused PR).
+    assert fakes["jira"].transitions == [(TICKET, "51")]
+
+
+def test_resume_422_with_no_open_pr_reraises_the_adapter_error(tmp_path: Path) -> None:
+    """AC3: the typed 422 but the lookup finds NO open PR (the 422-causing PR
+    was closed in the race window) — the ORIGINAL adapter error is re-raised
+    (same exception object — fail loud, no guessing), never swallowed."""
+    ckpts = _resume_past_code(tmp_path)
+    the_error = _already_exists_error()
+    adapter = FakeGitAdapter(create_pr_exc=the_error, open_prs=[])
+    runtimes, _ = _make_runtimes(approved=True)
+
+    with pytest.raises(PullRequestAlreadyExistsError) as exc_info:
+        _run(tmp_path, runtimes, resume=True, checkpoints_dir=ckpts, coder_adapter=adapter)
+
+    # The re-raised error IS the adapter's original exception (bare raise).
+    assert exc_info.value is the_error
+    # The lookup ran once before giving up…
+    assert [c for c in adapter.calls if c[0] == "find_open_pr_for_branch"] == [
+        ("find_open_pr_for_branch", OWNER, REPO, BRANCH)
+    ]
+    # …and nothing downstream happened: no review, no merge, no Done.
+    assert all(c[0] != "merge_pr" for c in adapter.calls)
+
+
+def test_resume_422_with_ambiguous_lookup_reraises_the_adapter_error(tmp_path: Path) -> None:
+    """AC3 (ambiguous leg): the lookup returns MORE than one entry (impossible
+    per GitHub's one-open-PR-per-head model, but never silently ``[0]``-indexed)
+    — the original adapter error is re-raised."""
+    ckpts = _resume_past_code(tmp_path)
+    the_error = _already_exists_error()
+    adapter = FakeGitAdapter(create_pr_exc=the_error, open_prs=[_reused_pr(), _reused_pr()])
+    runtimes, _ = _make_runtimes(approved=True)
+
+    with pytest.raises(PullRequestAlreadyExistsError) as exc_info:
+        _run(tmp_path, runtimes, resume=True, checkpoints_dir=ckpts, coder_adapter=adapter)
+
+    assert exc_info.value is the_error
+    assert all(c[0] != "merge_pr" for c in adapter.calls)
+
+
+def test_fresh_run_with_no_open_pr_creates_pr_exactly_as_before(tmp_path: Path) -> None:
+    """AC2: a fresh run with no 422 creates a NEW PR exactly as before — no
+    lookup is issued, no reuse trace step appears, and the created PR's number
+    is the run's PR through merge + Done."""
+    runtimes, _ = _make_runtimes(approved=True)
+    adapter = FakeGitAdapter()  # create_pr succeeds — the default fake
+
+    result, fakes = _run(tmp_path, runtimes, coder_adapter=adapter)
+
+    assert result.success is True
+    assert result.pr_number == PR_NUMBER
+    assert [c for c in adapter.calls if c[0] == "find_open_pr_for_branch"] == []
+    assert "coder_adapter.reuse_open_pr" not in result.trace
+    assert "coder_adapter.create_pr" in result.trace
+    assert ("merge_pr", OWNER, REPO, PR_NUMBER, "squash") in adapter.calls
+
+
+def test_other_422_from_create_pr_remains_a_hard_error(tmp_path: Path) -> None:
+    """AC4: any OTHER 422 (not the already-exists signature) stays a hard
+    error that aborts as today — and the recovery lookup is never issued."""
+    adapter = FakeGitAdapter(
+        create_pr_exc=GitProviderAdapterError(
+            "GitHub create pull request failed: HTTP 422 Unprocessable Entity "
+            f"for /repos/{OWNER}/{REPO}/pulls: Validation Failed"
+        )
+    )
+    runtimes, _ = _make_runtimes(approved=True)
+
+    with pytest.raises(GitProviderAdapterError) as exc_info:
+        _run(tmp_path, runtimes, coder_adapter=adapter)
+
+    assert type(exc_info.value) is GitProviderAdapterError  # NOT the subclass
+    # The recovery never fired: no lookup, no downstream stages.
+    assert [c for c in adapter.calls if c[0] == "find_open_pr_for_branch"] == []
+    assert all(c[0] != "merge_pr" for c in adapter.calls)
 
 
 # --------------------------------------------------------------------------- #
