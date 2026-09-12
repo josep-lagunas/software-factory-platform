@@ -1,14 +1,15 @@
 """Local dev runner for the single external-events webhook (SFP-132).
 
-Serves :class:`~external_events.interfaces.webhook.WebhookIngressEndpoint`
-(SFP-120) on a configurable port (default 8789) for tunnel-based dogfooding —
-point cloudflared/ngrok at it, then set the Slack app's Event Subscriptions
-request URL to the tunnel's ``/webhooks/{endpoint_id}`` path. No AWS, no
-cloud: the v0 hosting path is exactly this runner plus a tunnel (production
-hosting is the hosting epic, deferred by design). This replaces the deleted
-communication dev runner (``dev_slack_events``, PR #163 drift) with the
-MAS §9.2-conformant one: ALL ingress lives here, in the External Events
-Service.
+Serves the SFP-254 challenge-echo-wrapped
+:class:`~external_events.interfaces.webhook.WebhookIngressEndpoint`
+(SFP-120) on a configurable port (default 8789) for tunnel-based
+dogfooding — point cloudflared/ngrok at it, then set the Slack app's Event
+Subscriptions request URL to the tunnel's ``/webhooks/{endpoint_id}`` path.
+No AWS, no cloud: the v0 hosting path is exactly this runner plus a tunnel
+(production hosting is the hosting epic, deferred by design). This replaces
+the deleted communication dev runner (``dev_slack_events``, PR #163 drift)
+with the MAS §9.2-conformant one: ALL ingress lives here, in the External
+Events Service.
 
 Wiring (all in-process, per the software-first owner decision):
 - ``LocalSecretProvider`` resolves ``SLACK_SIGNING_SECRET`` from the
@@ -37,9 +38,14 @@ Usage::
     EXTERNAL_WEBHOOK_ENDPOINT_ID=slack-ops \\
     uv run python -m external_events.entrypoints.dev_webhook
 
-Prerequisite (HUMAN ACTION, owner): point the Slack app's Event
-Subscriptions request URL at the tunnel's ``/webhooks/{endpoint_id}`` path
-(https://api.slack.com/apps → Event Subscriptions).
+Challenge echo (SFP-254): the served app is
+:class:`~external_events.interfaces.challenge_echo.ChallengeEchoMiddleware`
+around the endpoint, so saving the Slack app's Event Subscriptions request
+URL — pointing it at the tunnel's ``/webhooks/{endpoint_id}`` path
+(https://api.slack.com/apps → Event Subscriptions) — now passes Slack's
+save-time ``url_verification`` validation: the challenge is echoed back on
+the authenticated 200. Repointing the URL remains a HUMAN ACTION (owner),
+executable once this runner is up behind the tunnel.
 """
 
 from __future__ import annotations
@@ -69,7 +75,7 @@ from external_events.infrastructure.persistence import (
     EndpointConfig,
     EndpointStatus,
 )
-from external_events.interfaces.webhook import WebhookIngressEndpoint
+from external_events.interfaces import ChallengeEchoMiddleware, WebhookIngressEndpoint
 
 __all__ = [
     "DEFAULT_ENDPOINT_ID",
@@ -150,27 +156,36 @@ def _dev_session_factory(endpoint_id: str) -> SessionFactory:
 
 def build_dev_app(
     endpoint_id: str = DEFAULT_ENDPOINT_ID,
-) -> tuple[WebhookIngressEndpoint, InMemoryTransport, EndpointConfigResolver]:
+) -> tuple[ChallengeEchoMiddleware, InMemoryTransport, EndpointConfigResolver]:
     """Wire the webhook with resolver + publisher + bus (dev composition).
+
+    The endpoint is wrapped in
+    :class:`~external_events.interfaces.challenge_echo.ChallengeEchoMiddleware`
+    (SFP-254) so the served app answers Slack's save-time
+    ``url_verification`` handshake — tunnel dogfooding passes the Slack
+    app's URL validation without any provider knowledge leaking into the
+    endpoint itself (ID-028).
 
     Args:
         endpoint_id: The dev endpoint id seeded into the resolver's database
             — the ``{endpoint_id}`` of the served ``/webhooks/{endpoint_id}``
             path. Defaults to :data:`DEFAULT_ENDPOINT_ID`.
 
-    Returns the app, the bus, and the resolver so the runner (and tests) can
-    inspect what was published via ``bus.published_messages`` and resolve
-    the seeded endpoint configuration.
+    Returns the (wrapped) app, the bus, and the resolver so the runner (and
+    tests) can inspect what was published via ``bus.published_messages`` and
+    resolve the seeded endpoint configuration.
     """
     session_factory = _dev_session_factory(endpoint_id)
     resolver = EndpointConfigResolver(session_factory)
     bus = InMemoryTransport()
     publisher = ExternalEventPublisher(bus)
-    app = WebhookIngressEndpoint(
-        resolver,
-        LocalSecretProvider(),
-        publisher,
-        bus,
+    app = ChallengeEchoMiddleware(
+        WebhookIngressEndpoint(
+            resolver,
+            LocalSecretProvider(),
+            publisher,
+            bus,
+        )
     )
     return app, bus, resolver
 
