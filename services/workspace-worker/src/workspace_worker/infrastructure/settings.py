@@ -13,7 +13,7 @@ surface resolves exactly one default model.
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import SettingsConfigDict
@@ -47,6 +47,24 @@ class WorkspaceWorkerSettings(Settings):
             has arrived (SFP-242). A run that goes silent mid-turn is killed
             at this budget. Default 900 (15 minutes). Env:
             ``SFP_SPAWN_PROGRESS_TIMEOUT``.
+        planner_max_turns: Turn bound for the Planner runtime (SFP-251).
+            Default 15 (measured). Env: ``SFP_PLANNER_MAX_TURNS``.
+        test_designer_max_turns: Turn bound for the Test Designer runtime
+            (SFP-251). Default 30 (measured). Env:
+            ``SFP_TEST_DESIGNER_MAX_TURNS``.
+        coder_max_turns: Turn bound for the Coder runtime (SFP-251) — room for
+            a multi-step implementation run. Default 80 (measured). Env:
+            ``SFP_CODER_MAX_TURNS``.
+        reviewer_max_turns: Turn bound for the Reviewer runtime (SFP-251).
+            Default 30 (measured). Env: ``SFP_REVIEWER_MAX_TURNS``.
+        readiness_max_turns: Turn bound for the Readiness runtime (SFP-251) —
+            bounded tight (a gate, not an implementation run). Default 8
+            (measured). Env: ``SFP_READINESS_MAX_TURNS``.
+        coder_effort: Reasoning effort forwarded to the Coder runtime
+            (SFP-251). One of ``low`` / ``medium`` / ``high`` — anything else
+            fails validation at construction. Default ``medium``. Env:
+            ``SFP_CODER_EFFORT``. Non-coder roles stay hardcoded ``low``
+            (SFP-251 out-of-scope: effort variance for them).
     """
 
     # Re-declared to keep env-file / prefix behaviour explicit in this service
@@ -94,6 +112,27 @@ class WorkspaceWorkerSettings(Settings):
             "SFP_SPAWN_PROGRESS_TIMEOUT",
             "SFP_SPAWN_PROGRESS_TIMEOUT_S",
         ),
+    )
+    # Per-role turn bounds + coder effort (SFP-251) — the measured operational
+    # values as committed defaults; every one env-tunable via its SFP_-prefixed
+    # name. ``gt=0`` rejects a zero/negative bound (a disabled bound would
+    # hang the pipeline); the effort Literal rejects any non-tier string.
+    planner_max_turns: int = Field(
+        default=15, gt=0, description="Planner runtime turn bound (SFP-251)"
+    )
+    test_designer_max_turns: int = Field(
+        default=30, gt=0, description="Test Designer runtime turn bound (SFP-251)"
+    )
+    coder_max_turns: int = Field(default=80, gt=0, description="Coder runtime turn bound (SFP-251)")
+    reviewer_max_turns: int = Field(
+        default=30, gt=0, description="Reviewer runtime turn bound (SFP-251)"
+    )
+    readiness_max_turns: int = Field(
+        default=8, gt=0, description="Readiness runtime turn bound (SFP-251)"
+    )
+    coder_effort: Literal["low", "medium", "high"] = Field(
+        default="medium",
+        description="Coder reasoning effort tier (SFP-251); non-coder roles stay 'low'",
     )
 
     @field_validator("anthropic_base_url", "default_model")

@@ -13,6 +13,9 @@
 #   ./run-ticket.sh SFP-232 --resume              # resume from stage checkpoints
 #   TICKET=SFP-232 ./run-ticket.sh --resume       # ticket via env
 #   MODEL_CODER=glm-5.2 ./run-ticket.sh SFP-232   # per-role model override
+#   RUN_TICKET_ALLOW_STALE_MAIN=1 ./run-ticket.sh SFP-232  # skip the local-main
+#                                                 # freshness guard (offline /
+#                                                 # intentionally pinned main)
 #
 # All unrecognized args are forwarded to ticket_pipeline (e.g. --base-branch).
 #
@@ -65,6 +68,36 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Local-main freshness (SFP-249 lesson, measured 2026-09-06 on SFP-243): this
+# script executes the pipeline FROM THE LOCAL REPO — a lagging local main means
+# the run itself executes pre-fix code (the 243 run posted a bare-word review
+# body 10h AFTER the SFP-249 rationale fix landed on origin/main, because
+# local main was stale). Squash merges never advance local main, so EVERY
+# merge via gh/adapter leaves the repo behind. Fail loudly instead of running
+# old code silently. Skippable explicitly (RUN_TICKET_ALLOW_STALE_MAIN=1) for
+# offline/intentional-pin launches.
+# NOTE: this compares the main COMMIT only — uncommitted local changes (the
+# standing smoke patches) are deliberately out of scope; they layer on top of
+# whatever main is, and the operator owns them explicitly.
+# ---------------------------------------------------------------------------
+if [[ "${RUN_TICKET_ALLOW_STALE_MAIN:-0}" != "1" ]] && git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  git -C "$REPO_ROOT" fetch origin main --quiet || {
+    echo "warning: could not fetch origin/main (offline?) — proceeding unverified" >&2
+  }
+  LOCAL_MAIN="$(git -C "$REPO_ROOT" rev-parse main 2>/dev/null || true)"
+  REMOTE_MAIN="$(git -C "$REPO_ROOT" rev-parse origin/main 2>/dev/null || true)"
+  if [[ -n "$LOCAL_MAIN" && -n "$REMOTE_MAIN" && "$LOCAL_MAIN" != "$REMOTE_MAIN" ]]; then
+    echo "error: local main ($LOCAL_MAIN) is STALE vs origin/main ($REMOTE_MAIN)." >&2
+    echo "       The pipeline would execute pre-merge code. Run:" >&2
+    echo "         git -C $REPO_ROOT pull --rebase --autostash origin main" >&2
+    echo "       (autostash preserves uncommitted smoke patches; then relaunch)." >&2
+    echo "       To launch anyway: RUN_TICKET_ALLOW_STALE_MAIN=1 $0 ..." >&2
+    exit 67
+  fi
+  echo "[run-ticket] local main fresh vs origin/main ($LOCAL_MAIN)" >&2
+fi
+
+# ---------------------------------------------------------------------------
 # Env bridge: .env (unprefixed) -> SFP_-prefixed settings the composition root
 # reads. Each is overridable from the caller's environment.
 # ---------------------------------------------------------------------------
@@ -96,7 +129,13 @@ SECRET_REF_JSON='{"name":"ANTHROPIC_AUTH_TOKEN"}'
 # authenticate as sfp-coder-bot/sfp-reviewer-bot but cannot SEE arconta/sfp).
 : "${SFP_GIT_OWNER:="josep-lagunas"}"
 : "${SFP_GIT_REPO:="software-factory-platform"}"
-: "${SFP_WORKTREE_BASE:="/tmp/sfp-worktrees"}"
+# DURABLE worktree base (2026-09-07, second /tmp-decay incident measured — the
+# clone cache's .git was corrupted by macOS /tmp cleanup mid-audit and nothing
+# was lost only because everything is derivable from origin; the first incident
+# ate SFP-148's worktree+checkpoints on 2026-09-03). ~/Library/Caches survives
+# reboots and OS cleanup; sfp-worktrees is fully reclaimable (re-clone/re-cut)
+# so Caches (not Application Support) is the right tier. Overridable as before.
+: "${SFP_WORKTREE_BASE:="$HOME/Library/Caches/sfp-worktrees"}"
 # Stream liveness watchdogs (SFP-242). NOT exported here — these are comments
 # only; the settings defaults apply unless an operator overrides them. The SDK
 # query() spawns the Claude Code CLI; when the endpoint goes mute the CLI stays
