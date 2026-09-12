@@ -1,9 +1,11 @@
 """Tests for the SFP-122 auth-strategy Protocol + factory.
 
-Fully hermetic and deterministic: the registry is test-injected (the v0
-module registry ships empty by Planner decision — SFP-123 populates it),
-and the SFP-86 ``SecretProvider`` seam is a recording fake, so no
-environment, no network, no clock touches anything.
+Fully hermetic and deterministic: selection is exercised through a
+test-injected registry, and the SFP-86 ``SecretProvider`` seam is a
+recording fake, so no environment, no network, no clock touches anything.
+The module registry itself now ships the two SFP-123 v0 strategies
+(populated on package import by
+``external_events.application.strategies``) — asserted below.
 
 Covers the acceptance criteria: per-key class selection from the registry,
 the secret VALUE resolved by the injected provider and injected at
@@ -30,6 +32,10 @@ from external_events.application.auth_factory import (
 )
 from external_events.application.auth_factory import (
     build_authentication_strategy as MODULE_BUILD,
+)
+from external_events.application.strategies import (
+    GitHubHmacStrategy,
+    SlackSignatureStrategy,
 )
 from sfp_config.providers import SecretResolutionError
 from sfp_config.secrets import SecretRef
@@ -74,7 +80,7 @@ class _SharedSecretStrategy:
         return raw_body == b"other" and headers.get("authorization") == "Bearer ok"
 
 
-#: A test registry — the shape SFP-123 will populate the module registry with.
+#: A test registry — the same shape the module registry now carries (SFP-123).
 _TEST_REGISTRY = {
     "hmac_sha256": _HmacStrategy,
     "shared_secret": _SharedSecretStrategy,
@@ -183,9 +189,13 @@ def test_unknown_key_fails_fast_before_any_secret_resolution() -> None:
 # --- registry wiring -----------------------------------------------------------
 
 
-def test_v0_registry_ships_empty() -> None:
-    """Planner decision: v0 registry is empty; SFP-123 populates it."""
-    assert AUTH_STRATEGY_REGISTRY == {}
+def test_v0_registry_holds_exactly_the_sfp_123_strategies() -> None:
+    """SFP-123 populated the v0 registry: exactly the two v0 strategies,
+    under the exact ``auth_strategy`` keys of the SFP-113 endpoint model."""
+    assert AUTH_STRATEGY_REGISTRY == {
+        "slack_signature": SlackSignatureStrategy,
+        "github_hmac": GitHubHmacStrategy,
+    }
 
 
 def test_default_registry_is_the_module_registry(monkeypatch: pytest.MonkeyPatch) -> None:
