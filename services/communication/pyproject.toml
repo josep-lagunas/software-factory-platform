@@ -9,6 +9,7 @@ dependencies = [
     "sfp-config",
     "sfp-contracts",
     "sfp-messaging",
+    "sfp-agent-runtime",
     "uvicorn>=0.52.0",
 ]
 
@@ -27,6 +28,9 @@ build-backend = "hatchling.build"
 sfp-config = { workspace = true }
 sfp-contracts = { workspace = true }
 sfp-messaging = { workspace = true }
+# sfp-agent-runtime likewise (SFP-134 — the CommunicationAgent runs over the
+# vendor-neutral AgentRuntime seam, AP-010 / MAS §9.6).
+sfp-agent-runtime = { workspace = true }
 
 [tool.coverage.run]
 source = ["src/communication"]
