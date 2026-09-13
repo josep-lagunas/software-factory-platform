@@ -32,6 +32,9 @@ REPO = Path(__file__).resolve().parents[1]
 # only if the launch recipe moves to --all-packages (or members become
 # default dependencies).
 sys.path.insert(0, str(REPO / "services" / "communication" / "src"))
+# sfp_config is a workspace member; after env re-syncs the default editable set
+# may not include it, so pin the source path explicitly (same pattern as above).
+sys.path.insert(0, str(REPO / "packages" / "sfp-config" / "src"))
 
 from communication.interfaces.slack_outbound import SlackOutboundClient  # noqa: E402
 from sfp_config import LocalSecretProvider  # noqa: E402

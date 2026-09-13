@@ -106,15 +106,28 @@ fi
 # frontmatter, SFP-237). Only planner/coder/reviewer carry per-role overrides
 # (ROLES_WITH_OVERRIDE in model_config.py); test_designer/readiness/other roles
 # resolve to default_model — the floor. So:
-#   - default_model = glm-5.1  -> floor for test_designer + readiness (and coder).
-#   - planner + reviewer need EXPLICIT overrides to glm-5.2 (else they fall to
-#     the 5.1 floor); coder=glm-5.1 (explicit override, equals floor, for clarity).
+#   - default_model = glm-5.3  -> floor for test_designer + readiness.
+#   - planner + reviewer stay on the non-flash tier (SFP-79 precedent: weak
+#     reviewer tier = worst dogfood outcome; flash is coder-only).
+#   - coder = glm-5.3-flash + effort low (SFP-255, the 2026-09-13 A/B on
+#     SFP-134/135/136: 24 vs 58 turns, 358s vs 1194s, 2.05M vs 5.28M tokens,
+#     quality gates equal or better — decision rule "gates equal AND turns+time
+#     lower" met decisively). Fallback on regression: override to a non-flash id
+#     (served as GLM-5.3) + drop the effort override.
+# NOTE on labels: z.ai's GLM Coding Plan serves glm-5.1/glm-5.2 requests as
+# GLM-5.3 (aliases; plan metering confirms — all non-flash usage buckets as
+# GLM-5.3). The glm-5.3 names below are the honest as-routed labels so
+# usage-metrics lines stop misreporting the served model.
 # Each var is overridable from the caller's environment (SFP_AGENT_MODEL_* or the
 # convenience MODEL_*); the ${VAR:-default} nesting makes caller env always win.
-: "${SFP_DEFAULT_MODEL:="glm-5.1"}"                          # floor for test_designer/readiness + coder
-: "${SFP_AGENT_MODEL_CODER:="${MODEL_CODER:-glm-5.1}"}"      # Coder on the operational tier
-: "${SFP_AGENT_MODEL_PLANNER:="${MODEL_PLANNER:-glm-5.2}"}"  # Planner on the capable tier
-: "${SFP_AGENT_MODEL_REVIEWER:="${MODEL_REVIEWER:-glm-5.2}"}" # Reviewer on the capable tier
+: "${SFP_DEFAULT_MODEL:="glm-5.3"}"                            # floor for test_designer/readiness
+: "${SFP_AGENT_MODEL_CODER:="${MODEL_CODER:-glm-5.3-flash}"}"  # Coder on flash (SFP-255)
+: "${SFP_AGENT_MODEL_PLANNER:="${MODEL_PLANNER:-glm-5.3}"}"    # Planner on the flagship tier
+: "${SFP_AGENT_MODEL_REVIEWER:="${MODEL_REVIEWER:-glm-5.3}"}"  # Reviewer on the flagship tier
+# Coder reasoning effort (SFP-255): low wins on the A/B population (mechanical
+# N=3 incl. two substantive COMM tickets). Remove this line to fall back to the
+# committed settings.py default (medium).
+: "${SFP_CODER_EFFORT:="low"}"
 # SecretRef is a pydantic model (extra="forbid", field `name`) -> the env value
 # is parsed as JSON; a bare name raises SettingsError. MUST be JSON. The literal
 # is held in single quotes (so its inner double-quotes are data, not delimiters)
@@ -160,12 +173,14 @@ export SFP_ANTHROPIC_BASE_URL SFP_DEFAULT_MODEL SFP_AGENT_MODEL_CODER \
 # kept defensive — empty would crash the model_config gate).
 [[ -n "${SFP_AGENT_MODEL_PLANNER:-}" ]] && export SFP_AGENT_MODEL_PLANNER
 [[ -n "${SFP_AGENT_MODEL_REVIEWER:-}" ]] && export SFP_AGENT_MODEL_REVIEWER
+[[ -n "${SFP_CODER_EFFORT:-}" ]] && export SFP_CODER_EFFORT
 # Secrets the LocalSecretProvider resolves by name (kept unprefixed, as in .env):
 export ANTHROPIC_AUTH_TOKEN JIRA_API_TOKEN GITHUB_TOKEN_CODER GITHUB_TOKEN_REVIEWER
 
 # Echo the resolved config as KEY=set/(unset), never the values — secrets stay hidden.
 cfg_keys=(SFP_ANTHROPIC_BASE_URL SFP_DEFAULT_MODEL SFP_AGENT_MODEL_CODER \
-          SFP_AGENT_MODEL_PLANNER SFP_AGENT_MODEL_REVIEWER SFP_JIRA_SITE \
+          SFP_AGENT_MODEL_PLANNER SFP_AGENT_MODEL_REVIEWER SFP_CODER_EFFORT \
+          SFP_JIRA_SITE \
           SFP_GIT_OWNER SFP_GIT_REPO SFP_WORKTREE_BASE \
           SFP_JIRA_EMAIL ANTHROPIC_AUTH_TOKEN JIRA_API_TOKEN \
           GITHUB_TOKEN_CODER GITHUB_TOKEN_REVIEWER)
