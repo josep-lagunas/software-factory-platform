@@ -17,6 +17,15 @@ Covers the PRSpec acceptance criteria end-to-end, deterministically (MAS §12.7)
   ``@command_handler`` registry and dispatched through the ``FakeBus``
   (sfp-testing) delegate to the bound service; no Slack I/O is touched
   (posting is SFP-133).
+- **update_summary()** (SFP-135) — the concrete
+  ``InteractionSummaryWriter`` port (SFP-134, runtime_checkable
+  conformance): persists the durable summary, publishes
+  ``UserInteractionUpdated`` (``ACTIVE``); unknown reference fails closed
+  (``LookupError``); a terminal interaction refuses (AP-005).
+- **record_message()** (SFP-135) — the MAS §9.4 message write: updates the
+  two ``last_message_*`` fields and re-anchors the 8h window at the
+  message instant, so a would-be-EXPIRED interaction derives ACTIVE again;
+  unknown reference fails closed.
 - **Invariant guard** — the SFP-112 model gains NO status column (derived
   state is mandatory; a schema change is explicitly out of scope).
 
@@ -43,6 +52,7 @@ from uuid import UUID
 
 import pytest
 import sqlalchemy as sa
+from communication.application.communication_agent import InteractionSummaryWriter
 from communication.application.interaction_service import (
     InteractionService,
     InteractionStatus,
@@ -432,6 +442,134 @@ async def test_complete_unknown_reference_raises_lookup_error(
 ) -> None:
     with pytest.raises(LookupError):
         await service.complete("C404/T404")
+
+
+# --- update_summary(): the InteractionSummaryWriter port (SFP-135 / SFP-134) ---
+
+
+async def test_update_summary_satisfies_landed_protocol(
+    service: InteractionService,
+) -> None:
+    """The runtime_checkable InteractionSummaryWriter port (SFP-134) accepts the service."""
+    assert isinstance(service, InteractionSummaryWriter)
+
+
+async def test_update_summary_persists_and_publishes_active(
+    service: InteractionService,
+    session_factory: SessionFactory,
+    bus: FakeBus,
+) -> None:
+    await service.create("C1/T1", question="Deploy staging?")
+    bus.assert_published(UserInteractionUpdated, times=1)
+
+    await service.update_summary("C1/T1", "User asked to deploy staging.")
+
+    loaded = _load_one(session_factory, "C1/T1")
+    assert loaded is not None
+    assert loaded.summary == "User asked to deploy staging."  # durable, never a transcript
+    assert loaded.completed_at is None
+    events = bus.messages_of(UserInteractionUpdated)
+    assert [event.state for event in events] == ["ACTIVE", "ACTIVE"]
+    assert events[-1].session_id == "C1/T1"
+
+
+async def test_update_summary_unknown_reference_fails_closed(
+    service: InteractionService,
+    bus: FakeBus,
+) -> None:
+    """No interaction for the reference is a typed failure — never a silent no-op."""
+    with pytest.raises(LookupError):
+        await service.update_summary("C404/T404", "orphan summary")
+    bus.assert_published(UserInteractionUpdated, times=0)
+
+
+async def test_update_summary_on_terminal_interaction_refuses(
+    service: InteractionService,
+    session_factory: SessionFactory,
+    clock: FakeClock,
+    bus: FakeBus,
+) -> None:
+    """AP-005: a summary write never mutates a closed interaction."""
+    await service.create("C1/T1", question="Deploy staging?")
+    await service.complete("C1/T1")
+    before = _load_one(session_factory, "C1/T1")
+    assert before is not None
+    bus.assert_published(UserInteractionUpdated, times=2)
+
+    with pytest.raises(InteractionTransitionError) as completed_excinfo:
+        await service.update_summary("C1/T1", "late correction")
+    assert completed_excinfo.value.derived_status is InteractionStatus.COMPLETED
+
+    # …and an EXPIRED interaction is likewise closed to summary writes.
+    await service.create("C2/T2", question="Deploy staging?")
+    clock.advance(EIGHT_HOURS + timedelta(seconds=1))
+    with pytest.raises(InteractionTransitionError) as expired_excinfo:
+        await service.update_summary("C2/T2", "late correction")
+    assert expired_excinfo.value.derived_status is InteractionStatus.EXPIRED
+
+    after = _load_one(session_factory, "C1/T1")
+    assert after is not None
+    assert after.summary == before.summary  # nothing persisted
+    # create C1 + complete C1 + create C2 only — the refusals publish nothing.
+    assert bus.published_count(UserInteractionUpdated) == 3
+
+
+# --- record_message(): the MAS §9.4 expiry-timer reset (SFP-135) ----------------
+
+
+async def test_record_message_updates_last_message_fields_and_resets_timer(
+    service: InteractionService,
+    session_factory: SessionFactory,
+    clock: FakeClock,
+    bus: FakeBus,
+) -> None:
+    await service.create("C1/T1", question="Deploy staging?")
+
+    # The clock moves past the creation window: the interaction WOULD derive
+    # EXPIRED (expiry is derived — nothing was written).
+    message_at = T0 + EIGHT_HOURS + timedelta(minutes=30)
+    clock.advance(EIGHT_HOURS + timedelta(minutes=30))
+    assert await service.status("C1/T1") is InteractionStatus.EXPIRED
+
+    await service.record_message("C1/T1", "user", message_at)
+
+    loaded = _load_one(session_factory, "C1/T1")
+    assert loaded is not None
+    assert loaded.last_message_emissor == "user"
+    # SQLite round-trips drop tzinfo — compare in the service's UTC domain.
+    assert loaded.last_message_timestamp == message_at.replace(tzinfo=None)
+    # The 8h window re-anchors at the message instant (MAS §9.4) → ACTIVE again.
+    assert loaded.expires_at == (message_at + EIGHT_HOURS).replace(tzinfo=None)
+    assert await service.status("C1/T1") is InteractionStatus.ACTIVE
+    events = bus.messages_of(UserInteractionUpdated)
+    assert [event.state for event in events] == ["ACTIVE", "ACTIVE"]
+
+
+async def test_record_message_unknown_reference_fails_closed(
+    service: InteractionService,
+    bus: FakeBus,
+) -> None:
+    with pytest.raises(LookupError):
+        await service.record_message("C404/T404", "user", T0)
+    bus.assert_published(UserInteractionUpdated, times=0)
+
+
+async def test_record_message_accepts_completed_interaction_window_reset_only(
+    service: InteractionService,
+    session_factory: SessionFactory,
+) -> None:
+    """A message write resets the window but NEVER unsets a persisted completion."""
+    await service.create("C1/T1", question="Deploy staging?")
+    await service.complete("C1/T1")
+    message_at = T0 + timedelta(hours=1)
+
+    await service.record_message("C1/T1", "agent", message_at)
+
+    loaded = _load_one(session_factory, "C1/T1")
+    assert loaded is not None
+    assert loaded.completed_at is not None  # terminal immutability intact
+    assert loaded.last_message_emissor == "agent"
+    assert loaded.expires_at == (message_at + EIGHT_HOURS).replace(tzinfo=None)
 
 
 # --- status(): the derived read-only view --------------------------------------
