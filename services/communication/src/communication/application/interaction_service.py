@@ -16,7 +16,10 @@ Grounded in:
   SFP-131, NOT here.
 - AP-009 / MAS §9.4 — the 8-hour inactivity window anchors ``expires_at`` at
   creation. Expiry is NEVER a write transition: no job flips a column (there
-  is none); the 8h reset timer on subsequent messages is SFP-130, NOT here.
+  is none). ``record_message`` (SFP-135) IS the MAS §9.4 timer reset: every
+  message re-anchors ``expires_at`` at its own timestamp + 8h, so an
+  interaction that *would* derive ``EXPIRED`` derives ``ACTIVE`` again after
+  the message — expiry is derived, never persisted.
 - MAS §12.7 (determinism) — the only wall-clock read is the single injectable
   ``clock``; same inputs always yield the same output. No sleeps anywhere.
 - SFP-124 — the envelope-factory seam discipline mirrored from
@@ -43,10 +46,14 @@ publishes exactly one ``UserInteractionUpdated``. NOTE (v0, single-process):
 no-duplicates guarantee is this service's serialized lookup, not a DB
 constraint.
 
-Event mapping (v0, to be aligned by SFP-135): the pinned
-``UserInteractionUpdated`` payload carries ``session_id`` + ``state``;
-``session_id`` holds the provider thread reference (one interaction ↔ one
-thread, MAS §9.4) and ``state`` the derived status.
+Event mapping (the SFP-135 alignment): the pinned ``UserInteractionUpdated``
+payload carries ``session_id`` + ``state``; ``session_id`` holds the provider
+thread reference (one interaction ↔ one thread, MAS §9.4) and ``state`` the
+derived status. The SFP-135 methods — ``update_summary`` (the concrete
+:class:`~communication.application.communication_agent.\
+InteractionSummaryWriter` port implementation) and ``record_message`` (the
+expiry-timer reset) — follow the same session-scope + typed-error + one-event
+idiom as ``create`` / ``complete``.
 """
 
 from __future__ import annotations
@@ -259,10 +266,10 @@ class InteractionService:
 
     - ``bus`` — the vendor-neutral :class:`~sfp_messaging.bus.MessageBus`
       (in-memory today; SFP-118 / SFP-101 re-plumb). Every successful
-      create/complete publishes exactly one ``UserInteractionUpdated`` AFTER
-      the unit of work commits, so a published event always reflects committed
-      state (a bus failure after commit leaves the write standing — v0 has no
-      outbox; flagged for SFP-135 alignment).
+      create/complete/update_summary/record_message publishes exactly one
+      ``UserInteractionUpdated`` AFTER the unit of work commits, so a
+      published event always reflects committed state (a bus failure after
+      commit leaves the write standing — v0 has no outbox).
     - ``session_factory`` — one unit of work per operation
       (:data:`SessionFactory`; see :func:`session_scope`).
     - ``clock`` — the ONLY wall-clock read (MAS §12.7). Defaults to
@@ -380,6 +387,88 @@ class InteractionService:
         # Unit of work committed; the event reflects committed state.
         await self._publish_updated(provider_reference, InteractionStatus.COMPLETED)
         return interaction
+
+    async def update_summary(self, provider_reference: str, summary: str) -> None:
+        """Persist the updated durable summary for the interaction (AP-009).
+
+        The concrete implementation of the
+        :class:`~communication.application.communication_agent.\
+InteractionSummaryWriter` port (SFP-134) — the one lifecycle effect the
+        :class:`~communication.application.communication_agent.CommunicationAgent`
+        delegates. Sets ``summary`` on the interaction, commits, and publishes
+        one ``UserInteractionUpdated`` with the derived status (``ACTIVE`` on
+        an open interaction). The summary is the durable representation —
+        NEVER a transcript (AP-009).
+
+        Args:
+            provider_reference: The 1:1 provider thread reference.
+            summary: The non-empty durable summary text to persist.
+
+        Raises:
+            LookupError: No interaction exists for the reference (fail-closed
+                — no silent no-op).
+            InteractionTransitionError: The interaction is terminal — its
+                derived status is ``COMPLETED`` or ``EXPIRED`` (AP-005
+                terminal immutability; a summary write never reopens or
+                mutates a closed interaction). Nothing is persisted, nothing
+                is published.
+        """
+        now = self._clock()
+        with self._session_factory() as session:
+            interaction = self._load(session, provider_reference)
+            if interaction is None:
+                raise LookupError(
+                    f"No UserInteraction found for provider_reference={provider_reference!r}"
+                )
+            state = derive_status(interaction, now=now)
+            if state is not InteractionStatus.ACTIVE:
+                raise InteractionTransitionError(state, interaction_id=interaction.interaction_id)
+            interaction.summary = summary
+        # Unit of work committed; the event reflects committed state.
+        await self._publish_updated(provider_reference, InteractionStatus.ACTIVE)
+
+    async def record_message(
+        self,
+        provider_reference: str,
+        emissor: str,
+        timestamp: datetime,
+    ) -> None:
+        """Record one message and reset the inactivity timer (MAS §9.4).
+
+        "Every inbound or outbound message updates ``last_message_emissor``
+        and ``last_message_timestamp``" — and because the 8-hour window is
+        *measured from* ``last_message_timestamp`` (AP-009 / the SFP-112
+        column comment), the write re-anchors ``expires_at`` at
+        ``timestamp + 8h``. Determinism (MAS §12.7): the timestamp is
+        CARRIED by the caller (the Slack message ``ts``, or any injected
+        value) — this method reads no wall clock for the message instant.
+        After the write an interaction that *would* derive ``EXPIRED``
+        derives :attr:`InteractionStatus.ACTIVE` again (expiry is derived,
+        never persisted), and exactly one ``UserInteractionUpdated`` is
+        published with the re-derived status.
+
+        Args:
+            provider_reference: The 1:1 provider thread reference.
+            emissor: Who sent the message (the ``user`` / ``agent`` vocabulary).
+            timestamp: The message's instant — carried, never read from the
+                wall clock here (MAS §12.7).
+
+        Raises:
+            LookupError: No interaction exists for the reference (fail-closed
+                — no silent no-op).
+        """
+        with self._session_factory() as session:
+            interaction = self._load(session, provider_reference)
+            if interaction is None:
+                raise LookupError(
+                    f"No UserInteraction found for provider_reference={provider_reference!r}"
+                )
+            interaction.last_message_emissor = emissor
+            interaction.last_message_timestamp = timestamp
+            interaction.expires_at = timestamp + _INACTIVITY_WINDOW
+            state = derive_status(interaction, now=self._clock())
+        # Unit of work committed; the event reflects committed state.
+        await self._publish_updated(provider_reference, state)
 
     async def status(self, provider_reference: str) -> InteractionStatus:
         """Return the DERIVED status of the interaction for the reference.
