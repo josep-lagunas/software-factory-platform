@@ -814,6 +814,12 @@ def _seed_remote_and_worktree(tmp_path: Path) -> tuple[Path, Path]:
 
 def _commit_all(repo: Path, filename: str, content: str, message: str) -> None:
     (repo / filename).write_text(content)
+    # Local identity before committing (pattern of the clone() tests above):
+    # CI runners carry NO global git identity, and `git commit` exits 128
+    # without one — this suite must pass in identity-less environments (the
+    # workspace-worker CI job was red on main for 3 weeks on exactly this).
+    _git("config", "user.email", "t@t", cwd=repo)
+    _git("config", "user.name", "t", cwd=repo)
     _git("add", ".", cwd=repo)
     _git("commit", "-m", message, cwd=repo)
 
