@@ -10,8 +10,22 @@
   timestamp-only status view, ``UserInteractionUpdated`` events on the
   injected MessageBus, and the ``@command_handler`` handlers for
   ``RequestUserInput`` / ``NotifyUser`` that delegate to it (no Slack I/O).
+  SFP-135 adds ``update_summary`` (the concrete
+  ``InteractionSummaryWriter`` port) and ``record_message`` (the MAS §9.4
+  expiry-timer reset).
+- :mod:`communication.application.confirm_flow` — the ID-069 CONFIRM state
+  machine (SFP-135): exact-literal ``CONFIRM`` gate, correction-driven
+  regeneration through the same CommunicationAgent, ``UserInputReceived``
+  publication, and interaction completion.
 """
 
+from communication.application.confirm_flow import (
+    CONFIRM_LITERAL,
+    ConfirmFlow,
+    ConfirmFlowResult,
+    ConfirmOutcome,
+    CorrectionOutcome,
+)
 from communication.application.interaction_service import (
     InteractionService,
     InteractionStatus,
@@ -30,6 +44,11 @@ from communication.application.operational_commands import (
 )
 
 __all__ = [
+    "CONFIRM_LITERAL",
+    "ConfirmFlow",
+    "ConfirmFlowResult",
+    "ConfirmOutcome",
+    "CorrectionOutcome",
     "InteractionService",
     "InteractionStatus",
     "InteractionTransitionError",
