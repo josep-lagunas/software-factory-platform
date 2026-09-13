@@ -183,6 +183,7 @@ source = { editable = "services/communication" }
 dependencies = [
     { name = "alembic" },
     { name = "httpx" },
+    { name = "sfp-agent-runtime" },
     { name = "sfp-config" },
     { name = "sfp-contracts" },
     { name = "sfp-messaging" },
@@ -194,6 +195,7 @@ dependencies = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.13.0" },
     { name = "httpx" },
+    { name = "sfp-agent-runtime", editable = "packages/sfp-agent-runtime" },
     { name = "sfp-config", editable = "packages/sfp-config" },
     { name = "sfp-contracts", editable = "packages/sfp-contracts" },
     { name = "sfp-messaging", editable = "packages/sfp-messaging" },
