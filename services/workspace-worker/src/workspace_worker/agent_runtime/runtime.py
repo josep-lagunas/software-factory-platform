@@ -334,6 +334,34 @@ class ClaudeAgentRuntime:
         )
         # ``request.agent`` is threaded through to the watchdog messages above.
 
+        # Per-role cost metrics (SFP-255; born as a local smoke-patch during the
+        # 2026-09-13 A/B, formalized here): the owner-required token/turn
+        # accounting substrate for model/effort experiments.
+        # ResultMessage already carries everything needed — num_turns, usage,
+        # model_usage (per-model breakdown), total_cost_usd, durations. Emitted
+        # BEFORE the hard-reject checks so aborted runs are accounted too.
+        try:
+            print(
+                "[usage-metrics] "
+                + _json.dumps(
+                    {
+                        "role": request.agent,
+                        "model": getattr(options, "model", None),
+                        "num_turns": getattr(final_message, "num_turns", None),
+                        "duration_ms": getattr(final_message, "duration_ms", None),
+                        "duration_api_ms": getattr(final_message, "duration_api_ms", None),
+                        "usage": getattr(final_message, "usage", None),
+                        "model_usage": getattr(final_message, "model_usage", None),
+                        "total_cost_usd": getattr(final_message, "total_cost_usd", None),
+                        "is_error": bool(getattr(final_message, "is_error", False)),
+                    },
+                    default=str,
+                ),
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001 — metrics must never fail a run
+            pass
+
         # 4. Hard-reject an SDK error or missing result (NOT retried).
         is_error = bool(getattr(final_message, "is_error", False))
         result_text = getattr(final_message, "result", None)
