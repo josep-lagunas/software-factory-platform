@@ -5,6 +5,8 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
     "sqlalchemy>=2.0.0",
     "alembic>=1.13.0",
+    "communication",
+    "httpx",
     "sfp-config",
     "sfp-contracts",
     "sfp-messaging",
@@ -27,6 +29,12 @@ build-backend = "hatchling.build"
 sfp-config = { workspace = true }
 sfp-contracts = { workspace = true }
 sfp-messaging = { workspace = true }
+# SFP-257 (Phase-A dev glue): the dev composition entrypoint
+# (entrypoints/dev_composition.py) imports the landed Communication components
+# in-process — a dev monolith convenience, NOT a MAS boundary change (MAS §9.4
+# is the reference sequence). httpx is the dev GLM AgentRuntime adapter's
+# transport (the same ID-051 choice as the Slack outbound adapter).
+communication = { workspace = true }
 
 [tool.coverage.run]
 source = ["src/external_events"]
