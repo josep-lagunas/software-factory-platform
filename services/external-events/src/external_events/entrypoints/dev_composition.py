@@ -43,10 +43,12 @@ Graceful degradation at DELIVERY time (fail-loud is startup-only): a GLM 200
 whose body holds no JSON object is retried exactly once with a stricter
 re-prompt inside :class:`GlmAgentRuntime`; a summary that still fails gets a
 short in-thread apology (:data:`SUMMARIZATION_APOLOGY`) and a 200 — Slack
-must never retry-storm a 500ing webhook. The app's own outbound posts echo
-back as bot-authored ``message`` events; they are dropped at inbound
+must never retry-storm a 500ing webhook. Only PLAIN messages count as user
+input: anything sub-typed or bot-authored (the app's own ``bot_message``
+echo, and the ``message_replied`` parent sub-event every bot reply into a
+thread emits, which carries the human's user id) is dropped at inbound
 interpretation (:func:`~communication.interfaces.slack_inbound.\
-parse_slack_message`, SFP-257) so the loop cannot self-feed.
+parse_slack_message`, SFP-257 whitelist) so no reply can re-feed the loop.
 
 Usage::
 

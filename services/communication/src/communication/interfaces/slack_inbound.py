@@ -31,14 +31,20 @@ Grounded in:
 - SFP-124 — redeliveries are already collapsed upstream by the ingress's
   deterministic ``idempotency_key`` (``source:sha256(body)``); this consumer
   keeps NO dedupe state (stateless by design).
-- SFP-257 (live-smoke finding, 2026-09-14) — a bot-authored inbound event
-  (``subtype="bot_message"`` and/or a ``bot_id``) is ECHO, not user input:
-  the app subscribing to whole-channel ``message`` events receives its own
-  outbound posts back, and interpreting them as user messages is a
-  self-reply loop (measured: ~142 ``chat.postMessage`` calls in ~90s with
-  zero LLM runs in between). Bot-authored events are dropped ONCE, at
-  interpretation time in :func:`parse_slack_message` — the single place the
-  provider body is read — never re-derived per handler.
+- SFP-257 (live-smoke findings, rounds 1+2, 2026-09-14) — an inbound event
+  that is not NEW user input is ECHO and must never advance an interaction.
+  Round 1: the app subscribing to whole-channel ``message`` events receives
+  its own outbound posts back (``subtype="bot_message"`` / a ``bot_id``) —
+  a bot-marker blacklist stopped the ~142-posts-in-~90s self-reply loop.
+  Round 2 proved a blacklist structurally incomplete: a bot reply posted
+  into a thread ALSO makes Slack emit a ``message_replied`` sub-event for
+  the PARENT message, which carries the HUMAN's ``user`` id and NO bot
+  markers — one human message re-summarized on every bot reply (measured:
+  9 GLM calls / 8 posts over ~6 minutes). The guard is therefore a
+  WHITELIST enforced ONCE at interpretation time in
+  :func:`parse_slack_message` — the single place the provider body is read,
+  never re-derived per handler: a message counts as user input ONLY when it
+  carries NO ``subtype`` and NO ``bot_id``.
 - SFP-129 — ``InteractionService.create`` is the find-or-create seam (by
   provider thread reference). The 8-hour ``expires_at`` RESET on subsequent
   messages is SFP-130, NOT here: this module updates only the two
@@ -170,9 +176,16 @@ class SlackProviderMessage(BaseModel):
             Identity Service, MAS §9.4 "never owns user identity").
         thread_ts: The root message's ``ts`` for a thread reply, or ``None``
             for a top-level message (which is its own thread root).
-        subtype: The Slack message subtype — ``"bot_message"`` when a bot
-            authored the message (the app's own outbound posts echo back
-            with it); ``None`` for plain human messages.
+        subtype: The Slack message subtype — ``None`` for a plain message
+            (the ONLY shape that counts as new user input, SFP-257).
+            Sub-typed events are Slack rendering state on top of an existing
+            message, never new input: ``bot_message`` (a bot's post echoing
+            back), ``message_replied`` (the PARENT-message sub-event every
+            bot reply into a thread emits — it carries the parent HUMAN's
+            ``user`` id and no bot markers), ``message_changed`` /
+            ``message_deleted`` (edits), ``thread_broadcast`` (a broadcast
+            duplicate of a reply already delivered as a plain event),
+            ``channel_topic``, ``tombstone``, join/leave notifications.
         bot_id: The id of the bot that authored the message, when one did;
             ``None`` for human messages.
     """
@@ -203,12 +216,25 @@ class SlackProviderMessage(BaseModel):
     def is_bot_authored(self) -> bool:
         """True when a bot authored this message — ANY bot, the app included.
 
-        The SFP-257 self-loop guard's discriminator: the app's own outbound
-        posts echo back as ``subtype="bot_message"`` with a ``bot_id`` when
-        the app subscribes to whole-channel ``message`` events. Such echo is
-        not user input and must never advance an interaction.
+        The round-1 SFP-257 discriminator: the app's own outbound posts echo
+        back as ``subtype="bot_message"`` with a ``bot_id`` when the app
+        subscribes to whole-channel ``message`` events. Such echo is not
+        user input and must never advance an interaction.
         """
         return self.subtype == _BOT_MESSAGE_SUBTYPE or bool(self.bot_id)
+
+    @property
+    def is_user_input(self) -> bool:
+        """True when this event is NEW user input — the whitelist (SFP-257).
+
+        Only a PLAIN message counts: ``subtype`` absent AND ``bot_id``
+        absent (``user`` presence is schema-enforced). Round 2 of the live
+        smoke proved the bot-marker blacklist insufficient — a ``message_
+        replied`` parent echo carries the human's ``user`` id and no bot
+        markers yet is not new input. Anything sub-typed or bot-authored is
+        Slack state rendered on top of an existing message: echo, not input.
+        """
+        return self.subtype is None and not self.is_bot_authored
 
 
 class _SlackEventsCallback(BaseModel):
@@ -232,13 +258,18 @@ def parse_slack_message(payload: dict[str, Any]) -> SlackProviderMessage | None:
     Deterministic and total: a body that is not an ``event_callback``
     envelope wrapping a handled event type (``app_mention`` / ``message``)
     with the handled shape — non-empty ``text`` / ``channel`` / ``ts`` /
-    ``user`` — yields ``None``, never an exception. A bot-authored event
-    (``subtype="bot_message"`` and/or a ``bot_id`` — the app's own outbound
-    echo) yields ``None`` too: it is not user input and must never advance
-    an interaction (the SFP-257 self-loop guard, enforced HERE at the single
-    interpretation point rather than re-derived per handler). The caller
-    treats ``None`` as "not a message this consumer maps to an interaction":
-    no schema interpretation beyond this point, no write, no publish.
+    ``user`` — yields ``None``, never an exception. The user-input
+    WHITELIST (SFP-257, enforced HERE at the single interpretation point
+    rather than re-derived per handler): a ``message`` counts as new user
+    input ONLY when it carries NO ``subtype`` and NO ``bot_id`` — anything
+    else is Slack rendering state on top of an existing message (the app's
+    own ``bot_message`` echo; the ``message_replied`` parent sub-event every
+    bot reply into a thread emits, which carries the HUMAN's ``user`` id
+    with no bot markers; ``message_changed`` / ``message_deleted`` edits;
+    ``thread_broadcast`` duplicates; ``channel_topic``; ``tombstone``;
+    join/leave) and yields ``None``. The caller treats ``None`` as "not a
+    message this consumer maps to an interaction": no schema interpretation
+    beyond this point, no write, no publish.
 
     Args:
         payload: The ``ExternalEventReceived.payload`` dict — the verbatim
@@ -255,7 +286,7 @@ def parse_slack_message(payload: dict[str, Any]) -> SlackProviderMessage | None:
         return None
     if body.event.type not in _HANDLED_EVENT_TYPES:
         return None
-    if body.event.is_bot_authored:
+    if not body.event.is_user_input:
         return None
     return body.event
 
@@ -342,8 +373,8 @@ class SlackInboundConsumer:
     1. **Filter** — ``source != "slack"`` returns early (no interpretation,
        no write, no publish).
     2. **Interpret** — the verbatim payload through the local
-       :func:`parse_slack_message`; an unhandled body — or a bot-authored
-       echo (the app's own posts, SFP-257) — returns early.
+       :func:`parse_slack_message`; an unhandled body — or any sub-typed /
+       bot-authored echo (SFP-257 whitelist) — returns early.
     3. **Advance** — find-or-create the ``UserInteraction`` by provider
        thread reference via :meth:`InteractionService.create
        <communication.application.interaction_service.InteractionService.create>`
