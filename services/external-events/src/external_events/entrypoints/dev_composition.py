@@ -49,6 +49,13 @@ echo, and the ``message_replied`` parent sub-event every bot reply into a
 thread emits, which carries the human's user id) is dropped at inbound
 interpretation (:func:`~communication.interfaces.slack_inbound.\
 parse_slack_message`, SFP-257 whitelist) so no reply can re-feed the loop.
+And the webhook ACKS BEFORE PROCESSING (:class:`AckThenProcessPublisher`,
+SFP-257 round 3): the 200 returns immediately after signature verification
+while the publish/consume chain (including the GLM round-trip) runs as a
+background task — Slack's ~3s Events API delivery timeout can no longer
+turn a slow summarize into a retry storm of legitimately-shaped
+redeliveries, which are additionally deduped on the SFP-124 idempotency
+key.
 
 Usage::
 
@@ -73,6 +80,7 @@ Live smoke (the closed dogfood loop, manual — the only step not automated):
 
 from __future__ import annotations
 
+import asyncio
 import atexit
 import json
 import logging
@@ -124,10 +132,14 @@ from sfp_config import (
 )
 from sfp_contracts.commands import NotifyUser
 from sfp_contracts.events import ExternalEventReceived
+from sfp_contracts.events.envelope import EventEnvelope
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from external_events.application.publisher import make_external_event_envelope
+
 __all__ = [
+    "AckThenProcessPublisher",
     "CONFIRM_REQUEST_SUFFIX",
     "CLOSED_THREAD_MESSAGE",
     "DevAgentSettings",
@@ -395,6 +407,109 @@ application.communication_agent.SummarizationError`).
         except json.JSONDecodeError:
             return None
         return output if isinstance(output, dict) else None
+
+
+# --------------------------------------------------------------------------- #
+# Ack-then-process ingress publisher (SFP-257 round 3)
+# --------------------------------------------------------------------------- #
+
+
+class AckThenProcessPublisher:
+    """**Dev-only** ack-then-process ingress publisher (SFP-257 round 3).
+
+    The webhook's 200 must NEVER wait on the consume chain: Slack's Events
+    API aborts a delivery after ~3 seconds and RETRIES it, and a retry is a
+    full redelivery of the original event — a legitimate fresh user message
+    (``subtype`` absent, human ``user``, no ``bot_id``) that passes every
+    interpretation filter. While the endpoint processed synchronously
+    (signature → publish → GLM summarize ~5-6s → reply → 200), every retry
+    re-entered summarize: one human message kept re-summarizing and
+    replying, with accumulated retries arriving in bursts (live smoke
+    round 3, 2026-09-14: FIVE identical deliveries within 3ms; rounds 1-2's
+    echo storms were the same timeout loop seen through bot-shaped events).
+
+    This wrapper (duck-compatible with the SFP-124
+    :class:`~external_events.application.publisher.ExternalEventPublisher`
+    the dev webhook wires by default) moves only the publish/dispatch off
+    the request path:
+
+    1. build the SFP-124 envelope deterministically (pure, no I/O — the
+       reference :func:`~external_events.application.publisher.\
+make_external_event_envelope`);
+    2. dedupe redeliveries (below);
+    3. ``asyncio.create_task`` the bus dispatch and return the envelope —
+       the endpoint answers 200 immediately.
+
+    Fail-loud is unchanged elsewhere: startup binding stays fail-loud, and
+    signature verification still rejects synchronously with 401 BEFORE this
+    publisher is ever reached. A background dispatch failure is LOGGED,
+    never silently dropped and never re-raised (the ack already went out;
+    the known summarize failure mode already degrades gracefully in-band
+    with :data:`SUMMARIZATION_APOLOGY`).
+
+    Dedup (dev-only in-memory seen-set — production dedupe belongs to the
+    Phase-B durable transport, SFP-118/101; the in-memory transport
+    deliberately performs none, SFP-46): the SFP-124
+    ``idempotency_key`` (``{source}:{sha256(body)}``) collides for
+    byte-identical redeliveries by construction, and Slack's top-level
+    ``event_id`` is included as a second key so a retry whose body drifted
+    still dedupes. The set grows with distinct deliveries for the process
+    lifetime — acceptable for a dev runner.
+    """
+
+    def __init__(self, bus: Any) -> None:
+        self._bus = bus
+        self._seen: set[str] = set()
+        #: Background dispatch tasks not yet finished (dev observability;
+        #: tests await them so assertions are deterministic).
+        self.in_flight: list[asyncio.Task[None]] = []
+
+    async def publish(
+        self, source: str, external_id: str, payload: dict[str, Any]
+    ) -> EventEnvelope:
+        """Envelope now, dispatch later — the ack-then-process seam."""
+        envelope = make_external_event_envelope(
+            ExternalEventReceived(source=source, external_id=external_id, payload=payload)
+        )
+        keys = {envelope.idempotency_key, *self._provider_event_keys(source, payload)}
+        if keys & self._seen:
+            logger.info(
+                "dev runner: duplicate delivery dropped (source=%s, external_id=%s)",
+                source,
+                external_id,
+            )
+            return envelope
+        self._seen |= keys
+        task: asyncio.Task[None] = asyncio.create_task(self._dispatch(envelope))
+        self.in_flight.append(task)
+        task.add_done_callback(self.in_flight.remove)
+        return envelope
+
+    async def _dispatch(self, envelope: EventEnvelope) -> None:
+        """Publish one envelope on the bus in the background."""
+        try:
+            await self._bus.publish(envelope)
+        except Exception as exc:  # noqa: BLE001 - acked already: log, never raise
+            logger.error(
+                "dev runner: background dispatch failed (%s: %s) — delivery was acked",
+                type(exc).__name__,
+                exc,
+            )
+
+    @staticmethod
+    def _provider_event_keys(source: str, payload: dict[str, Any]) -> set[str]:
+        """Extra dedup keys from the provider body (dev-only; Slack today).
+
+        Reads ONE top-level routing field (``event_id``) — a dev-composition
+        allowance for redelivery bodies that are not byte-identical, never
+        a license for ingress interpretation (MAS §9.2).
+        """
+        if source != "slack":
+            return set()
+        event_id = payload.get("event_id")
+        if isinstance(event_id, str) and event_id:
+            return {f"slack-event:{event_id}"}
+        return set()
 
 
 # --------------------------------------------------------------------------- #
@@ -779,7 +894,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     endpoint_id = _resolve_endpoint_id(args.endpoint_id)
     port = _resolve_port(args.port)
-    app, bus, _resolver = build_dev_app(endpoint_id)
+    app, bus, _resolver = build_dev_app(
+        endpoint_id,
+        # Ack-then-process (SFP-257 round 3): the 200 must never wait on the
+        # consume chain — Slack aborts a delivery after ~3s and retries it,
+        # and each retry is a legitimate fresh user message that would
+        # re-enter summarize. The GLM round-trip runs in the background;
+        # redeliveries dedupe on the SFP-124 idempotency key.
+        ingress_publisher_factory=AckThenProcessPublisher,
+    )
 
     try:
         composition = build_dev_composition(bus=bus, probe_runtime=True)

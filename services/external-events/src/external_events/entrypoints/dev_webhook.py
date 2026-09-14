@@ -54,10 +54,10 @@ import argparse
 import atexit
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import Final
+from typing import Any, Final
 
 import sqlalchemy as sa
 from sfp_config import LocalSecretProvider
@@ -156,6 +156,8 @@ def _dev_session_factory(endpoint_id: str) -> SessionFactory:
 
 def build_dev_app(
     endpoint_id: str = DEFAULT_ENDPOINT_ID,
+    *,
+    ingress_publisher_factory: Callable[[InMemoryTransport], Any] | None = None,
 ) -> tuple[ChallengeEchoMiddleware, InMemoryTransport, EndpointConfigResolver]:
     """Wire the webhook with resolver + publisher + bus (dev composition).
 
@@ -170,6 +172,13 @@ def build_dev_app(
         endpoint_id: The dev endpoint id seeded into the resolver's database
             — the ``{endpoint_id}`` of the served ``/webhooks/{endpoint_id}``
             path. Defaults to :data:`DEFAULT_ENDPOINT_ID`.
+        ingress_publisher_factory: Optional dev seam (SFP-257 round 3)
+            building the ingress publisher over the created bus — the dev
+            composition passes its ack-then-process publisher so the HTTP
+            200 never waits on the consume chain. Defaults to ``None``:
+            the plain SFP-124 :class:`ExternalEventPublisher` (publish
+            inline, then 200 — the behavior the webhook contract tests
+            pin).
 
     Returns the (wrapped) app, the bus, and the resolver so the runner (and
     tests) can inspect what was published via ``bus.published_messages`` and
@@ -178,7 +187,11 @@ def build_dev_app(
     session_factory = _dev_session_factory(endpoint_id)
     resolver = EndpointConfigResolver(session_factory)
     bus = InMemoryTransport()
-    publisher = ExternalEventPublisher(bus)
+    publisher = (
+        ingress_publisher_factory(bus)
+        if ingress_publisher_factory is not None
+        else ExternalEventPublisher(bus)
+    )
     app = ChallengeEchoMiddleware(
         WebhookIngressEndpoint(
             resolver,
