@@ -16,23 +16,35 @@ Covers the closed Slack dogfood loop wired in
 - **CONFIRM** — the literal publishes ``UserInputReceived`` and completes the
   interaction; a correction regenerates (SFP-135 semantics exercised through
   the composition);
-- **self-echo guard** (SFP-257 live-smoke finding) — the bot's own outbound
-  post echoing back as a bot-authored ``message`` event produces ZERO
-  outbound effects (the infinite reply-loop reproduction);
+- **self-echo guard** (SFP-257 live-smoke rounds 1+2) — the bot's own
+  outbound post echoing back as a bot-authored ``message`` event, and the
+  ``message_replied`` parent sub-events every bot reply emits, produce ZERO
+  outbound effects (the infinite reply-loop reproductions);
 - **graceful degradation** (SFP-257 live-smoke finding) — a summary that
   fails even after the dev runtime's single stricter retry gets a short
   in-thread apology and completes the delivery (never a webhook 500);
+- **ack-then-process** (SFP-257 live-smoke round 3) — through the real ASGI
+  app with a Slack-signed delivery: the webhook returns 200 BEFORE a
+  deliberately slow consumer completes, and five byte-identical
+  redeliveries dedupe to exactly ONE summarize (Slack's ~3s delivery
+  timeout can no longer produce a retry storm);
 - the dev GLM ``AgentRuntime`` adapter and the dev-only destination resolver,
   over ``httpx.MockTransport`` / fakes — no live Slack or GLM anywhere.
 
-Deterministic throughout (MAS §12.7): injected clock, no sleeps, no network.
+Deterministic throughout (MAS §12.7): injected clock, no network. ONE
+deliberate exception — the ack-then-process runtime stand-in blocks for a
+scaled 0.25s ``time.sleep`` because the blocking GLM round-trip is exactly
+what the 200 must not wait on (round 3's live finding).
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import sys
+import time
 import types
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -57,11 +69,13 @@ from external_events.entrypoints.dev_composition import (
     CLOSED_THREAD_MESSAGE,
     CONFIRM_REQUEST_SUFFIX,
     SUMMARIZATION_APOLOGY,
+    AckThenProcessPublisher,
     DevCompositionError,
     DevSlackDestinationResolver,
     GlmAgentRuntime,
     build_dev_composition,
 )
+from external_events.entrypoints.dev_webhook import build_dev_app
 from sfp_agent_runtime.interfaces import AgentRunRequest, AgentRunResult
 from sfp_contracts.events import ExternalEventReceived
 from sfp_contracts.events.envelope import EventEnvelope, EventType
@@ -719,6 +733,203 @@ class TestSummarizationFailureDegrades:
         # opening question (create() seeds summary from it).
         interaction = _load_interaction(session_factory_of(comp), THREAD_ROOT)
         assert interaction.summary == "the deploy finished, rerun the checks"
+
+
+# --------------------------------------------------------------------------- #
+# Ack-then-process (SFP-257 round 3): the 200 must never wait on the chain
+# --------------------------------------------------------------------------- #
+
+
+#: The signing secret the ``secrets`` fixture plants (mirrors the live app).
+_SIGNING_SECRET = "dev-signing-secret"
+
+#: The dev endpoint id ``build_dev_app`` seeds.
+_ENDPOINT_ID = "slack-dev"
+
+
+class SlowRuntime:
+    """A blocking ``AgentRuntime`` stand-in — the ~5s GLM round-trip, scaled."""
+
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+        self.requests: list[AgentRunRequest] = []
+        self.completed = 0
+
+    def run(self, request: AgentRunRequest) -> AgentRunResult:
+        self.requests.append(request)
+        time.sleep(self.delay)  # the blocking stand-in is the point of the test
+        self.completed += 1
+        return AgentRunResult(
+            agent="communication",
+            ticket_id="x",
+            success=True,
+            output={"summary": RUNTIME_SUMMARY},
+        )
+
+
+def _slack_delivery_body(*, ts: str = "1757428801.000300") -> bytes:
+    """One verbatim Slack Events API delivery body (a plain human message)."""
+    return json.dumps(
+        {
+            "token": "xoxb-verification-token",
+            "team_id": "T06SFP",
+            "api_app_id": "A06SFP",
+            "event_id": f"Ev{ts.replace('.', '')}",
+            "type": "event_callback",
+            "event": {
+                "type": "message",
+                "text": "the deploy finished, rerun the checks",
+                "channel": CHANNEL,
+                "ts": ts,
+                "user": USER,
+                "thread_ts": THREAD_ROOT,
+                "event_ts": ts,
+                "channel_type": "channel",
+            },
+        }
+    ).encode("utf-8")
+
+
+def _sign_slack(secret: str, body: bytes) -> list[tuple[bytes, bytes]]:
+    """A valid current-timestamp Slack v0 signature over exactly ``body``."""
+    timestamp = str(int(time.time()))
+    basestring = f"v0:{timestamp}:{body.decode('utf-8', errors='replace')}"
+    digest = hmac.new(
+        secret.encode("utf-8"), basestring.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return [
+        (b"x-slack-signature", f"v0={digest}".encode()),
+        (b"x-slack-request-timestamp", timestamp.encode()),
+    ]
+
+
+async def _post_asgi(
+    app: Any, *, path: str, body: bytes, headers: list[tuple[bytes, bytes]]
+) -> int:
+    """Drive one signed POST through the app; return the response status."""
+    sent: list[dict[str, Any]] = []
+    delivered = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal delivered
+        assert not delivered, "receive called after the body was fully delivered"
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    await app(
+        {"type": "http", "method": "POST", "path": path, "headers": headers},
+        receive,
+        send,
+    )
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    return int(start["status"])
+
+
+def _build_ack_app(
+    session_factory: Any, runtime: Any, outbound: FakeOutbound
+) -> tuple[Any, Any, AckThenProcessPublisher]:
+    """``main()``'s wiring over injected seams: app + composition + wrapper.
+
+    Mirrors :func:`external_events.entrypoints.dev_composition.main` exactly
+    — the app is built with the ack-then-process ingress publisher, then the
+    Communication composition is bound to the SAME bus before serving.
+    """
+    holder: dict[str, AckThenProcessPublisher] = {}
+
+    def factory(bus: Any) -> AckThenProcessPublisher:
+        wrapper = AckThenProcessPublisher(bus)
+        holder["wrapper"] = wrapper
+        return wrapper
+
+    app, bus, _resolver = build_dev_app(_ENDPOINT_ID, ingress_publisher_factory=factory)
+    composition = build_dev_composition(
+        bus=bus,
+        session_factory=session_factory,
+        runtime=runtime,
+        outbound=outbound,  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    set_slack_inbound_consumer(composition.router)
+    return app, bus, holder["wrapper"]
+
+
+class TestAckThenProcess:
+    """SFP-257 round 3: Slack aborts a delivery after ~3s and retries it —
+    and a retry is a legitimate fresh user message that re-enters summarize.
+    The webhook must ACK (200) before the consume chain runs, and identical
+    redeliveries must dedupe on the SFP-124 idempotency key.
+    """
+
+    def test_webhook_acks_before_the_slow_consumer_completes(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        runtime = SlowRuntime(delay=0.25)  # the blocking GLM round-trip
+        outbound = FakeOutbound()
+        app, _bus, wrapper = _build_ack_app(session_factory, runtime, outbound)
+        body = _slack_delivery_body()
+
+        async def scenario() -> None:
+            status = await _post_asgi(
+                app,
+                path=f"/webhooks/{_ENDPOINT_ID}",
+                body=body,
+                headers=_sign_slack(_SIGNING_SECRET, body),
+            )
+            # The ack went out while the consumer was still mid-run —
+            # Slack's ~3s delivery timeout can no longer produce retries.
+            assert status == 200
+            assert runtime.completed == 0
+            assert outbound.sends == []
+            await asyncio.gather(*wrapper.in_flight)
+
+        asyncio.run(scenario())
+
+        # The background dispatch completed exactly once afterwards.
+        assert runtime.completed == 1
+        assert len(outbound.sends) == 1
+
+    def test_identical_redeliveries_summarize_exactly_once(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        runtime = SlowRuntime(delay=0.0)
+        outbound = FakeOutbound()
+        app, bus, wrapper = _build_ack_app(session_factory, runtime, outbound)
+        body = _slack_delivery_body()
+
+        async def scenario() -> None:
+            # Five byte-identical redeliveries (the live round-3 burst),
+            # each freshly signed — all acked with 200.
+            statuses = [
+                await _post_asgi(
+                    app,
+                    path=f"/webhooks/{_ENDPOINT_ID}",
+                    body=body,
+                    headers=_sign_slack(_SIGNING_SECRET, body),
+                )
+                for _ in range(5)
+            ]
+            assert statuses == [200] * 5
+            await asyncio.gather(*wrapper.in_flight)
+
+        asyncio.run(scenario())
+
+        # Exactly ONE summarize, ONE reply, ONE event on the bus — the
+        # other four deliveries deduped on the SFP-124 idempotency key.
+        assert len(runtime.requests) == 1
+        assert len(outbound.sends) == 1
+        externals = [
+            m for m in bus.published_messages if type(m.payload).__name__ == "ExternalEventReceived"
+        ]
+        assert len(externals) == 1
 
 
 # --------------------------------------------------------------------------- #
