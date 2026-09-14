@@ -18,10 +18,8 @@ suite — totality by fail-closed default):
 2. **Single-service rule — that service's tests**: changes confined to ONE
    service's ``src/`` + ``tests/`` subtrees scope to
    ``services/<svc>/tests`` plus the fixed importer set from
-   :data:`IMPORTER_MAP` (currently empty for every service — verified by the
-   exhaustive test, so this reduces to that service's tests alone). New
-   isolated files (no importers) need no special casing — they already reduce
-   to the service's tests.
+   :data:`IMPORTER_MAP`. New isolated files (no importers) need no special
+   casing — they already reduce to the service's tests.
 3. **Multi-service rule — FULL**: a diff touching ``src``/``tests`` of 2+
    distinct services. Unions of scopes are NEVER computed — the full suite is
    computed instead (cheaper to reason about than a stitched union).
@@ -65,14 +63,16 @@ __all__ = [
 #: is confined to that service (rule 2). Values are repo-relative test-path
 #: roots (e.g. ``"services/orchestrator/tests"``), NOT service names.
 #:
-#: Currently EMPTY for every service: no package imports a service and no
-#: service imports another service (both facts are asserted by the exhaustive
-#: partition test — if an import ever appears, that test fails and forces this
-#: map to be updated with the importing side's test root). An empty set means
-#: "that service's tests alone".
+#: Non-empty only where a service's ``src`` imports another service's
+#: ``src`` (asserted by the exhaustive partition test — a new import makes
+#: that test fail and forces the importing side's test root to be listed
+#: here). An empty set means "that service's tests alone". SFP-257: the
+#: external-events dev composition imports Communication in-process (Phase-A
+#: dev glue), so a diff confined to Communication also runs the
+#: external-events tests.
 IMPORTER_MAP: Mapping[str, frozenset[str]] = MappingProxyType(
     {
-        "communication": frozenset(),
+        "communication": frozenset({"services/external-events/tests"}),
         "external-events": frozenset(),
         "identity": frozenset(),
         "orchestrator": frozenset(),

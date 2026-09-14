@@ -196,6 +196,8 @@ def event_callback_body(
     ts: str = "1757000000.000100",
     user: str = "U08OWNER",
     thread_ts: str | None = None,
+    subtype: str | None = None,
+    bot_id: str | None = None,
 ) -> dict[str, Any]:
     """A VERBATIM-shaped Slack Events API ``event_callback`` body.
 
@@ -215,6 +217,10 @@ def event_callback_body(
     }
     if thread_ts is not None:
         event["thread_ts"] = thread_ts
+    if subtype is not None:
+        event["subtype"] = subtype
+    if bot_id is not None:
+        event["bot_id"] = bot_id
     return {
         "token": "xoxb-verification-token",
         "team_id": "T06SFP",
@@ -357,6 +363,61 @@ class TestSlackProviderSchema:
         body["event"] = "not-a-dict"
         assert parse_slack_message(body) is None
 
+    def test_bot_message_subtype_is_not_a_user_message(self) -> None:
+        """The app's own posts echo back as ``bot_message`` — not user input.
+
+        The round-1 SFP-257 self-loop guard: interpreting the app's own
+        outbound echo as a user message is an infinite reply loop (live
+        smoke 2026-09-14).
+        """
+        body = event_callback_body(subtype="bot_message", bot_id="B08SFPAPP")
+        assert parse_slack_message(body) is None
+
+    def test_bot_id_alone_is_not_a_user_message(self) -> None:
+        """Either bot marker alone disqualifies the event (belt-and-braces)."""
+        body = event_callback_body(bot_id="B08SFPAPP")
+        assert parse_slack_message(body) is None
+
+    def test_message_replied_parent_echo_is_not_user_input(self) -> None:
+        """The round-2 SFP-257 incident shape — the blacklist's blind spot.
+
+        A bot reply posted into a thread makes Slack emit a ``message_replied``
+        sub-event for the PARENT message: it carries the HUMAN's ``user`` id
+        and NO bot markers, yet is not new input. Passing it re-summarizes
+        the original message on every bot reply (measured: one human message
+        → 9 GLM calls / 8 posts over ~6 minutes).
+        """
+        body = event_callback_body(subtype="message_replied")
+        assert parse_slack_message(body) is None
+
+    @pytest.mark.parametrize(
+        "subtype",
+        [
+            "message_changed",
+            "message_deleted",
+            "channel_topic",
+            "thread_broadcast",
+            "tombstone",
+        ],
+    )
+    def test_subtyped_state_events_are_not_user_input(self, subtype: str) -> None:
+        """Every sub-typed event is Slack state on an existing message.
+
+        ``thread_broadcast`` included: a broadcast is a duplicate rendering
+        of a reply already delivered as a plain thread event — letting it
+        through would double-count that input.
+        """
+        assert parse_slack_message(event_callback_body(subtype=subtype)) is None
+
+    def test_plain_human_message_is_the_only_user_input_shape(self) -> None:
+        message = parse_slack_message(event_callback_body())
+
+        assert message is not None
+        assert message.subtype is None
+        assert message.bot_id is None
+        assert message.is_bot_authored is False
+        assert message.is_user_input is True
+
 
 # --------------------------------------------------------------------------- #
 # The consumer — filtering, advancement, and the ID-076 routing rule
@@ -376,6 +437,27 @@ class TestSlackInboundConsumer:
         self, consumer: SlackInboundConsumer, session_factory: SessionFactory, bus: FakeBus
     ) -> None:
         await consumer.consume(slack_event({"type": "url_verification", "challenge": "abc123"}))
+
+        assert count_rows(session_factory) == 0
+        assert bus.published_messages == []
+
+    async def test_bot_authored_echo_returns_early(
+        self, consumer: SlackInboundConsumer, session_factory: SessionFactory, bus: FakeBus
+    ) -> None:
+        """A bot-authored echo never advances an interaction (SFP-257)."""
+        await consumer.consume(
+            slack_event(event_callback_body(subtype="bot_message", bot_id="B08SFPAPP"))
+        )
+
+        assert count_rows(session_factory) == 0
+        assert bus.published_messages == []
+
+    async def test_message_replied_parent_echo_returns_early(
+        self, consumer: SlackInboundConsumer, session_factory: SessionFactory, bus: FakeBus
+    ) -> None:
+        """A sub-typed parent echo carrying the HUMAN's id never advances an
+        interaction (SFP-257 round 2 — no bot markers present)."""
+        await consumer.consume(slack_event(event_callback_body(subtype="message_replied")))
 
         assert count_rows(session_factory) == 0
         assert bus.published_messages == []
