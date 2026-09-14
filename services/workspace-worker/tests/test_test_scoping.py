@@ -115,7 +115,9 @@ class TestRuleTwoSingleServiceScopes:
             }
         )
         assert not scope.is_full
-        assert scope.test_paths == (f"services/{service_dir}/tests",)
+        assert scope.test_paths == tuple(
+            sorted({f"services/{service_dir}/tests", *IMPORTER_MAP[service_dir]})
+        )
 
     def test_new_isolated_file_with_no_importers_scopes_to_service_tests(self) -> None:
         # Rule 3 of the PRSpec: an isolated NEW module nothing imports still
@@ -333,11 +335,15 @@ class TestExhaustivePathMap:
             assert compute_test_scope({f"packages/{pkg}/src/x/y.py"}).is_full
 
     def test_every_real_service_dir_maps_to_one_outcome(self) -> None:
-        # Partition member 2: each service → its own tests. Exhaustive over
-        # disk; each directory is covered by exactly this one rule.
+        # Partition member 2: each service → its own tests plus its fixed
+        # importer set. Exhaustive over disk; each directory is covered by
+        # exactly this one rule.
         for svc in _SERVICE_DIRS:
             scope = compute_test_scope({f"services/{svc}/src/x/y.py", f"services/{svc}/tests/t.py"})
-            assert scope == TestScope(is_full=False, test_paths=(f"services/{svc}/tests",))
+            assert scope == TestScope(
+                is_full=False,
+                test_paths=tuple(sorted({f"services/{svc}/tests", *IMPORTER_MAP[svc]})),
+            )
 
     def test_partition_of_real_repo_subdirs_is_total(self) -> None:
         # Every top-level repo directory lands in exactly one bucket:
@@ -394,7 +400,7 @@ class TestExhaustivePathMap:
         root. Scanned from disk so the assertion tracks reality.
         """
         service_modules = {svc.replace("-", "_"): svc for svc in _SERVICE_DIRS}
-        offenders: list[str] = []
+        edges: set[tuple[str, str, Path]] = set()
         for svc in _SERVICE_DIRS:
             own = svc.replace("-", "_")
             src = _REPO_ROOT / "services" / svc / "src"
@@ -409,17 +415,29 @@ class TestExhaustivePathMap:
                         if stripped.startswith(f"import {mod}") or stripped.startswith(
                             f"from {mod}"
                         ):
-                            offenders.append(
-                                f"{py.relative_to(_REPO_ROOT)} imports {mod} — add "
-                                f"services/{svc_dir}/tests to IMPORTER_MAP consumers"
-                            )
-        assert not offenders, "; ".join(offenders)
+                            edges.add((svc, svc_dir, py.relative_to(_REPO_ROOT)))
+        unrecorded = [
+            f"{path} imports {imported} — add services/{importer}/tests to "
+            f"IMPORTER_MAP[{imported!r}]"
+            for importer, imported, path in sorted(edges)
+            if f"services/{importer}/tests" not in IMPORTER_MAP.get(imported, frozenset())
+        ]
+        assert not unrecorded, "; ".join(unrecorded)
 
-    def test_importer_sets_are_currently_empty_for_every_service(self) -> None:
-        # Encodes TODAY'S truth (PRSpec: "currently empty for every service").
-        # The two static checks above prove the emptiness is real; if this
-        # starts failing alongside them, update the map, not this pin.
-        assert {k: sorted(v) for k, v in IMPORTER_MAP.items()} == {svc: [] for svc in _SERVICE_DIRS}
+    def test_importer_sets_match_the_declared_cross_service_edges(self) -> None:
+        # Encodes TODAY'S truth. SFP-257 added the first cross-service import
+        # (the external-events dev composition imports Communication in
+        # process — Phase-A dev glue), so IMPORTER_MAP["communication"] lists
+        # the external-events test root; every other service stays empty. The
+        # static edge check above proves the map stays in sync with reality;
+        # a new import means updating BOTH the map and this pin.
+        assert {k: sorted(v) for k, v in IMPORTER_MAP.items()} == {
+            "communication": ["services/external-events/tests"],
+            "external-events": [],
+            "identity": [],
+            "orchestrator": [],
+            "workspace-worker": [],
+        }
 
     def test_importer_map_values_are_frozensets(self) -> None:
         for value in IMPORTER_MAP.values():
