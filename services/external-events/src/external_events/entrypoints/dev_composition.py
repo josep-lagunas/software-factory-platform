@@ -39,6 +39,15 @@ an unreachable GLM endpoint raises :class:`DevCompositionError`; ``main()``
 prints the reason to stderr and exits NON-ZERO instead of serving a runner
 that 500s on every delivery.
 
+Graceful degradation at DELIVERY time (fail-loud is startup-only): a GLM 200
+whose body holds no JSON object is retried exactly once with a stricter
+re-prompt inside :class:`GlmAgentRuntime`; a summary that still fails gets a
+short in-thread apology (:data:`SUMMARIZATION_APOLOGY`) and a 200 — Slack
+must never retry-storm a 500ing webhook. The app's own outbound posts echo
+back as bot-authored ``message`` events; they are dropped at inbound
+interpretation (:func:`~communication.interfaces.slack_inbound.\
+parse_slack_message`, SFP-257) so the loop cannot self-feed.
+
 Usage::
 
     uv run python -m external_events.entrypoints.dev_composition [--port 8789]
@@ -77,6 +86,7 @@ import sqlalchemy as sa
 from communication.application.communication_agent import (
     ClosedInteractionOutcome,
     CommunicationAgent,
+    SummarizationError,
 )
 from communication.application.confirm_flow import ConfirmFlow, ConfirmOutcome, CorrectionOutcome
 from communication.application.interaction_service import (
@@ -124,6 +134,7 @@ __all__ = [
     "DevCompositionError",
     "DevSlackDestinationResolver",
     "GlmAgentRuntime",
+    "SUMMARIZATION_APOLOGY",
     "build_dev_composition",
     "main",
 ]
@@ -139,6 +150,25 @@ CLOSED_THREAD_MESSAGE: Final[str] = (
 #: Appended to a regenerated summary so the user knows the ID-069 gate is open.
 CONFIRM_REQUEST_SUFFIX: Final[str] = (
     "\n\nReply CONFIRM to accept this summary, or reply with a correction."
+)
+
+#: Posted to the thread when summarization fails even after the dev runtime's
+#: retry — the composition degrades gracefully (the webhook returns 200 so
+#: Slack does not retry-storm) instead of 500ing. Fail-loud stays
+#: STARTUP-only, as the ticket specifies (SFP-257 live smoke, 2026-09-14).
+SUMMARIZATION_APOLOGY: Final[str] = "Sorry — I couldn't summarize that message. Please retry."
+
+#: The fail-closed error for an HTTP 200 whose text blocks hold no JSON
+#: object — the sentinel the dev runtime's single retry keys on.
+_NO_JSON_OBJECT_ERROR: Final[str] = "glm returned no JSON object"
+
+#: The stricter re-prompt appended for the single retry after an unparseable
+#: output (live smoke 2026-09-14: GLM intermittently answers 200 with prose
+#: for certain message contents).
+_STRICTER_REPROMPT: Final[str] = (
+    "Your previous reply contained no parseable JSON object. "
+    "Reply again with ONLY the JSON object — no prose before or after it and "
+    "no code fences: the reply must start with '{' and end with '}'."
 )
 
 
@@ -195,12 +225,18 @@ class DevAgentSettings(Settings):
 class GlmAgentRuntime:
     """A minimal Anthropic-compatible (GLM) ``AgentRuntime`` for dev only.
 
-    One synchronous ``POST {base_url}/v1/messages`` per run (ID-051 httpx;
-    the token is resolved from the injected :class:`~sfp_config.SecretProvider`
-    at call time and never logged — ID-016). The response's text blocks are
-    joined and parsed as a JSON object — the structured output
+    One synchronous ``POST {base_url}/v1/messages`` per attempt (ID-051
+    httpx; the token is resolved from the injected
+    :class:`~sfp_config.SecretProvider` at call time and never logged —
+    ID-016). The response's text blocks are joined and parsed as a JSON
+    object — the structured output
     :class:`~communication.application.communication_agent.CommunicationAgent`
-    validates. Any transport failure, non-2xx response or unparseable body
+    validates. An HTTP 200 whose body holds no parseable JSON object is
+    retried EXACTLY ONCE with a stricter re-prompt (the pipeline
+    ``ClaudeAgentRuntime``'s retry-on-empty-stream spirit, dev-sized —
+    live smoke 2026-09-14: GLM intermittently answers 200 with prose, which
+    otherwise 500s the webhook into Slack's retry storm). Any transport
+    failure, non-2xx response, or output still unparseable after the retry
     yields ``AgentRunResult(success=False, error=...)`` — fail-closed, never
     a raise (the agent already maps failures to :class:`~communication.\
 application.communication_agent.SummarizationError`).
@@ -246,7 +282,29 @@ application.communication_agent.SummarizationError`).
             )
 
     def run(self, request: AgentRunRequest) -> AgentRunResult:
-        """Run one structured-output request (the ``AgentRuntime`` Protocol)."""
+        """Run one structured-output request (the ``AgentRuntime`` Protocol).
+
+        An HTTP 200 whose body holds no parseable JSON object is retried
+        exactly once with the stricter re-prompt; only that failure mode
+        retries (transport / HTTP errors fail immediately — the strict
+        re-prompt cannot fix a dead endpoint).
+        """
+        prompt = self._build_prompt(request)
+        first = self._run_once(request, prompt)
+        if first.success or first.error != _NO_JSON_OBJECT_ERROR:
+            return first
+        retry = self._run_once(request, f"{prompt}\n\n{_STRICTER_REPROMPT}")
+        if retry.success:
+            return retry
+        return AgentRunResult(
+            agent=request.agent,
+            ticket_id=request.ticket_id,
+            success=False,
+            error=f"{_NO_JSON_OBJECT_ERROR} (after 1 retry)",
+        )
+
+    def _build_prompt(self, request: AgentRunRequest) -> str:
+        """Assemble the structured-output prompt from the run request."""
         prompt = (
             f"{request.prompt}\n\n"
             "Respond with ONLY a JSON object.\n\nCONTEXT:\n"
@@ -254,6 +312,10 @@ application.communication_agent.SummarizationError`).
         )
         for key in sorted(request.context):
             prompt += f"{key}: {request.context[key]!s}\n"
+        return prompt
+
+    def _run_once(self, request: AgentRunRequest, prompt: str) -> AgentRunResult:
+        """One POST + parse attempt; fail-closed mapping, no retries here."""
         try:
             response = self._post([{"role": "user", "content": prompt}])
         except httpx.HTTPError as exc:
@@ -276,7 +338,7 @@ application.communication_agent.SummarizationError`).
                 agent=request.agent,
                 ticket_id=request.ticket_id,
                 success=False,
-                error="glm returned no JSON object",
+                error=_NO_JSON_OBJECT_ERROR,
             )
         return AgentRunResult(
             agent=request.agent,
@@ -446,7 +508,20 @@ class DevCommunicationRouter(SlackInboundConsumer):
 
         if is_new:
             await self._carry_over_context(message)
-        await self._route_reply(message)
+        try:
+            await self._route_reply(message)
+        except SummarizationError as exc:
+            # Graceful degradation (SFP-257 live smoke, 2026-09-14): a
+            # summary that still fails after the runtime's retry must NOT
+            # 500 the webhook — Slack would hammer retries (measured: five
+            # consecutive 500s). Apologize in-thread and complete the
+            # delivery with a 200. Fail-loud stays STARTUP-only.
+            logger.warning(
+                "dev runner: summarization failed for %s (%s) — apologizing in-thread",
+                reference,
+                exc,
+            )
+            await self._notify(reference, SUMMARIZATION_APOLOGY)
 
     async def _handle_closed(self, message: SlackProviderMessage) -> None:
         """A reply to a closed interaction: request a new thread (AP-005)."""
