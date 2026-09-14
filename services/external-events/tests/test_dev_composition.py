@@ -16,6 +16,12 @@ Covers the closed Slack dogfood loop wired in
 - **CONFIRM** — the literal publishes ``UserInputReceived`` and completes the
   interaction; a correction regenerates (SFP-135 semantics exercised through
   the composition);
+- **self-echo guard** (SFP-257 live-smoke finding) — the bot's own outbound
+  post echoing back as a bot-authored ``message`` event produces ZERO
+  outbound effects (the infinite reply-loop reproduction);
+- **graceful degradation** (SFP-257 live-smoke finding) — a summary that
+  fails even after the dev runtime's single stricter retry gets a short
+  in-thread apology and completes the delivery (never a webhook 500);
 - the dev GLM ``AgentRuntime`` adapter and the dev-only destination resolver,
   over ``httpx.MockTransport`` / fakes — no live Slack or GLM anywhere.
 
@@ -25,6 +31,7 @@ Deterministic throughout (MAS §12.7): injected clock, no sleeps, no network.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import types
 from collections.abc import Iterator
@@ -49,6 +56,7 @@ from external_events.entrypoints import dev_composition
 from external_events.entrypoints.dev_composition import (
     CLOSED_THREAD_MESSAGE,
     CONFIRM_REQUEST_SUFFIX,
+    SUMMARIZATION_APOLOGY,
     DevCompositionError,
     DevSlackDestinationResolver,
     GlmAgentRuntime,
@@ -85,6 +93,13 @@ THREAD_ROOT_2 = "1757428900.000200"
 #: The Slack user id of the synthetic sender.
 USER = "U0DEV"
 
+#: The app's own bot identity — what the bot's outbound posts echo back as
+#: (the self-loop guard's input; SFP-257 live smoke).
+BOT_ID = "B0DEVAPP"
+
+#: The bot's Slack user id as Events API echoes carry it.
+BOT_USER = "U0DEVBOT"
+
 
 def _slack_event(
     *,
@@ -93,22 +108,26 @@ def _slack_event(
     text: str = "the deploy finished, rerun the checks",
     user: str = USER,
     ts: str = "1757428801.000300",
+    subtype: str | None = None,
+    bot_id: str | None = None,
 ) -> ExternalEventReceived:
     """Build one synthetic Slack delivery (the verbatim Events API body)."""
+    event: dict[str, Any] = {
+        "type": "message",
+        "text": text,
+        "channel": channel,
+        "ts": ts,
+        "user": user,
+        "thread_ts": thread_root,
+    }
+    if subtype is not None:
+        event["subtype"] = subtype
+    if bot_id is not None:
+        event["bot_id"] = bot_id
     return ExternalEventReceived(
         source="slack",
         external_id=ts,
-        payload={
-            "type": "event_callback",
-            "event": {
-                "type": "message",
-                "text": text,
-                "channel": channel,
-                "ts": ts,
-                "user": user,
-                "thread_ts": thread_root,
-            },
-        },
+        payload={"type": "event_callback", "event": event},
     )
 
 
@@ -336,6 +355,60 @@ class TestGlmAgentRuntime:
         result = runtime.run(AgentRunRequest(agent="a", ticket_id="t", prompt="p"))
         assert result.success is False
 
+    def test_run_retries_once_with_a_stricter_prompt_on_unparseable_output(self) -> None:
+        """A 200-with-prose answer gets ONE stricter retry (SFP-257 finding 2)."""
+        bodies: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(request.content))
+            if len(bodies) == 1:
+                return httpx.Response(
+                    200, json={"content": [{"type": "text", "text": "no JSON object here"}]}
+                )
+            return httpx.Response(
+                200, json={"content": [{"type": "text", "text": '{"summary": "recovered"}'}]}
+            )
+
+        result = self._runtime(handler).run(AgentRunRequest(agent="a", ticket_id="t", prompt="p"))
+
+        assert result.success is True
+        assert result.output == {"summary": "recovered"}
+        # Exactly one retry, and it carried the stricter re-prompt.
+        assert len(bodies) == 2
+        first_prompt = bodies[0]["messages"][0]["content"]
+        retry_prompt = bodies[1]["messages"][0]["content"]
+        assert retry_prompt.startswith(first_prompt)
+        assert "no parseable JSON object" in retry_prompt
+        assert "no parseable JSON object" not in first_prompt
+
+    def test_run_fails_after_exactly_one_retry(self) -> None:
+        posts: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            posts.append(str(request.url))
+            return httpx.Response(200, json={"content": [{"type": "text", "text": "hi"}]})
+
+        result = self._runtime(handler).run(AgentRunRequest(agent="a", ticket_id="t", prompt="p"))
+
+        assert result.success is False
+        assert result.error is not None and "no JSON object" in result.error
+        assert len(posts) == 2
+
+    def test_http_error_is_not_retried(self) -> None:
+        """Only the unparseable-output path retries — a stricter prompt
+        cannot fix a dead endpoint."""
+        posts: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            posts.append(str(request.url))
+            return httpx.Response(500, json={})
+
+        result = self._runtime(handler).run(AgentRunRequest(agent="a", ticket_id="t", prompt="p"))
+
+        assert result.success is False
+        assert result.error is not None and "500" in result.error
+        assert len(posts) == 1
+
     def test_run_maps_transport_failure_to_failure(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError("nope")
@@ -509,6 +582,97 @@ class TestClosedInteraction:
         with session_factory_of(comp)() as session:
             assert session.scalars(select(UserInteraction)).all() == []
         assert all(type(m.payload).__name__ != "UserInputReceived" for m in bus.published_messages)
+
+
+class TestSelfEchoGuard:
+    """The SFP-257 self-loop finding: the bot's own outbound posts echo back
+    as whole-channel ``message`` events; interpreting them as user input fed
+    an infinite reply loop (~142 ``chat.postMessage`` calls in ~90s, zero
+    LLM runs — live smoke 2026-09-14). The guard drops bot-authored events
+    at inbound interpretation, so an echo produces NO outbound effect.
+    """
+
+    def test_bot_own_echo_on_a_closed_thread_produces_zero_outbound(self, composition: Any) -> None:
+        comp, bus, outbound, runtime = composition
+        set_slack_inbound_consumer(comp.router)
+
+        _publish(bus, _slack_event())  # opens the thread (1 reply)
+        _publish(bus, _slack_event(text="CONFIRM"))  # completes the interaction
+        sends_before = len(outbound.sends)
+        runs_before = len(runtime.requests)
+        inputs_before = [
+            m for m in bus.published_messages if type(m.payload).__name__ == "UserInputReceived"
+        ]
+
+        # The bot's own closed-thread reply arrives back as a whole-channel
+        # message event (bot_message subtype + bot_id) — the exact echo that
+        # previously fed the loop. Without the guard this delivery would post
+        # the closed-thread message again, ping-pong forever.
+        _publish(
+            bus,
+            _slack_event(
+                text=f"{CLOSED_THREAD_MESSAGE} (closing summary: {RUNTIME_SUMMARY})",
+                user=BOT_USER,
+                ts="1757428810.000600",
+                subtype="bot_message",
+                bot_id=BOT_ID,
+            ),
+        )
+
+        # Zero outbound, zero LLM runs, zero new publications — the loop
+        # cannot start.
+        assert len(outbound.sends) == sends_before
+        assert len(runtime.requests) == runs_before
+        inputs_after = [
+            m for m in bus.published_messages if type(m.payload).__name__ == "UserInputReceived"
+        ]
+        assert len(inputs_after) == len(inputs_before)
+
+
+class TestSummarizationFailureDegrades:
+    """The SFP-257 graceful-degradation finding: a summary that still fails
+    after the runtime's retry must NOT 500 the webhook (Slack retry-storms
+    a 500ing delivery — measured: five consecutive 500s). The composition
+    posts a short apology to the thread and completes the delivery.
+    """
+
+    def test_failed_summary_apologizes_in_thread_instead_of_raising(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        bus = InMemoryTransport()
+        runtime = FakeRuntime(
+            AgentRunResult(
+                agent="communication",
+                ticket_id="x",
+                success=False,
+                error="glm returned no JSON object (after 1 retry)",
+            )
+        )
+        outbound = FakeOutbound()
+        comp = build_dev_composition(
+            bus=bus,
+            session_factory=session_factory,
+            runtime=runtime,
+            outbound=outbound,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+        set_slack_inbound_consumer(comp.router)
+
+        # Must NOT raise: the publish completing means the webhook returns
+        # 200, so Slack does not hammer retries.
+        _publish(bus, _slack_event())
+
+        # Exactly one delivery: the short apology, threaded to the sender.
+        assert [s["text"] for s in outbound.sends] == [SUMMARIZATION_APOLOGY]
+        assert outbound.sends[0]["channel_ref"] == CHANNEL
+        assert outbound.sends[0]["thread_ref"] == THREAD_ROOT
+        # Nothing was persisted as a summary — the interaction keeps its
+        # opening question (create() seeds summary from it).
+        interaction = _load_interaction(session_factory_of(comp), THREAD_ROOT)
+        assert interaction.summary == "the deploy finished, rerun the checks"
 
 
 # --------------------------------------------------------------------------- #
