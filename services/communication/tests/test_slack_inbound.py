@@ -366,8 +366,9 @@ class TestSlackProviderSchema:
     def test_bot_message_subtype_is_not_a_user_message(self) -> None:
         """The app's own posts echo back as ``bot_message`` — not user input.
 
-        The SFP-257 self-loop guard: interpreting the app's own outbound echo
-        as a user message is an infinite reply loop (live smoke 2026-09-14).
+        The round-1 SFP-257 self-loop guard: interpreting the app's own
+        outbound echo as a user message is an infinite reply loop (live
+        smoke 2026-09-14).
         """
         body = event_callback_body(subtype="bot_message", bot_id="B08SFPAPP")
         assert parse_slack_message(body) is None
@@ -377,13 +378,45 @@ class TestSlackProviderSchema:
         body = event_callback_body(bot_id="B08SFPAPP")
         assert parse_slack_message(body) is None
 
-    def test_human_message_carries_no_bot_markers(self) -> None:
+    def test_message_replied_parent_echo_is_not_user_input(self) -> None:
+        """The round-2 SFP-257 incident shape — the blacklist's blind spot.
+
+        A bot reply posted into a thread makes Slack emit a ``message_replied``
+        sub-event for the PARENT message: it carries the HUMAN's ``user`` id
+        and NO bot markers, yet is not new input. Passing it re-summarizes
+        the original message on every bot reply (measured: one human message
+        → 9 GLM calls / 8 posts over ~6 minutes).
+        """
+        body = event_callback_body(subtype="message_replied")
+        assert parse_slack_message(body) is None
+
+    @pytest.mark.parametrize(
+        "subtype",
+        [
+            "message_changed",
+            "message_deleted",
+            "channel_topic",
+            "thread_broadcast",
+            "tombstone",
+        ],
+    )
+    def test_subtyped_state_events_are_not_user_input(self, subtype: str) -> None:
+        """Every sub-typed event is Slack state on an existing message.
+
+        ``thread_broadcast`` included: a broadcast is a duplicate rendering
+        of a reply already delivered as a plain thread event — letting it
+        through would double-count that input.
+        """
+        assert parse_slack_message(event_callback_body(subtype=subtype)) is None
+
+    def test_plain_human_message_is_the_only_user_input_shape(self) -> None:
         message = parse_slack_message(event_callback_body())
 
         assert message is not None
         assert message.subtype is None
         assert message.bot_id is None
         assert message.is_bot_authored is False
+        assert message.is_user_input is True
 
 
 # --------------------------------------------------------------------------- #
@@ -415,6 +448,16 @@ class TestSlackInboundConsumer:
         await consumer.consume(
             slack_event(event_callback_body(subtype="bot_message", bot_id="B08SFPAPP"))
         )
+
+        assert count_rows(session_factory) == 0
+        assert bus.published_messages == []
+
+    async def test_message_replied_parent_echo_returns_early(
+        self, consumer: SlackInboundConsumer, session_factory: SessionFactory, bus: FakeBus
+    ) -> None:
+        """A sub-typed parent echo carrying the HUMAN's id never advances an
+        interaction (SFP-257 round 2 — no bot markers present)."""
+        await consumer.consume(slack_event(event_callback_body(subtype="message_replied")))
 
         assert count_rows(session_factory) == 0
         assert bus.published_messages == []

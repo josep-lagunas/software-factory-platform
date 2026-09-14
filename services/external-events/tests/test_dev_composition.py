@@ -585,17 +585,25 @@ class TestClosedInteraction:
 
 
 class TestSelfEchoGuard:
-    """The SFP-257 self-loop finding: the bot's own outbound posts echo back
-    as whole-channel ``message`` events; interpreting them as user input fed
-    an infinite reply loop (~142 ``chat.postMessage`` calls in ~90s, zero
-    LLM runs — live smoke 2026-09-14). The guard drops bot-authored events
-    at inbound interpretation, so an echo produces NO outbound effect.
+    """The SFP-257 self-loop findings (live smoke rounds 1+2, 2026-09-14):
+
+    - round 1: the bot's own outbound posts echo back as whole-channel
+      ``message`` events; interpreting them as user input fed an infinite
+      reply loop (~142 ``chat.postMessage`` calls in ~90s, zero LLM runs).
+    - round 2: each bot reply into a thread ALSO emits a ``message_replied``
+      sub-event for the PARENT message — carrying the HUMAN's user id and no
+      bot markers, invisible to a bot-marker blacklist — re-summarizing the
+      original message on every bot reply (9 GLM calls / 8 posts over ~6
+      minutes).
+
+    The guard is a whitelist at inbound interpretation (a message is user
+    input ONLY with no ``subtype`` and no ``bot_id``), so every echo shape
+    produces NO outbound effect.
     """
 
     def test_bot_own_echo_on_a_closed_thread_produces_zero_outbound(self, composition: Any) -> None:
         comp, bus, outbound, runtime = composition
         set_slack_inbound_consumer(comp.router)
-
         _publish(bus, _slack_event())  # opens the thread (1 reply)
         _publish(bus, _slack_event(text="CONFIRM"))  # completes the interaction
         sends_before = len(outbound.sends)
@@ -627,6 +635,44 @@ class TestSelfEchoGuard:
             m for m in bus.published_messages if type(m.payload).__name__ == "UserInputReceived"
         ]
         assert len(inputs_after) == len(inputs_before)
+
+    def test_round2_one_human_message_with_bot_thread_replies_summarizes_exactly_once(
+        self, composition: Any
+    ) -> None:
+        """The round-2 incident regression (SFP-257 re-smoke, 2026-09-14).
+
+        One human message produced 8 evolving bot replies over ~6 minutes
+        because every bot thread-reply re-triggered a fresh summarize of the
+        ORIGINAL message via the ``message_replied`` parent sub-event. With
+        the whitelist, one human message + any number of bot replies (and
+        their parent sub-events) means EXACTLY ONE summarize run and one
+        reply — no re-summaries.
+        """
+        comp, bus, outbound, runtime = composition
+        set_slack_inbound_consumer(comp.router)
+
+        # One human message → exactly one summarize + one bot reply.
+        _publish(bus, _slack_event())
+        assert len(runtime.requests) == 1
+        assert len(outbound.sends) == 1
+
+        # Every bot reply into the thread ALSO emits a message_replied
+        # sub-event for the PARENT message — the human's user id, no bot
+        # markers, the parent's text. None of them may re-enter summarize.
+        for index in range(3):
+            _publish(
+                bus,
+                _slack_event(
+                    text="the deploy finished, rerun the checks",
+                    user=USER,
+                    ts=f"175742882{index}.00070{index}",
+                    subtype="message_replied",
+                ),
+            )
+
+        # Exactly the round-1 count: no re-summaries, no extra replies.
+        assert len(runtime.requests) == 1
+        assert len(outbound.sends) == 1
 
 
 class TestSummarizationFailureDegrades:
