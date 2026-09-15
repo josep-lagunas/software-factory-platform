@@ -986,3 +986,456 @@ class TestMain:
 
         assert excinfo.value.code == 1
         assert serve_calls == []
+
+
+# --------------------------------------------------------------------------- #
+# SFP-258 — the one-button Block Kit confirm UX (click ≡ typed, multilingual)
+# --------------------------------------------------------------------------- #
+
+#: The Catalan summary the language-aware runtime "produces" for an adjust
+#: message explicitly requesting Catalan (fixture — the live behavior is an
+#: LLM prompt instruction, so determinism here is fixture-based, MAS §12.7).
+CATALAN_SUMMARY = "Resum: el desplegament ha acabat; cal repetir les comprovacions."
+
+
+class FakeBlockOutbound(FakeOutbound):
+    """A Block Kit-capable fake port: records ``blocks`` and ``chat.update``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.updates: list[dict[str, Any]] = []
+
+    def send_message(
+        self,
+        text: str,
+        *,
+        channel_ref: str | None = None,
+        thread_ref: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
+    ) -> DeliveryReceipt:
+        self.sends.append(
+            {"text": text, "channel_ref": channel_ref, "thread_ref": thread_ref, "blocks": blocks}
+        )
+        return DeliveryReceipt(
+            provider_message_id=f"msg-{len(self.sends)}",
+            channel_ref=channel_ref or "",
+            thread_ref=thread_ref,
+            provider_reference=f"slack://channel/{channel_ref}",
+            ok=True,
+            error=None,
+        )
+
+    def update_message(
+        self,
+        *,
+        channel_ref: str,
+        ts: str,
+        text: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
+        thread_ref: str | None = None,
+    ) -> DeliveryReceipt:
+        self.updates.append(
+            {
+                "channel_ref": channel_ref,
+                "ts": ts,
+                "text": text,
+                "blocks": blocks,
+                "thread_ref": thread_ref,
+            }
+        )
+        return DeliveryReceipt(
+            provider_message_id=ts,
+            channel_ref=channel_ref,
+            thread_ref=thread_ref,
+            provider_reference=f"slack://channel/{channel_ref}/thread/{thread_ref}",
+            ok=True,
+            error=None,
+        )
+
+
+class LanguageRuntime:
+    """A runtime that answers in Catalan when the adjust message asks for it."""
+
+    def __init__(self) -> None:
+        self.requests: list[AgentRunRequest] = []
+
+    def run(self, request: AgentRunRequest) -> AgentRunResult:
+        self.requests.append(request)
+        if "català" in str(request.context.get("current_message", "")):
+            summary = CATALAN_SUMMARY
+        else:
+            summary = RUNTIME_SUMMARY
+        return AgentRunResult(
+            agent="communication", ticket_id="x", success=True, output={"summary": summary}
+        )
+
+
+def _block_actions_event(
+    *,
+    thread_root: str = THREAD_ROOT,
+    message_ts: str = "1757428805.000900",
+    action_id: str = "accept_action",
+    channel: str = CHANNEL,
+) -> ExternalEventReceived:
+    """One verbatim-shaped Slack interactive (block_actions) delivery."""
+    return ExternalEventReceived(
+        source="slack",
+        external_id=f"ba-{message_ts}",
+        payload={
+            "type": "block_actions",
+            "team": {"id": "T0DEV"},
+            "user": {"id": USER},
+            "channel": {"id": channel},
+            "message": {
+                "type": "message",
+                "ts": message_ts,
+                "thread_ts": thread_root,
+                "text": RUNTIME_SUMMARY,
+            },
+            "actions": [
+                {"action_id": action_id, "block_id": "decision_buttons", "value": "task_accepted"}
+            ],
+            "response_url": "https://hooks.slack.com/actions/T0DEV/XXX",
+        },
+    )
+
+
+def _block_composition(
+    secrets: None,
+    session_factory: Any,
+    runtime: Any | None = None,
+) -> tuple[Any, InMemoryTransport, FakeBlockOutbound, Any]:
+    """The composition wired with the Block Kit-capable fake port."""
+    bus = InMemoryTransport()
+    runtime = runtime if runtime is not None else FakeRuntime()
+    outbound = FakeBlockOutbound()
+    comp = build_dev_composition(
+        bus=bus,
+        session_factory=session_factory,
+        runtime=runtime,
+        outbound=outbound,  # type: ignore[arg-type]
+        clock=lambda: NOW,
+    )
+    return comp, bus, outbound, runtime
+
+
+def _user_inputs(bus: InMemoryTransport) -> list[Any]:
+    """Every ``UserInputReceived`` payload published on the bus."""
+    return [
+        m.payload for m in bus.published_messages if type(m.payload).__name__ == "UserInputReceived"
+    ]
+
+
+class TestBlockKitConfirmUX:
+    """The SFP-258 one-button UX, end-to-end through the composition."""
+
+    def test_summary_reply_renders_the_exact_decision_actions_block(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        comp, bus, outbound, _runtime = _block_composition(secrets, session_factory)
+        set_slack_inbound_consumer(comp.router)
+
+        _publish(bus, _slack_event())
+
+        assert len(outbound.sends) == 1
+        blocks = outbound.sends[0]["blocks"]
+        assert blocks is not None
+        # Section: the summary + the (English default) hint line.
+        assert blocks[0] == {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": RUNTIME_SUMMARY + CONFIRM_REQUEST_SUFFIX},
+        }
+        # The owner's EXACT actions block (verbatim per the Requirements).
+        assert blocks[1] == {
+            "type": "actions",
+            "block_id": "decision_buttons",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": "accept_action",
+                    "style": "primary",
+                    "text": {"type": "plain_text", "text": "✅ Confirm", "emoji": True},
+                    "value": "task_accepted",
+                }
+            ],
+        }
+
+    def test_clicking_the_button_confirms_tears_down_and_completes(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        comp, bus, outbound, runtime = _block_composition(secrets, session_factory)
+        set_slack_inbound_consumer(comp.router)
+
+        _publish(bus, _slack_event())
+        _publish(bus, _block_actions_event(message_ts="1757428805.000900"))
+
+        # Confirmation: UserInputReceived with the confirmed summary; the
+        # interaction completed; the click caused NO regeneration (the only
+        # runtime run is the initial summarize).
+        assert len(runtime.requests) == 1
+        inputs = _user_inputs(bus)
+        assert inputs[-1].session_id == THREAD_ROOT
+        assert inputs[-1].text == RUNTIME_SUMMARY
+        interaction = _load_interaction(session_factory_of(comp), THREAD_ROOT)
+        assert interaction.completed_at is not None
+
+        # Teardown: chat.update replaced the actions block with the
+        # terminal state on the message that carried the button.
+        assert len(outbound.updates) == 1
+        update = outbound.updates[0]
+        assert update["channel_ref"] == CHANNEL
+        assert update["ts"] == "1757428805.000900"
+        assert update["thread_ref"] == THREAD_ROOT
+        assert update["blocks"][1] == dev_composition.CONFIRMED_ACTIONS_BLOCK
+        assert update["blocks"][1]["block_id"] == "decision_buttons"
+
+    def test_click_and_typed_confirmation_publish_the_same_payload_shape(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        comp, bus, _outbound, _runtime = _block_composition(secrets, session_factory)
+        set_slack_inbound_consumer(comp.router)
+
+        # Thread 1: typed confirmation; thread 2: the button click.
+        _publish(bus, _slack_event())
+        _publish(bus, _slack_event(text="CONFIRM"))
+        second = "1757428950.000700"
+        _publish(bus, _slack_event(thread_root=second, ts="1757428950.000750"))
+        _publish(bus, _block_actions_event(thread_root=second, message_ts="1757428950.000800"))
+
+        inputs = _user_inputs(bus)
+        confirms = [i for i in inputs if i.text == RUNTIME_SUMMARY]
+        assert len(confirms) == 2
+        # The SAME payload shape (session_id, text) either way.
+        assert confirms[0].session_id == THREAD_ROOT
+        assert confirms[1].session_id == second
+        assert type(confirms[0]) is type(confirms[1])
+
+    def test_late_click_on_a_completed_interaction_is_closed_not_reconfirmed(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        comp, bus, outbound, runtime = _block_composition(secrets, session_factory)
+        set_slack_inbound_consumer(comp.router)
+
+        _publish(bus, _slack_event())
+        _publish(bus, _slack_event(text="CONFIRM"))  # interaction completed
+        confirmed_count = len([i for i in _user_inputs(bus) if i.text == RUNTIME_SUMMARY])
+        click_count = len(outbound.updates)
+        _publish(bus, _block_actions_event(message_ts="1757428805.000999"))
+
+        # No second confirmation, no regeneration — closed stays closed.
+        confirmed_after = len([i for i in _user_inputs(bus) if i.text == RUNTIME_SUMMARY])
+        assert confirmed_after == confirmed_count == 1
+        # The only runtime run is the initial summarize — no regeneration.
+        assert len(runtime.requests) == 1
+        # The stale button still gets replaced with the terminal state so
+        # the completed thread cannot LOOK re-confirmable.
+        assert len(outbound.updates) == click_count + 1
+        assert outbound.updates[-1]["blocks"][1] == dev_composition.CONFIRMED_ACTIONS_BLOCK
+
+    def test_typed_confirmation_tears_down_the_recorded_summary_message(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        comp, bus, outbound, _runtime = _block_composition(secrets, session_factory)
+        set_slack_inbound_consumer(comp.router)
+
+        _publish(bus, _slack_event())  # summary delivered as msg-1
+        _publish(bus, _slack_event(text="CONFIRM"))
+
+        assert len(outbound.updates) == 1
+        update = outbound.updates[0]
+        assert update["ts"] == "msg-1"  # the recorded summary-delivery ts
+        assert update["channel_ref"] == CHANNEL
+        assert update["blocks"][1] == dev_composition.CONFIRMED_ACTIONS_BLOCK
+
+    @pytest.mark.parametrize(
+        "word",
+        ["confirm", "Confirm", "CONFIRM", "confirmo", "vale", "D'acord", "OUI", "Bestätigt"],
+    )
+    def test_multilingual_typed_confirmation_confirms_without_a_model_call(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+        word: str,
+    ) -> None:
+        comp, bus, outbound, runtime = _block_composition(secrets, session_factory)
+        set_slack_inbound_consumer(comp.router)
+
+        _publish(bus, _slack_event())
+        _publish(bus, _slack_event(text=word))
+
+        confirms = [i for i in _user_inputs(bus) if i.text == RUNTIME_SUMMARY]
+        assert len(confirms) == 1
+        interaction = _load_interaction(session_factory_of(comp), THREAD_ROOT)
+        assert interaction.completed_at is not None
+
+    def test_non_confirmation_sentence_is_adjust_input_not_a_confirmation(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        comp, bus, outbound, runtime = _block_composition(secrets, session_factory)
+        set_slack_inbound_consumer(comp.router)
+
+        _publish(bus, _slack_event())
+        _publish(bus, _slack_event(text="sounds good, but add the rollback plan"))
+
+        # Regenerated (a second summarize), NOT confirmed, button re-rendered.
+        assert len(runtime.requests) == 2
+        assert [i.text for i in _user_inputs(bus)].count(RUNTIME_SUMMARY) == 0
+        assert interaction_open(session_factory_of(comp), THREAD_ROOT)
+        assert len(outbound.sends) == 2
+
+    def test_catalan_language_request_is_honored_in_summary_and_hint(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        comp, bus, outbound, runtime = _block_composition(
+            secrets, session_factory, runtime=LanguageRuntime()
+        )
+        set_slack_inbound_consumer(comp.router)
+
+        _publish(bus, _slack_event())
+        assert RUNTIME_SUMMARY in outbound.sends[0]["text"]  # English default
+        assert outbound.sends[0]["text"].endswith(CONFIRM_REQUEST_SUFFIX)
+
+        _publish(bus, _slack_event(text="Si-us-plau, resumeix-ho en català", ts="1757428802.0"))
+
+        assert len(runtime.requests) == 2
+        second = outbound.sends[1]
+        assert CATALAN_SUMMARY in second["text"]
+        # The hint line follows the requested language (Catalan, not English).
+        assert "acceptar aquest resum" in second["text"]
+        assert CONFIRM_REQUEST_SUFFIX not in second["text"]
+
+    def test_non_accept_action_click_is_ignored(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        comp, bus, outbound, _runtime = _block_composition(secrets, session_factory)
+        set_slack_inbound_consumer(comp.router)
+
+        _publish(bus, _slack_event())
+        _publish(
+            bus,
+            _block_actions_event(message_ts="1757428805.000901", action_id="some_other_action"),
+        )
+
+        assert outbound.updates == []
+        assert interaction_open(session_factory_of(comp), THREAD_ROOT)
+
+    def test_block_actions_never_enters_the_message_path(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        """A block_actions delivery is a structured decision, NOT a message
+        event: with no thread summary to confirm it produces NO interaction,
+        NO summarize, NO message-path publication (whitelist untouched)."""
+        comp, bus, outbound, runtime = _block_composition(secrets, session_factory)
+        set_slack_inbound_consumer(comp.router)
+
+        _publish(bus, _block_actions_event())
+
+        assert runtime.requests == []
+        assert outbound.sends == []
+        assert outbound.updates == []
+        with session_factory_of(comp)() as session:  # type: ignore[misc]
+            rows = session.scalars(sa.select(UserInteraction)).all()
+        assert rows == []
+
+
+def interaction_open(session_factory: Any, reference: str) -> bool:
+    """True when the interaction for ``reference`` has NOT been completed."""
+    return _load_interaction(session_factory, reference).completed_at is None
+
+
+class TestBlockActionsIngress:
+    """block_actions flows through the SAME signature-verified ingress chain
+    (SFP-254): unsigned → 401 before anything runs; signed → 200 ack, then
+    the decision processes in the background (ack-then-process untouched)."""
+
+    def _block_actions_body(self, *, thread_root: str = THREAD_ROOT) -> bytes:
+        return json.dumps(
+            {
+                "type": "block_actions",
+                "team": {"id": "T06SFP"},
+                "user": {"id": USER},
+                "channel": {"id": CHANNEL},
+                "message": {
+                    "type": "message",
+                    "ts": "1757428805.000900",
+                    "thread_ts": thread_root,
+                },
+                "actions": [{"action_id": "accept_action", "value": "task_accepted"}],
+            }
+        ).encode("utf-8")
+
+    def test_unsigned_block_actions_is_rejected_with_401(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        runtime = SlowRuntime(delay=0.0)
+        outbound = FakeOutbound()
+        app, _bus, wrapper = _build_ack_app(session_factory, runtime, outbound)
+        body = self._block_actions_body()
+
+        async def scenario() -> int:
+            status = await _post_asgi(app, path=f"/webhooks/{_ENDPOINT_ID}", body=body, headers=[])
+            await asyncio.gather(*wrapper.in_flight)
+            return status
+
+        status = asyncio.run(scenario())
+        assert status == 401
+        # Nothing ran — no summarize, no outbound effect.
+        assert runtime.completed == 0
+        assert outbound.sends == []
+
+    def test_signed_block_actions_is_acked_then_processed(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        runtime = SlowRuntime(delay=0.0)
+        outbound = FakeOutbound()
+        app, _bus, wrapper = _build_ack_app(session_factory, runtime, outbound)
+        body = self._block_actions_body()
+
+        async def scenario() -> int:
+            status = await _post_asgi(
+                app,
+                path=f"/webhooks/{_ENDPOINT_ID}",
+                body=body,
+                headers=_sign_slack(_SIGNING_SECRET, body),
+            )
+            assert status == 200
+            assert runtime.completed == 0  # ack BEFORE the decision ran
+            await asyncio.gather(*wrapper.in_flight)
+            return status
+
+        assert asyncio.run(scenario()) == 200
+        assert runtime.completed == 0  # a decision never summarizes
