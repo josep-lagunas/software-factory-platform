@@ -307,6 +307,108 @@ def test_receipt_survives_minimal_ok_body() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Block Kit + chat.update (SFP-258 — Block Kit summaries, button teardown)
+# ---------------------------------------------------------------------------
+
+
+UPDATE_URL = "https://slack.com/api/chat.update"
+
+
+def test_send_message_without_blocks_posts_plain_text() -> None:
+    """``blocks=None`` (the default) keeps the pre-SFP-258 payload shape."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["payload"] = json.loads(request.content)
+        return ok_response()
+
+    receipt = make_client(handler).send_message("hello", channel_ref="C123")
+
+    assert receipt.ok is True
+    assert seen["url"] == POST_URL
+    assert seen["payload"] == {"channel": "C123", "text": "hello"}
+    assert "blocks" not in seen["payload"]
+
+
+def test_send_message_with_blocks_carries_the_block_kit_layout() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["payload"] = json.loads(request.content)
+        return ok_response()
+
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "summary"}}]
+    receipt = make_client(handler).send_message(
+        "fallback", channel_ref="C123", thread_ref="1712345678.000001", blocks=blocks
+    )
+
+    assert receipt.ok is True
+    assert seen["payload"]["blocks"] == blocks
+    assert seen["payload"]["text"] == "fallback"
+    assert seen["payload"]["thread_ts"] == "1712345678.000001"
+
+
+def test_update_message_posts_to_chat_update_with_channel_and_ts() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(200, json={"ok": True, "channel": "C123", "ts": "1712345678.123456"})
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": "confirmed summary"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": ":white_check_mark:"}]},
+    ]
+    receipt = make_client(handler).update_message(
+        channel_ref="C123",
+        ts="1712345678.123456",
+        text="confirmed summary",
+        blocks=blocks,
+        thread_ref="1712345678.000001",
+    )
+
+    assert receipt.ok is True
+    assert seen["url"] == UPDATE_URL
+    assert seen["payload"]["channel"] == "C123"
+    assert seen["payload"]["ts"] == "1712345678.123456"
+    assert seen["payload"]["blocks"] == blocks
+    # The receipt reference anchors to the thread, per the port contract.
+    assert receipt.provider_reference == "slack://channel/C123/thread/1712345678.000001"
+
+
+@pytest.mark.parametrize("missing", ["channel_ref", "ts"])
+def test_update_message_requires_channel_and_ts(missing: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("no HTTP call expected")
+
+    kwargs: dict[str, Any] = {"channel_ref": "C123", "ts": "1712345678.123456"}
+    kwargs[missing] = ""
+    with pytest.raises(ValueError, match="channel_ref and ts"):
+        make_client(handler).update_message(**kwargs)
+
+
+def test_update_message_5xx_raises_provider_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={})
+
+    with pytest.raises(ProviderError, match="chat|transport|HTTP"):
+        make_client(handler).update_message(channel_ref="C123", ts="1712345678.123456", text="x")
+
+
+def test_update_message_ok_false_returns_receipt_with_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": False, "error": "message_not_found"})
+
+    receipt = make_client(handler).update_message(
+        channel_ref="C123", ts="1712345678.123456", text="x"
+    )
+    assert receipt.ok is False
+    assert receipt.error == "message_not_found"
+
+
+# ---------------------------------------------------------------------------
 # Opt-in live verification (SLACK_LIVE=1)
 # ---------------------------------------------------------------------------
 

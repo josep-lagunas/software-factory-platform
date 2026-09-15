@@ -21,7 +21,7 @@ and retrying is the caller's concern (explicitly out of scope).
 from __future__ import annotations
 
 import os
-from typing import Final
+from typing import Any, Final
 
 import httpx
 from sfp_config import SecretProvider, SecretRef
@@ -32,10 +32,14 @@ from communication.interfaces.outbound import (
     ProviderError,
 )
 
-__all__ = ["SlackOutboundClient"]
+__all__ = ["SLACK_POST_MESSAGE_URL", "SLACK_UPDATE_MESSAGE_URL", "SlackOutboundClient"]
 
-#: The Slack Web API endpoint this adapter drives.
+#: The Slack Web API endpoint this adapter drives for posting.
 SLACK_POST_MESSAGE_URL: Final[str] = "https://slack.com/api/chat.postMessage"
+
+#: The Slack Web API endpoint this adapter drives for editing an existing
+#: message in place (SFP-258 — Block Kit button teardown).
+SLACK_UPDATE_MESSAGE_URL: Final[str] = "https://slack.com/api/chat.update"
 
 #: Name of the env var carrying the default channel id (SFP-86).
 _CHANNEL_ENV: Final[str] = "SLACK_CHANNEL_ID"
@@ -73,15 +77,19 @@ class SlackOutboundClient(OutboundMessagePort):
         *,
         channel_ref: str | None = None,
         thread_ref: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
     ) -> DeliveryReceipt:
-        """Post ``text`` to a Slack channel (optionally a thread).
+        """Post ``text`` (optionally as Block Kit ``blocks``) to a channel.
 
         Args:
-            text: Message body.
+            text: Message body — also the notification-time fallback Slack
+                renders when ``blocks`` cannot be displayed.
             channel_ref: Slack channel id. ``None`` falls back to the
                 ``SLACK_CHANNEL_ID`` environment variable.
             thread_ref: Parent message ``ts`` to thread under
                 (Slack ``thread_ts``). ``None`` posts top-level.
+            blocks: Optional Block Kit layout (SFP-258). ``None`` posts the
+                plain text message — the pre-SFP-258 behavior, unchanged.
 
         Returns:
             A :class:`DeliveryReceipt` — built from the **response** body
@@ -94,18 +102,95 @@ class SlackOutboundClient(OutboundMessagePort):
             ProviderError: On transport-level failure only — connection
                 error, timeout, or HTTP 5xx. Never for an HTTP-200 response.
         """
-        channel = channel_ref if channel_ref is not None else self._default_channel()
-        token = self._secret_provider.resolve(SecretRef(name="SLACK_BOT_TOKEN"))
-
-        payload: dict[str, str] = {"channel": channel, "text": text}
+        payload: dict[str, Any] = {"channel": self._channel_or_default(channel_ref), "text": text}
         if thread_ref is not None:
             # Native Slack threading: replies carry the parent's ts.
             payload["thread_ts"] = thread_ref
+        if blocks is not None:
+            payload["blocks"] = blocks
+        return self._post_and_receipt(
+            SLACK_POST_MESSAGE_URL,
+            payload,
+            channel=payload["channel"],
+            thread_ref=thread_ref,
+            action="posting",
+        )
+
+    def update_message(
+        self,
+        *,
+        channel_ref: str,
+        ts: str,
+        text: str | None = None,
+        blocks: list[dict[str, Any]] | None = None,
+        thread_ref: str | None = None,
+    ) -> DeliveryReceipt:
+        """Edit an already-posted message in place via ``chat.update`` (SFP-258).
+
+        The Block Kit button teardown seam: the composition replaces a
+        summary's decision actions block with a terminal state so a
+        completed thread cannot be re-confirmed.
+
+        Args:
+            channel_ref: Slack channel id of the message (required — Slack
+                edits are addressed by ``(channel, ts)``).
+            ts: The ``ts`` of the message to edit (required).
+            text: Replacement notification-time fallback text. ``None``
+                keeps the update blocks-only.
+            blocks: Replacement Block Kit layout. ``None`` keeps the update
+                text-only.
+            thread_ref: The thread root, used ONLY to anchor the returned
+                receipt's canonical reference (``chat.update`` takes no
+                ``thread_ts``).
+
+        Returns:
+            A :class:`DeliveryReceipt` anchored to the updated message.
+
+        Raises:
+            ProviderError: On transport-level failure only (connection
+                error, timeout, HTTP 5xx) — never for an HTTP-200 response.
+        """
+        if not channel_ref or not ts:
+            raise ValueError("update_message requires both channel_ref and ts")
+        payload: dict[str, Any] = {"channel": channel_ref, "ts": ts}
+        if text is not None:
+            payload["text"] = text
+        if blocks is not None:
+            payload["blocks"] = blocks
+        return self._post_and_receipt(
+            SLACK_UPDATE_MESSAGE_URL,
+            payload,
+            channel=channel_ref,
+            thread_ref=thread_ref,
+            action="updating",
+        )
+
+    def _channel_or_default(self, channel_ref: str | None) -> str:
+        """Resolve the target channel: explicit ref or ``SLACK_CHANNEL_ID``.
+
+        Raises:
+            ValueError: When ``channel_ref`` is ``None`` and no default is
+                configured.
+        """
+        return channel_ref if channel_ref is not None else self._default_channel()
+
+    def _post_and_receipt(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        channel: str,
+        thread_ref: str | None,
+        action: str,
+    ) -> DeliveryReceipt:
+        """POST one Web API call (token per request, never logged) and map
+        the outcome to its receipt/exception (the SFP-133 partition)."""
+        token = self._secret_provider.resolve(SecretRef(name="SLACK_BOT_TOKEN"))
 
         try:
             if self._client is not None:
                 response = self._client.post(
-                    SLACK_POST_MESSAGE_URL,
+                    url,
                     json=payload,
                     headers={"Authorization": f"Bearer {token}"},
                     timeout=self._timeout,
@@ -113,7 +198,7 @@ class SlackOutboundClient(OutboundMessagePort):
             else:
                 with httpx.Client(timeout=self._timeout) as client:
                     response = client.post(
-                        SLACK_POST_MESSAGE_URL,
+                        url,
                         json=payload,
                         headers={"Authorization": f"Bearer {token}"},
                     )
@@ -121,12 +206,12 @@ class SlackOutboundClient(OutboundMessagePort):
             # Transport failure → ProviderError. The message carries the
             # exception class name + carrier refs only — never the token.
             raise ProviderError(
-                f"slack transport failure ({type(exc).__name__}) posting to channel={channel}"
+                f"slack transport failure ({type(exc).__name__}) {action} to channel={channel}"
             ) from exc
 
         if response.status_code >= 500:
             raise ProviderError(
-                f"slack transport failure (HTTP {response.status_code}) posting"
+                f"slack transport failure (HTTP {response.status_code}) {action}"
                 f" to channel={channel}"
             )
 

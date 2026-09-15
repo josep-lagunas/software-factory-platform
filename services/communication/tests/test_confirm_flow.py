@@ -1,14 +1,26 @@
-"""Tests for the CONFIRM state machine (SFP-135, ID-069, MAS §9.4).
+"""Tests for the CONFIRM state machine (SFP-135, ID-069 as amended, MAS §9.4).
 
 Covers the PRSpec acceptance criteria end-to-end, deterministically (MAS
 §12.7 — no wall clock, no network, no sleeps):
 
-- **Exact-literal CONFIRM gate** — parametrized: surrounding whitespace is
-  stripped, everything else (``confirm`` / ``Confirm`` / ``CONFIRM NOW`` /
-  free-text corrections) is a CORRECTION that regenerates the summary
-  through the SAME injected agent (one runtime run), persists it, and
-  requests re-confirmation — no publish, no completion.
-- **Confirm path** — the exact literal publishes ONE ``UserInputReceived``
+- **Multilingual, case-insensitive CONFIRM gate** — parametrized: the
+  curated confirmation words (EN + ES/CA/FR/DE) confirm in any casing after
+  trimming surrounding whitespace/punctuation/emoji (the 2026-09-15 ID-069
+  amendment); everything else — sentences, corrections — is an ADJUST input
+  that regenerates the summary through the SAME injected agent (one runtime
+  run), persists it, and requests re-confirmation — no publish, no
+  completion.
+- **Classifier hook** — the general-path ``confirmation_intent_classifier``
+  callable decides the replies the curated list misses; absent (default),
+  they are corrections.
+- **LLM intent fallback** — a run whose ``is_confirmation_intent`` output
+  field is true confirms the freshly regenerated summary (the LLM is the
+  fallback behind the curated list, never the only path).
+- **Interaction-level confirmation** — ``confirm_interaction`` (the Block
+  Kit button path, SFP-258) publishes the SAME ``UserInputReceived`` shape
+  as a typed confirmation and completes the interaction; on a closed
+  interaction it returns the closed outcome with zero mutations.
+- **Confirm path** — a confirmation publishes ONE ``UserInputReceived``
   carrying the confirmed summary text and completes the interaction
   (``completed_at`` set, ``UserInteractionUpdated`` COMPLETED).
 - **Closed interactions** — COMPLETED and EXPIRED both yield the SFP-134
@@ -248,21 +260,37 @@ def _load_one(session_factory: SessionFactory, provider_reference: str) -> UserI
         return session.scalars(stmt).first()
 
 
-# --- The exact-literal CONFIRM gate (ID-069) -----------------------------------
+# --- The multilingual, case-insensitive CONFIRM gate (ID-069 as amended,
+# --- SFP-258; the curated word list is the deterministic fast path) ------------
 
 
 @pytest.mark.parametrize(
     ("reply_text", "confirms"),
     [
         ("CONFIRM", True),
-        ("  CONFIRM  ", True),  # surrounding whitespace only — still the literal
-        ("confirm", False),  # NO case-folding: a correction
-        ("Confirm", False),  # NO case-folding: a correction
-        ("CONFIRM NOW", False),  # no substring match: a correction
+        ("confirm", True),  # case-insensitive (the 2026-09-15 amendment)
+        ("Confirm", True),  # case-insensitive
+        ("  CONFIRM  ", True),  # surrounding whitespace only — still a confirmation
+        ("Confirm!", True),  # surrounding punctuation trimmed
+        # Curated ES / CA / FR / DE confirmation words (case-insensitive):
+        ("confirmo", True),
+        ("CONFIRMAR", True),
+        ("vale", True),
+        ("D'acord", True),
+        ("CONFIRMAT", True),
+        ("confirmez", True),
+        ("OUI", True),
+        ("Bestätigen", True),
+        ("bestätigt", True),
+        ("JA", True),
+        # NOT confirmations — adjust input, whatever their positivity:
+        ("CONFIRM NOW", False),  # no substring/prefix match: a correction
+        ("yes please, but add the rollback plan", False),  # free-text adjustment
         ("Looks good, ship it", False),  # free-text correction
+        ("confirmado el despliegue ayer", False),  # a sentence, not a word
     ],
 )
-async def test_confirm_gate_is_exact_literal(
+async def test_confirm_gate_is_multilingual_and_case_insensitive(
     flow: ConfirmFlow,
     service: InteractionService,
     runtime: FakeRuntime,
@@ -314,6 +342,157 @@ async def test_confirm_publishes_user_input_received_and_completes(
     assert isinstance(outcome, ConfirmOutcome)
     assert outcome.confirmed_summary == PENDING_SUMMARY
     assert outcome.interaction_id == str(loaded.interaction_id)
+
+
+# --- SFP-258: the general-path hook, the LLM fallback, the button path -------
+
+
+@pytest.mark.parametrize("reply_text", ["confirmaré el desplegament", "sounds right to me"])
+async def test_classifier_hook_confirms_what_the_curated_list_misses(
+    service: InteractionService,
+    bus: FakeBus,
+    session_factory: SessionFactory,
+    clock: FakeClock,
+    runtime: FakeRuntime,
+    agent: CommunicationAgent,
+    reply_text: str,
+) -> None:
+    """The injected classifier is the general path — consulted ONLY after
+    the curated list misses, and only on the whole message."""
+    await _pending(service)
+    seen: list[str] = []
+
+    def classifier(text: str) -> bool:
+        seen.append(text)
+        return text == "sounds right to me"
+
+    flow = ConfirmFlow(
+        bus=bus,
+        interactions=service,
+        agent=agent,
+        session_factory=session_factory,
+        clock=clock,
+        confirmation_intent_classifier=classifier,
+    )
+
+    outcome = await flow.handle(_reply(reply_text))
+
+    assert seen == [reply_text]  # the hook only ever sees the exact text
+    if reply_text == "sounds right to me":
+        assert isinstance(outcome, ConfirmOutcome)
+        assert runtime.requests == []  # hook hits: no regeneration
+    else:
+        assert isinstance(outcome, CorrectionOutcome)
+        assert len(runtime.requests) == 1
+
+
+async def test_llm_intent_fallback_confirms_the_regenerated_summary(
+    service: InteractionService,
+    bus: FakeBus,
+    session_factory: SessionFactory,
+    clock: FakeClock,
+    runtime: FakeRuntime,
+    agent: CommunicationAgent,
+) -> None:
+    """A message the curated list misses but the run classifies as a
+    confirmation intent confirms the FRESH summary (LLM = fallback)."""
+    reference = await _pending(service)
+    runtime._result = AgentRunResult(  # noqa: SLF001 - test-only seam
+        agent="communication",
+        ticket_id=str(INTERACTION_ID),
+        success=True,
+        output={"summary": REGENERATED_SUMMARY, "is_confirmation_intent": True},
+    )
+    flow = ConfirmFlow(
+        bus=bus,
+        interactions=service,
+        agent=agent,
+        session_factory=session_factory,
+        clock=clock,
+    )
+
+    outcome = await flow.handle(_reply("tot correcte, endavant"))
+
+    assert isinstance(outcome, ConfirmOutcome)
+    assert outcome.confirmed_summary == REGENERATED_SUMMARY
+    event = bus.messages_of(UserInputReceived)[-1]
+    assert event.session_id == reference
+    assert event.text == REGENERATED_SUMMARY
+    loaded = _load_one(session_factory, reference)
+    assert loaded is not None and loaded.completed_at is not None
+
+
+async def test_confirm_interaction_is_equivalent_to_typed_confirmation(
+    flow: ConfirmFlow,
+    service: InteractionService,
+    bus: FakeBus,
+    session_factory: SessionFactory,
+) -> None:
+    """The Block Kit button path publishes the SAME payload shape as the
+    typed path (SFP-258 acceptance: click ≡ typed confirmation)."""
+    await _pending(service)
+
+    typed = await flow.handle(_reply("CONFIRM"))
+
+    # A fresh pending interaction on a SECOND thread for the click path.
+    second = "1757428800.000900"
+    await service.create(
+        second,
+        interaction_type="user_input_request",
+        question="Deploy staging?",
+        response_required=True,
+    )
+    await service.update_summary(second, PENDING_SUMMARY)
+
+    clicked = await flow.confirm_interaction(second)
+
+    assert isinstance(typed, ConfirmOutcome) and isinstance(clicked, ConfirmOutcome)
+    assert typed.confirmed_summary == clicked.confirmed_summary == PENDING_SUMMARY
+    # Same summary, same payload shape — different interactions, so
+    # different ids (UUIDv4, non-deterministic by design).
+    assert typed.interaction_id != clicked.interaction_id
+    clicks = bus.messages_of(UserInputReceived)
+    assert len(clicks) == 2
+    for event in clicks:
+        assert event.text == PENDING_SUMMARY
+    assert clicks[0].session_id == THREAD_ROOT
+    assert clicks[1].session_id == second
+    assert await service.status(THREAD_ROOT) is InteractionStatus.COMPLETED
+    assert await service.status(second) is InteractionStatus.COMPLETED
+
+
+@pytest.mark.parametrize("closer", ["complete", "expire"])
+async def test_confirm_interaction_on_a_closed_interaction_is_inert(
+    closer: str,
+    service: InteractionService,
+    bus: FakeBus,
+    session_factory: SessionFactory,
+    clock: FakeClock,
+    runtime: FakeRuntime,
+    agent: CommunicationAgent,
+) -> None:
+    """A late button click on a completed/expired interaction: the closed
+    outcome, ZERO mutations, ZERO publishes."""
+    reference = await _pending(service)
+    flow = ConfirmFlow(
+        bus=bus,
+        interactions=service,
+        agent=agent,
+        session_factory=session_factory,
+        clock=clock,
+    )
+    if closer == "complete":
+        await service.complete(reference)
+    else:
+        clock.advance(EIGHT_HOURS + timedelta(seconds=1))
+
+    outcome = await flow.confirm_interaction(reference)
+
+    assert isinstance(outcome, ClosedInteractionOutcome)
+    assert outcome.prior_summary == PENDING_SUMMARY
+    # No UserInputReceived beyond the create/update lifecycle events.
+    assert bus.messages_of(UserInputReceived) == []
+    assert runtime.requests == []
 
 
 async def test_correction_regenerates_persists_and_re_requests(

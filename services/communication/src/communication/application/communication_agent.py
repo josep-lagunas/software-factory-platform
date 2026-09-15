@@ -50,7 +50,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar, Final, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Protocol, runtime_checkable
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -62,7 +62,12 @@ from sfp_agent_runtime.interfaces import (
 from sfp_agent_runtime.prompt_builder import PromptBuilder
 
 from communication.application.interaction_service import InteractionStatus
-from communication.interfaces.slack_inbound import SlackProviderMessage
+
+if TYPE_CHECKING:
+    # Annotation-only: importing this at runtime would close the
+    # slack_inbound → interaction_service → application → confirm_flow →
+    # communication_agent → slack_inbound import cycle.
+    from communication.interfaces.slack_inbound import SlackProviderMessage
 
 __all__ = [
     "ClosedInteractionOutcome",
@@ -135,6 +140,13 @@ class InteractionSummary(BaseModel):
         message_timestamp: The timestamp of that message — parsed
             deterministically from the Slack message ``ts``, never a
             wall-clock read (MAS §12.7).
+        confirmation_intent: Whether the run classified the current message
+            as an expression of confirmation intent (the
+            ``is_confirmation_intent`` structured output field, SFP-258's
+            ID-069 amendment). ``False`` when the field is absent — the
+            summarize prompt that predates SFP-258 produces none. The
+            ConfirmFlow consumes it ONLY as the LLM fallback behind the
+            curated word list, never as the primary gate.
     """
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
@@ -143,6 +155,7 @@ class InteractionSummary(BaseModel):
     summary: str = Field(min_length=1)
     emissor: str = Field(min_length=1)
     message_timestamp: datetime
+    confirmation_intent: bool = False
 
 
 class ConversationContext(BaseModel):
@@ -418,6 +431,7 @@ AgentRuntime` Protocol (AP-010 / MAS §9.6). The ONLY path to model
                     "summary": output.get("summary"),
                     "emissor": _USER_EMISSOR,
                     "message_timestamp": _parse_slack_ts(message.ts),
+                    "confirmation_intent": bool(output.get("is_confirmation_intent", False)),
                 }
             )
         except ValidationError as exc:
