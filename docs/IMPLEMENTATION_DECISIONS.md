@@ -2484,8 +2484,11 @@ The universal CONFIRM gate prevents mis-captured human intent from corrupting wo
 Positive: durable, confirmed, structured human decisions; uniform guarantee; traceable; v0 stays deterministic.  
 Negative: every interaction incurs a confirm round-trip; summary quality matters; no override escape hatch in v0.
 
+### Amendment (2026-09-15, SFP-258 — one-button Slack confirm UX)
+The confirmation act is generalized. A summary is confirmed by **(a) a Block Kit button click** (a single primary ✅ Confirm button — the two-button variant is superseded by the 2026-09-15 one-button product decision) **or (b) a typed confirmation in any language and any casing** — a curated multilingual confirmation-word list (EN/ES/CA/FR/DE, case-insensitive) is the deterministic fast path, and an LLM confirmation-intent classification (a structured output field of the summarize run) is the general-path fallback, never the only path. **All other pre-confirmation text remains adjustment** that regenerates the summary and re-renders the button — there is no activation step. The confirm-before-persist ordering is unchanged: confirmation (click or text) publishes `UserInputReceived` carrying the confirmed summary and completes the interaction; a completed thread's button is torn down (chat.update terminal state) and late clicks take the existing closed-interaction handling. Summaries, hint lines and (where practical) button copy adapt to an explicitly requested output language, defaulting to English.
+
 ### References
-ID-024, ID-071. Master Architecture Specification §9.4, AP-005, AP-009. Adopted from `software-factory-handoff/workflow/human-interaction.md`.
+ID-024, ID-071. Master Architecture Specification §9.4, AP-005, AP-009. Adopted from `software-factory-handoff/workflow/human-interaction.md`. Amended by SFP-258 (2026-09-15).
 
 ### Affected Components
 Communication Service (Communication Agent), Orchestrator (UserDecision), Identity Service.

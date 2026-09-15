@@ -86,14 +86,19 @@ from sfp_contracts.events.envelope import EventEnvelope, EventType
 from sfp_messaging import MessageContext, event_handler
 from sqlalchemy import select
 
-from communication.application.interaction_service import (
-    InteractionService,
-    SessionFactory,
-)
 from communication.infrastructure.persistence import UserInteraction
 
 if TYPE_CHECKING:
+    # Annotation-only: importing ``interaction_service`` at runtime here
+    # executes ``communication.application.__init__``, which imports
+    # ``confirm_flow``, which imports THIS module — an import cycle that
+    # breaks ``import communication.interfaces`` depending on entry order.
     from sfp_messaging.bus import MessageBus
+
+    from communication.application.interaction_service import (
+        InteractionService,
+        SessionFactory,
+    )
 
 __all__ = [
     "SLACK_SOURCE",

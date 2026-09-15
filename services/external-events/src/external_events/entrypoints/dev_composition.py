@@ -112,7 +112,7 @@ from communication.application.notifications import (
     SlackDestination,
 )
 from communication.infrastructure.persistence import Base as CommunicationBase
-from communication.interfaces.outbound import OutboundMessagePort
+from communication.interfaces.outbound import OutboundMessagePort, ProviderError
 from communication.interfaces.slack_inbound import (
     SlackInboundConsumer,
     SlackProviderMessage,
@@ -139,18 +139,28 @@ from sqlalchemy.pool import StaticPool
 from external_events.application.publisher import make_external_event_envelope
 
 __all__ = [
-    "AckThenProcessPublisher",
+    "ACCEPT_ACTION_ID",
+    "ACCEPT_ACTION_VALUE",
+    "BLOCK_ACTIONS_TYPE",
+    "CONFIRMED_ACTIONS_BLOCK",
+    "CONFIRM_HINTS",
     "CONFIRM_REQUEST_SUFFIX",
     "CLOSED_THREAD_MESSAGE",
+    "DECISION_BLOCK_ID",
     "DevAgentSettings",
     "DevCommunicationRouter",
     "DevComposition",
     "DevCompositionError",
     "DevSlackDestinationResolver",
     "GlmAgentRuntime",
+    "LANGUAGE_REQUESTS",
     "SUMMARIZATION_APOLOGY",
     "build_dev_composition",
+    "decision_actions_block",
+    "detect_language_request",
+    "hint_for",
     "main",
+    "summary_blocks",
 ]
 
 logger = logging.getLogger(__name__)
@@ -171,6 +181,170 @@ CONFIRM_REQUEST_SUFFIX: Final[str] = (
 #: Slack does not retry-storm) instead of 500ing. Fail-loud stays
 #: STARTUP-only, as the ticket specifies (SFP-257 live smoke, 2026-09-14).
 SUMMARIZATION_APOLOGY: Final[str] = "Sorry — I couldn't summarize that message. Please retry."
+
+# --------------------------------------------------------------------------- #
+# Block Kit decision UX (SFP-258 — the one-button confirm)
+# --------------------------------------------------------------------------- #
+
+#: ``block_id`` of the owner's decision actions block — VERBATIM per the
+#: SFP-258 Requirements (single primary button; the two-button variant is
+#: superseded by the 2026-09-15 one-button product decision).
+DECISION_BLOCK_ID: Final[str] = "decision_buttons"
+
+#: ``action_id`` of the ✅ Confirm button (the structured decision the
+#: block_actions router dispatches on).
+ACCEPT_ACTION_ID: Final[str] = "accept_action"
+
+#: ``value`` carried by the ✅ Confirm button.
+ACCEPT_ACTION_VALUE: Final[str] = "task_accepted"
+
+#: The top-level ``type`` of a Slack interactive payload (NOT an Events API
+#: ``event_callback`` — routed as a structured decision, never a message).
+BLOCK_ACTIONS_TYPE: Final[str] = "block_actions"
+
+#: The terminal state the actions block is replaced with once the
+#: interaction is confirmed — a completed thread cannot be re-confirmed
+#: (late clicks land on the closed-interaction path instead).
+CONFIRMED_ACTIONS_BLOCK: Final[dict[str, Any]] = {
+    "type": "context",
+    "block_id": DECISION_BLOCK_ID,
+    "elements": [
+        {"type": "mrkdwn", "text": ":white_check_mark: *Confirmed* — this summary was accepted."}
+    ],
+}
+
+
+def decision_actions_block() -> dict[str, Any]:
+    """Build the owner's EXACT decision actions block (SFP-258 Requirements).
+
+    ``block_id`` ``decision_buttons``; ONE primary button: ``plain_text``
+    ``✅ Confirm``, ``action_id`` ``accept_action``, ``value``
+    ``task_accepted``. A fresh dict per call — the block is embedded in a
+    chat payload and must never be shared-mutable module state.
+    """
+    return {
+        "type": "actions",
+        "block_id": DECISION_BLOCK_ID,
+        "elements": [
+            {
+                "type": "button",
+                "action_id": ACCEPT_ACTION_ID,
+                "style": "primary",
+                "text": {"type": "plain_text", "text": "✅ Confirm", "emoji": True},
+                "value": ACCEPT_ACTION_VALUE,
+            }
+        ],
+    }
+
+
+def summary_blocks(summary_text: str, hint: str) -> list[dict[str, Any]]:
+    """Build the Block Kit layout of a summary reply: summary + the button."""
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"{summary_text}{hint}"}},
+        decision_actions_block(),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Language adaptation (SFP-258 — language-adaptive summaries and hints)
+# --------------------------------------------------------------------------- #
+
+#: The language the summary/hint/button copy defaults to when the user
+#: never asked for one.
+DEFAULT_LANGUAGE: Final[str] = "en"
+
+#: The hint line per supported language — the ID-069 gate re-request that
+#: replaced the hardcoded-English ``CONFIRM_REQUEST_SUFFIX`` append. The
+#: English entry IS the legacy suffix (back-compat, and the button label
+#: stays the fixed '✅ Confirm' — language-adapting it is impractical at
+#: Block Kit render time here and the ticket allows "when practical").
+CONFIRM_HINTS: Final[dict[str, str]] = {
+    "en": CONFIRM_REQUEST_SUFFIX,
+    "ca": "\n\nRespon CONFIRM per acceptar aquest resum, o respon amb una correcció.",
+    "es": "\n\nResponde CONFIRM para aceptar este resumen, o responde con una corrección.",
+    "fr": "\n\nRépondez CONFIRM pour accepter ce résumé, ou répondez avec une correction.",
+    "de": "\n\nAntworte mit CONFIRM, um diese Zusammenfassung zu akzeptieren, "
+    "oder antworte mit einer Korrektur.",
+}
+
+#: Deterministic language-request detection: a lowercase substring of the
+#: adjust message maps the thread to that output language (SFP-258). The
+#: LLM honors the request inside the summary (prompt instruction); this map
+#: deterministically adapts the HINT line. First match in insertion order
+#: wins — Catalan before Spanish (``català``/``catalan`` do not collide),
+#: English last so an explicit "in English" resets a prior request.
+LANGUAGE_REQUESTS: Final[tuple[tuple[str, str], ...]] = (
+    ("català", "ca"),
+    ("catalan", "ca"),
+    ("español", "es"),
+    ("castellano", "es"),
+    ("spanish", "es"),
+    ("français", "fr"),
+    ("francais", "fr"),
+    ("french", "fr"),
+    ("deutsch", "de"),
+    ("german", "de"),
+    ("inglés", "en"),
+    ("ingles", "en"),
+    ("english", "en"),
+)
+
+
+def detect_language_request(text: str) -> str | None:
+    """The language explicitly requested in ``text``, or ``None``.
+
+    Pure and deterministic (MAS §12.7): a case-folded substring scan over
+    :data:`LANGUAGE_REQUESTS` — first match wins, no model call.
+    """
+    folded = text.casefold()
+    for needle, language in LANGUAGE_REQUESTS:
+        if needle in folded:
+            return language
+    return None
+
+
+def hint_for(language: str | None) -> str:
+    """The confirm hint line for ``language`` (unknown → English)."""
+    return CONFIRM_HINTS.get(language or DEFAULT_LANGUAGE, CONFIRM_HINTS[DEFAULT_LANGUAGE])
+
+
+def _block_actions_facts(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The carrier facts a block_actions payload carries (defensive parse).
+
+    Returns ``None`` when the body is not a well-formed interactive
+    payload. Slack's interactive schema: ``channel.id``, ``message.ts``,
+    ``message.thread_ts``, ``actions[]`` with ``action_id`` — read
+    defensively (the dev runner must never 500 on a provider body) and
+    typed (no provider knowledge leaks past this function).
+    """
+    if payload.get("type") != BLOCK_ACTIONS_TYPE:
+        return None
+    raw_channel = payload.get("channel")
+    channel: dict[str, Any] = raw_channel if isinstance(raw_channel, dict) else {}
+    raw_message = payload.get("message")
+    message: dict[str, Any] = raw_message if isinstance(raw_message, dict) else {}
+    channel_id = channel.get("id") or payload.get("channel_id")
+    message_ts = message.get("ts")
+    thread_root = message.get("thread_ts") or message_ts
+    actions = payload.get("actions")
+    if (
+        not isinstance(channel_id, str)
+        or not isinstance(message_ts, str)
+        or not isinstance(thread_root, str)
+        or not isinstance(actions, list)
+    ):
+        return None
+    return {
+        "channel_id": channel_id,
+        "message_ts": message_ts,
+        "thread_root": thread_root,
+        "action_ids": [
+            action.get("action_id")
+            for action in actions
+            if isinstance(action, dict) and isinstance(action.get("action_id"), str)
+        ],
+    }
+
 
 #: The fail-closed error for an HTTP 200 whose text blocks hold no JSON
 #: object — the sentinel the dev runtime's single retry keys on.
@@ -591,6 +765,7 @@ class DevCommunicationRouter(SlackInboundConsumer):
         notifications: NotificationService,
         resolver: DevSlackDestinationResolver,
         clock: Clock | None = None,
+        outbound: Any | None = None,
     ) -> None:
         super().__init__(
             bus=bus,
@@ -601,13 +776,36 @@ class DevCommunicationRouter(SlackInboundConsumer):
         self._confirm_flow = confirm_flow
         self._notifications = notifications
         self._resolver = resolver
+        #: The delivery port, for the SFP-258 Block Kit sends and the
+        #: ``chat.update`` button teardown. ``None`` falls back to the
+        #: notifications service with plain text (a port without the Block
+        #: Kit surface — e.g. the pre-SFP-258 fakes — degrades gracefully).
+        self._outbound = outbound
         #: The InteractionService the context carry-over write goes through.
         self._interactions = interaction_service
         self._known_references: set[str] = set()
         self._pending_context: dict[str, str] = {}
+        #: Per-thread requested output language (SFP-258); absent = English.
+        self._thread_language: dict[str, str] = {}
+        #: The ts of the message that last carried a thread's summary + the
+        #: decision button — the teardown target for a TYPED confirmation
+        #: (a button click carries its own message ts in the payload).
+        self._summary_message_ts: dict[str, str] = {}
 
     async def consume(self, event: ExternalEventReceived) -> None:
-        """Run the landed inbound sequence, then route the outcome."""
+        """Run the landed inbound sequence, then route the outcome.
+
+        A ``block_actions`` payload (Slack interactive — SFP-258) is routed
+        as a STRUCTURED DECISION before the message interpretation: it is
+        not a message event, the whitelist/dedup/ack-then-process invariants
+        (SFP-257) are untouched, and the decision reaches the same ID-069
+        gate a typed confirmation does.
+        """
+        facts = _block_actions_facts(event.payload)
+        if facts is not None:
+            await self._handle_block_actions(facts)
+            return
+
         message = parse_slack_message(event.payload)
         if message is None:
             await super().consume(event)
@@ -617,6 +815,9 @@ class DevCommunicationRouter(SlackInboundConsumer):
         is_new = reference not in self._known_references
         self._known_references.add(reference)
         self._resolver.remember(reference, message.channel)
+        requested = detect_language_request(message.text)
+        if requested is not None:
+            self._thread_language[reference] = requested
         try:
             await super().consume(event)
         except InteractionTransitionError:
@@ -669,20 +870,164 @@ class DevCommunicationRouter(SlackInboundConsumer):
         """Route one inbound reply through the ID-069 gate to its effect."""
         result = await self._confirm_flow.handle(message)
         if isinstance(result, CorrectionOutcome):
-            await self._notify(
-                message.provider_reference,
-                f"{result.regenerated_summary}{CONFIRM_REQUEST_SUFFIX}",
-            )
+            await self._deliver_summary(message.provider_reference, result.regenerated_summary)
         elif isinstance(result, ConfirmOutcome):
-            logger.info(
-                "dev runner: UserInputReceived published (session_id=%s, text=%r); "
-                "interaction %s completed",
-                message.provider_reference,
-                result.confirmed_summary,
-                result.interaction_id,
-            )
+            await self._complete_confirmation(message.provider_reference, result)
         else:
             await self._handle_closed(message)
+
+    async def _handle_block_actions(self, facts: dict[str, Any]) -> None:
+        """Route a verified block_actions payload as a structured decision.
+
+        Only the ✅ Confirm decision acts (:data:`ACCEPT_ACTION_ID`); the
+        click is EXACTLY equivalent to typed confirmation — same
+        ``UserInputReceived`` publication shape, same completion — via the
+        SFP-135 flow's :meth:`ConfirmFlow.confirm_interaction`. The actions
+        block is then torn down to its terminal state so the completed
+        thread cannot be re-confirmed; a late click on a completed
+        interaction takes the closed-interaction path (zero mutations, zero
+        publishes) and still renders the terminal state.
+        """
+        channel = facts["channel_id"]
+        thread_root = facts["thread_root"]
+        self._resolver.remember(thread_root, channel)
+        if ACCEPT_ACTION_ID not in facts["action_ids"]:
+            logger.info(
+                "dev runner: block_actions on %s carried no %s decision (ignored)",
+                thread_root,
+                ACCEPT_ACTION_ID,
+            )
+            return
+        try:
+            outcome = await self._confirm_flow.confirm_interaction(thread_root)
+        except LookupError:
+            logger.warning(
+                "dev runner: block_actions click on unknown thread %s — ignored", thread_root
+            )
+            return
+        if isinstance(outcome, ConfirmOutcome):
+            logger.info(
+                "dev runner: decision button click confirmed interaction %s (UserInputReceived "
+                "published with the confirmed summary)",
+                outcome.interaction_id,
+            )
+            self._teardown_actions_block(
+                channel=channel,
+                message_ts=facts["message_ts"],
+                thread_root=thread_root,
+                summary_text=outcome.confirmed_summary,
+            )
+            return
+        logger.info(
+            "dev runner: late block_actions click on closed interaction %s — "
+            "closed-interaction handling, no re-confirmation",
+            outcome.interaction_id,
+        )
+        self._teardown_actions_block(
+            channel=channel,
+            message_ts=facts["message_ts"],
+            thread_root=thread_root,
+            summary_text=outcome.prior_summary,
+        )
+
+    async def _complete_confirmation(self, reference: str, outcome: ConfirmOutcome) -> None:
+        """The typed-confirmation effect: log + tear the button down."""
+        logger.info(
+            "dev runner: UserInputReceived published (session_id=%s, text=%r); "
+            "interaction %s completed",
+            reference,
+            outcome.confirmed_summary,
+            outcome.interaction_id,
+        )
+        teardown_ts = self._summary_message_ts.get(reference)
+        if teardown_ts is None:
+            logger.warning(
+                "dev runner: no known summary message ts for %s — button teardown skipped",
+                reference,
+            )
+            return
+        destination = self._resolver.resolve(reference)
+        self._teardown_actions_block(
+            channel=destination.channel_ref,
+            message_ts=teardown_ts,
+            thread_root=reference,
+            summary_text=outcome.confirmed_summary,
+        )
+
+    def _teardown_actions_block(
+        self,
+        *,
+        channel: str,
+        message_ts: str,
+        thread_root: str,
+        summary_text: str,
+    ) -> None:
+        """Replace the decision actions block with its terminal state.
+
+        Uses ``chat.update`` on the message that carried the button (the
+        button click's payload carries the message ts; a typed confirmation
+        uses the recorded summary-delivery ts). A transport failure is
+        LOGGED, never raised — the confirmation itself already succeeded and
+        the delivery was acked (the ack-then-process discipline).
+        """
+        update = getattr(self._outbound, "update_message", None)
+        if update is None:
+            logger.info(
+                "dev runner: outbound port has no update_message — teardown skipped for %s",
+                thread_root,
+            )
+            return
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": summary_text}},
+            CONFIRMED_ACTIONS_BLOCK,
+        ]
+        try:
+            receipt = update(
+                channel_ref=channel,
+                ts=message_ts,
+                text=summary_text,
+                blocks=blocks,
+                thread_ref=thread_root,
+            )
+        except ProviderError as exc:
+            logger.warning(
+                "dev runner: button teardown for %s failed (%s) — the confirmation stands",
+                thread_root,
+                exc,
+            )
+            return
+        logger.info("dev runner: decision buttons replaced with terminal state → %r", receipt)
+
+    async def _deliver_summary(self, reference: str, summary_text: str) -> None:
+        """Deliver a regenerated summary as Block Kit + the decision button.
+
+        The layout is the summary text section (with the language-adaptive
+        confirm hint line) plus the owner's EXACT actions block. A port
+        without the Block Kit surface falls back to the plain-text
+        notifications path — the pre-SFP-258 behavior.
+        """
+        hint = hint_for(self._thread_language.get(reference))
+        blocks = summary_blocks(summary_text, hint)
+        send = getattr(self._outbound, "send_message", None) if self._outbound else None
+        if send is None:
+            await self._notify(reference, f"{summary_text}{hint}")
+            return
+        destination = self._resolver.resolve(reference)
+        try:
+            receipt = send(
+                f"{summary_text}{hint}",
+                channel_ref=destination.channel_ref,
+                thread_ref=destination.thread_ref,
+                blocks=blocks,
+            )
+        except TypeError:
+            # Port predates the blocks kwarg — plain-text fallback.
+            await self._notify(reference, f"{summary_text}{hint}")
+            return
+        if receipt.provider_message_id:
+            # The teardown target for a later TYPED confirmation.
+            self._summary_message_ts[reference] = receipt.provider_message_id
+        logger.info("dev runner: Block Kit summary delivered to %s → %r", reference, receipt)
 
     async def _notify(self, session_id: str, text: str) -> NotificationOutcome:
         """Deliver ``text`` to the thread via the SFP-136 handler (SFP-244 port)."""
@@ -826,8 +1171,9 @@ def build_dev_composition(
         clock=wall_clock,
     )
     resolver = DevSlackDestinationResolver()
+    delivery_port = outbound if outbound is not None else SlackOutboundClient(provider)
     notifications = NotificationService(
-        outbound=outbound if outbound is not None else SlackOutboundClient(provider),
+        outbound=delivery_port,
         interactions=interactions,
         resolver=resolver,
     )
@@ -839,6 +1185,7 @@ def build_dev_composition(
         notifications=notifications,
         resolver=resolver,
         clock=clock,
+        outbound=delivery_port,
     )
     return DevComposition(
         router=router,
