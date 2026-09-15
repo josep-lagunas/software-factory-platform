@@ -15,6 +15,11 @@ touches a wall clock), and the real SFP-124 publisher over a spy bus:
 - auth failure → 401 and ZERO publishes; malformed JSON post-auth → 400 and
   ZERO publishes; auth precedes parsing (a bad signature over garbage JSON
   is 401, never 400);
+- form-encoded deliveries (``payload=<urlencoded JSON>`` — Slack
+  interactivity's wire format) publish the DECODED object with the identity
+  hashed over the raw FORM bytes; extra form parameters are dropped; a form
+  without a JSON-object ``payload`` → 400; the signature is verified over
+  the raw form bytes (tampered → 401);
 - identical redelivery → the SAME ``external_id`` and the SAME SFP-124
   ``idempotency_key`` (dedupe by construction), fresh ``message_id``;
 - route discipline: only ``POST /webhooks/{endpoint_id}`` is a delivery —
@@ -37,6 +42,7 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 from typing import Any, NamedTuple
+from urllib.parse import urlencode
 
 import pytest
 import sqlalchemy as sa
@@ -477,6 +483,122 @@ async def test_top_level_non_object_json_is_400(stack: _Stack) -> None:
             headers=_valid_headers(top_level),
         )
         assert response.status == 400
+    assert stack.bus.published == []
+
+
+# --------------------------------------------------------------------- #
+# 5b. Form-encoded deliveries — the ``payload`` parameter wire format
+# --------------------------------------------------------------------- #
+
+
+#: One verbatim-shaped Slack interactivity payload (block_actions) — the
+#: delivery class whose REAL wire format is form-encoded, and whose live
+#: 400 motivated the form-decode path (opaque fixture data here: the
+#: ingress must carry it without inspecting a single field).
+_INTERACTION: dict[str, Any] = {
+    "type": "block_actions",
+    "team": {"id": "T06SFP"},
+    "user": {"id": "U0DEV"},
+    "channel": {"id": "C0DEV"},
+    "message": {"type": "message", "ts": "1757428805.000900", "thread_ts": "1757428800.000100"},
+    "actions": [{"action_id": "accept_action", "value": "task_accepted"}],
+}
+
+
+def _form_body(payload: Any, **extra_params: str) -> bytes:
+    """One ``application/x-www-form-urlencoded`` delivery body:
+    ``payload=<urlencoded JSON>`` (plus optional extra parameters)."""
+    return urlencode({"payload": json.dumps(payload), **extra_params}).encode("utf-8")
+
+
+async def test_form_encoded_payload_delivery_publishes_the_decoded_object(
+    stack: _Stack,
+) -> None:
+    """The wire format Slack interactivity actually uses: a urlencoded form
+    whose ``payload`` parameter carries the JSON object. The ingress decodes
+    the transport and publishes the JSON verbatim — same opaque carriage as
+    a bare-JSON delivery, no provider interpretation (ID-028)."""
+    body = _form_body(_INTERACTION)
+    response = await _post(
+        stack.app, path=f"/webhooks/{_ACTIVE_ID}", body=body, headers=_valid_headers(body)
+    )
+
+    assert response.status == 200
+    assert json.loads(response.body) == {"ok": True}
+    assert len(stack.bus.published) == 1
+    event = stack.bus.published[0].payload
+    # The decoded JSON object, verbatim — as if it had arrived bare.
+    assert event.payload == _INTERACTION
+    # Identity still hashes the RAW delivered bytes (the form itself), so
+    # identical redeliveries collide on the same idempotency key.
+    assert event.external_id == hashlib.sha256(body).hexdigest()
+    assert stack.bus.published[0].idempotency_key == f"github:{hashlib.sha256(body).hexdigest()}"
+
+
+async def test_form_extra_parameters_are_transport_framing_dropped_unread(
+    stack: _Stack,
+) -> None:
+    """Only the ``payload`` parameter is the delivery: any other form
+    parameter is transport framing the ingress never publishes."""
+    body = _form_body(_INTERACTION, api_app_id="A06SFP", token="xoxb-verification")
+    response = await _post(
+        stack.app, path=f"/webhooks/{_ACTIVE_ID}", body=body, headers=_valid_headers(body)
+    )
+
+    assert response.status == 200
+    assert stack.bus.published[0].payload.payload == _INTERACTION
+
+
+async def test_form_payload_that_is_not_json_is_400_with_zero_publishes(stack: _Stack) -> None:
+    body = urlencode({"payload": "this is {{{ not json"}).encode("utf-8")
+    response = await _post(
+        stack.app, path=f"/webhooks/{_ACTIVE_ID}", body=body, headers=_valid_headers(body)
+    )
+
+    assert response.status == 400
+    assert json.loads(response.body) == {"error": "invalid payload"}
+    assert stack.bus.published == []
+
+
+async def test_form_without_payload_parameter_is_400(stack: _Stack) -> None:
+    """A well-encoded form carrying no ``payload`` parameter is not one of
+    the two understood transport shapes — 400, not a carriage guess."""
+    body = urlencode({"other": "value", "again": "x"}).encode("utf-8")
+    response = await _post(
+        stack.app, path=f"/webhooks/{_ACTIVE_ID}", body=body, headers=_valid_headers(body)
+    )
+
+    assert response.status == 400
+    assert stack.bus.published == []
+
+
+async def test_form_payload_that_is_not_a_json_object_is_400(stack: _Stack) -> None:
+    """The form-decoded value must satisfy the SFP-124 contract type too:
+    a well-formed top-level non-object → 400, zero publishes."""
+    body = _form_body([1, 2, 3])
+    response = await _post(
+        stack.app, path=f"/webhooks/{_ACTIVE_ID}", body=body, headers=_valid_headers(body)
+    )
+
+    assert response.status == 400
+    assert stack.bus.published == []
+
+
+async def test_form_signature_is_verified_over_the_raw_form_bytes(stack: _Stack) -> None:
+    """The signing base is the raw form body, not the decoded JSON: a valid
+    signature computed over DIFFERENT bytes never authenticates a form
+    delivery — 401, zero publishes, before any parse."""
+    signed = _form_body(_INTERACTION)
+    injected = {**_INTERACTION, "actions": [{"action_id": "accept", "value": "injected"}]}
+    tampered = _form_body(injected)
+    response = await _post(
+        stack.app,
+        path=f"/webhooks/{_ACTIVE_ID}",
+        body=tampered,
+        headers=_valid_headers(signed),
+    )
+
+    assert response.status == 401
     assert stack.bus.published == []
 
 

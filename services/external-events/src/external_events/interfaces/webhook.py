@@ -41,11 +41,17 @@ SecretProvider` and registry) for the resolved endpoint's
    unresolvable secret from the provider) are server-side faults this
    PRSpec's binding response contract does not map: they propagate to the
    ASGI server's error handling (a 5xx), still with zero publishes.
-4. **Parse** ``json.loads(raw_body)`` — only now that auth has seen the
-   exact signed bytes. Malformed JSON (or a top-level non-object, which
-   cannot satisfy the ``ExternalEventReceived.payload: dict[str, Any]``
-   contract type — a type-compatibility check, not interpretation) →
-   ``400`` with zero publishes.
+4. **Parse** — only now that auth has seen the exact signed bytes. Two
+   transport encodings of the opaque payload are understood (both are
+   wire formats, not interpretation — ID-028): the body as JSON
+   directly (GitHub webhooks, Slack Events API), or an
+   ``application/x-www-form-urlencoded`` body whose single ``payload``
+   parameter carries the JSON object (how Slack delivers interactivity —
+   buttons, shortcuts, view submissions). Malformed in both shapes (or a
+   top-level non-object, which cannot satisfy the
+   ``ExternalEventReceived.payload: dict[str, Any]`` contract type — a
+   type-compatibility check, not interpretation) → ``400`` with zero
+   publishes.
 5. **external_id = sha256(raw_body)** — hashing is not interpretation
    (MAS §9.2): it is deterministic across redeliveries of the same bytes,
    which is exactly what makes the SFP-124 ``idempotency_key``
@@ -71,6 +77,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from functools import partial
 from typing import TYPE_CHECKING, Any, Final
+from urllib.parse import parse_qs
 
 from sfp_config.providers import SecretProvider
 
@@ -215,7 +222,7 @@ class WebhookIngressEndpoint:
             return
 
         # (4) Parse — only after auth has seen the exact signed bytes.
-        payload = _parse_json_object(raw_body)
+        payload = _parse_delivery_payload(raw_body)
         if payload is None:
             await self._respond(send, endpoint_id, 400, _BAD_PAYLOAD_BODY)
             return
@@ -337,3 +344,50 @@ def _parse_json_object(raw_body: bytes) -> dict[str, Any] | None:
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _parse_delivery_payload(raw_body: bytes) -> dict[str, Any] | None:
+    """The delivery's JSON object: direct, or form-encoded ``payload``.
+
+    Two wire shapes carry a JSON object to this ingress, and neither is
+    interpretation (ID-028 — both are transport encodings of the SAME
+    opaque payload):
+
+    - the body IS the JSON object (GitHub webhooks, Slack Events API);
+    - the body is ``application/x-www-form-urlencoded`` with the JSON
+      object in exactly one parameter: ``payload`` — how Slack delivers
+      interactivity (block actions, shortcuts, view submissions). The
+      form is decoded, the ``payload`` parameter's value is parsed as
+      the JSON object, and any other parameter is transport framing
+      this ingress drops unread.
+
+    A body that is neither shape returns ``None`` → the caller's ``400``.
+    A body that parses as a JSON object directly never reaches the form
+    path (the two shapes are disjoint on well-formed input).
+    """
+    direct = _parse_json_object(raw_body)
+    if direct is not None:
+        return direct
+    return _payload_from_form(raw_body)
+
+
+def _payload_from_form(raw_body: bytes) -> dict[str, Any] | None:
+    """Decode a form body and parse its ``payload`` parameter as JSON.
+
+    Tolerant by necessity — this runs on an untrusted (though
+    already-authenticated) edge: a body that is not decodable UTF-8 form
+    data, carries no ``payload`` parameter, or whose ``payload`` value is
+    not a JSON object all return ``None`` → the caller's ``400``. A
+    repeated ``payload`` parameter resolves to its last value (HTML-form
+    semantics). Percent-decoding replaces invalid UTF-8 sequences
+    (:func:`urllib.parse.unquote`'s ``errors="replace"`` default), so the
+    re-encode below cannot raise.
+    """
+    try:
+        form = parse_qs(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    values = form.get("payload")
+    if not values:
+        return None
+    return _parse_json_object(values[-1].encode("utf-8"))
