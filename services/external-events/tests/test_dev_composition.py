@@ -49,6 +49,7 @@ import types
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 import pytest
@@ -1374,23 +1375,35 @@ def interaction_open(session_factory: Any, reference: str) -> bool:
 class TestBlockActionsIngress:
     """block_actions flows through the SAME signature-verified ingress chain
     (SFP-254): unsigned → 401 before anything runs; signed → 200 ack, then
-    the decision processes in the background (ack-then-process untouched)."""
+    the decision processes in the background (ack-then-process untouched).
+
+    SFP-258 live-bug regression: Slack interactivity deliveries arrive as
+    ``application/x-www-form-urlencoded`` bodies — ``payload=<urlencoded
+    JSON>`` — not bare JSON. The ingress form-decodes the ``payload``
+    parameter after signature verification, so a REAL wire-format click
+    reaches the block_actions router and fires the confirm path."""
+
+    def _block_actions_dict(self, *, thread_root: str = THREAD_ROOT) -> dict[str, Any]:
+        return {
+            "type": "block_actions",
+            "team": {"id": "T06SFP"},
+            "user": {"id": USER},
+            "channel": {"id": CHANNEL},
+            "message": {
+                "type": "message",
+                "ts": "1757428805.000900",
+                "thread_ts": thread_root,
+            },
+            "actions": [{"action_id": "accept_action", "value": "task_accepted"}],
+        }
 
     def _block_actions_body(self, *, thread_root: str = THREAD_ROOT) -> bytes:
-        return json.dumps(
-            {
-                "type": "block_actions",
-                "team": {"id": "T06SFP"},
-                "user": {"id": USER},
-                "channel": {"id": CHANNEL},
-                "message": {
-                    "type": "message",
-                    "ts": "1757428805.000900",
-                    "thread_ts": thread_root,
-                },
-                "actions": [{"action_id": "accept_action", "value": "task_accepted"}],
-            }
-        ).encode("utf-8")
+        return json.dumps(self._block_actions_dict(thread_root=thread_root)).encode("utf-8")
+
+    def _form_body(self, payload: dict[str, Any]) -> bytes:
+        """Slack's REAL interactivity wire format: a urlencoded form whose
+        ``payload`` parameter carries the JSON object."""
+        return urlencode({"payload": json.dumps(payload)}).encode("utf-8")
 
     def test_unsigned_block_actions_is_rejected_with_401(
         self,
@@ -1439,3 +1452,115 @@ class TestBlockActionsIngress:
 
         assert asyncio.run(scenario()) == 200
         assert runtime.completed == 0  # a decision never summarizes
+
+    def test_signed_form_encoded_click_runs_the_confirm_path(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        """The live SFP-258 bug, pinned as a regression: the click arrives
+        FORM-ENCODED (``payload=<urlencoded JSON>``, the wire format every
+        real Slack interactivity delivery uses — not the bare-JSON bodies
+        every pre-fix test POSTed). A valid Slack signature over the raw
+        form bytes → 200 ack, the decoded object reaches the block_actions
+        router, and the confirm path fires: UserInputReceived with the
+        stored summary, the interaction completed, the button torn down."""
+        runtime = SlowRuntime(delay=0.0)
+        outbound = FakeBlockOutbound()
+        app, bus, wrapper = _build_ack_app(session_factory, runtime, outbound)
+        # The thread's summary is already delivered — the interaction is
+        # open, waiting on exactly this click. (Published directly on the
+        # bus, as the ingress would have; must run OUTSIDE the scenario's
+        # event loop.)
+        _publish(bus, _slack_event())
+        body = self._form_body(self._block_actions_dict())
+
+        async def scenario() -> int:
+            status = await _post_asgi(
+                app,
+                path=f"/webhooks/{_ENDPOINT_ID}",
+                body=body,
+                headers=_sign_slack(_SIGNING_SECRET, body),
+            )
+            await asyncio.gather(*wrapper.in_flight)
+            return status
+
+        assert asyncio.run(scenario()) == 200
+
+        # The confirm fired: UserInputReceived with the stored summary,
+        # keyed to the thread — the same payload shape as a typed confirm.
+        inputs = _user_inputs(bus)
+        assert inputs[-1].session_id == THREAD_ROOT
+        assert inputs[-1].text == RUNTIME_SUMMARY
+        # The interaction is completed...
+        assert _load_interaction(session_factory, THREAD_ROOT).completed_at is not None
+        # ...the click caused NO regeneration (the only run is the initial
+        # summarize)...
+        assert len(runtime.requests) == 1
+        # ...and the button was torn down on the message that carried it.
+        assert len(outbound.updates) == 1
+        assert outbound.updates[0]["ts"] == "1757428805.000900"
+        assert outbound.updates[0]["blocks"][1] == dev_composition.CONFIRMED_ACTIONS_BLOCK
+
+    def test_form_encoded_click_with_wrong_signature_is_401(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        """The Slack signature is verified over the RAW FORM bytes — a valid
+        signature over different form bytes never authenticates the click,
+        and nothing runs (no publish, no decision, no confirm)."""
+        runtime = SlowRuntime(delay=0.0)
+        outbound = FakeBlockOutbound()
+        app, _bus, wrapper = _build_ack_app(session_factory, runtime, outbound)
+        signed = self._form_body(self._block_actions_dict())
+        tampered = self._form_body(
+            {
+                **self._block_actions_dict(),
+                "actions": [{"action_id": "accept_action", "value": "injected"}],
+            }
+        )
+
+        async def scenario() -> int:
+            status = await _post_asgi(
+                app,
+                path=f"/webhooks/{_ENDPOINT_ID}",
+                body=tampered,
+                headers=_sign_slack(_SIGNING_SECRET, signed),
+            )
+            await asyncio.gather(*wrapper.in_flight)
+            return status
+
+        assert asyncio.run(scenario()) == 401
+        assert runtime.completed == 0
+        assert outbound.sends == []
+        assert outbound.updates == []
+
+    def test_form_encoded_payload_that_is_not_json_is_400(
+        self,
+        secrets: None,
+        session_factory: Any,
+        registry_binding: None,
+    ) -> None:
+        """A form delivery whose ``payload`` parameter is not JSON is the
+        400 malformed-payload branch — acked as an error, nothing runs."""
+        runtime = SlowRuntime(delay=0.0)
+        outbound = FakeBlockOutbound()
+        app, _bus, wrapper = _build_ack_app(session_factory, runtime, outbound)
+        body = urlencode({"payload": "this is {{{ not json"}).encode("utf-8")
+
+        async def scenario() -> int:
+            status = await _post_asgi(
+                app,
+                path=f"/webhooks/{_ENDPOINT_ID}",
+                body=body,
+                headers=_sign_slack(_SIGNING_SECRET, body),
+            )
+            await asyncio.gather(*wrapper.in_flight)
+            return status
+
+        assert asyncio.run(scenario()) == 400
+        assert runtime.completed == 0
+        assert outbound.updates == []
